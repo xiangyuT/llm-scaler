@@ -392,11 +392,7 @@ echo   +-- python_embeded/           (Python environment)
 echo   +-- ComfyUI/                  (ComfyUI application)
 echo   ^|   +-- custom_nodes/        (Custom nodes)
 echo   ^|       +-- comfyui-manager
-echo   ^|       +-- comfyui-videohelpersuite
-echo   ^|       +-- comfyui-easy-use
-echo   ^|       +-- comfyui_controlnet_aux
 echo   ^|       +-- ComfyUI-GGUF
-echo   ^|       +-- ComfyUI-KJNodes
 echo   +-- run_comfyui.bat           (Launcher)
 echo   +-- run_comfyui_lowvram.bat   (Low VRAM Launcher)
 echo   +-- run_comfyui_cpu.bat       (CPU-only Launcher)
