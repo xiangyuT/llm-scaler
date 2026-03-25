@@ -7,6 +7,7 @@
 // Normalization: RMSNorm, LayerNorm
 // SVDQuant: W4A4 dequantization, quantization, and oneDNN GEMM for nunchaku
 // Rotary: Fused rotary position embedding
+// SDP: Scaled Dot-Product Attention (ESIMD Flash Attention via lgrf sidecar)
 // ============================================================================
 
 #include <torch/extension.h>
@@ -36,6 +37,9 @@ namespace svdq {
 }
 namespace rotary {
     torch::Tensor rotary_emb(const torch::Tensor& x, const torch::Tensor& cos_cache, const torch::Tensor& sin_cache, int64_t seq_len, int64_t heads);
+}
+namespace sdp {
+    torch::Tensor sdp(torch::Tensor q, torch::Tensor k, torch::Tensor v);
 }
 }
 
@@ -148,4 +152,13 @@ PYBIND11_MODULE(_C, m) {
         "Output: [total_rows, head_dim] same dtype as x",
         py::arg("x"), py::arg("cos_cache"), py::arg("sin_cache"),
         py::arg("seq_len"), py::arg("heads"));
+
+    // Scaled Dot-Product Attention (ESIMD Flash Attention)
+    auto sdp = m.def_submodule("sdp", "Scaled dot-product attention kernels");
+    sdp.def("sdp", &omni_xpu::sdp::sdp,
+        "ESIMD Flash Attention for Intel XPU\n"
+        "Input: q/k/v [B, L, H, 128] fp16/bf16 contiguous on XPU\n"
+        "Constraints: B == 1, head_dim == 128\n"
+        "Output: [B, Lq, H, 128] same dtype as q",
+        py::arg("q"), py::arg("k"), py::arg("v"));
 }
