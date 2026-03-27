@@ -255,13 +255,15 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
       fp32SoftMaxTemp.select<16, 1>(0) = fp32SoftMaxTemp.select<16, 1>(0) + ttemp.select<16, 1>(0);
       fp32HistoricMaxTemp = fp32CurrentMaxTemp;
 
-      // Compensation — fp16 multiply (NATIVE on Xe2, same as fp16 kernel)
-      simd<fp16, 32> compensationTemp;
-      compensationTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
-      compensationTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
+      // Compensation — fp32 multiply + clamp to prevent fp16 accumulator overflow
       #pragma unroll
       for (int kk = 0; kk < 64; kk++) {
-        finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * compensationTemp.select<32, 1>(0);
+        simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
+        f32tmp.select<16, 1>(0) *= fp32SoftMaxCompensation;
+        f32tmp.select<16, 1>(16) *= fp32SoftMaxCompensation;
+        f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
+        f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
+        finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
       }
 
       // Pack softmax weights fp32 → fp16 VNNI (same as fp16 kernel)
@@ -499,12 +501,15 @@ ESIMD_INLINE void flashAttnBMha128Bf16IoPrecomputed(
       fp32HistoricMaxTemp = fp32CurrentMaxTemp;
 
       if (loopIdx != 0) {
-        simd<fp16, 32> compensationTemp;
-        compensationTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
-        compensationTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
+        // fp32 multiply + clamp to prevent fp16 accumulator overflow
         #pragma unroll
         for (int kk = 0; kk < 64; kk++) {
-          finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * compensationTemp.select<32, 1>(0);
+          simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
+          f32tmp.select<16, 1>(0) *= fp32SoftMaxCompensation;
+          f32tmp.select<16, 1>(16) *= fp32SoftMaxCompensation;
+          f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
+          f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
+          finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
         }
       }
 

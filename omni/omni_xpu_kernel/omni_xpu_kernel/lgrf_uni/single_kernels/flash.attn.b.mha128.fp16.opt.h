@@ -131,7 +131,7 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
     slmPingpongStore = slmPingpongStore * 64 * 128 * sizeof(fp16);
     auto tempQkAsFp16 = tempOutput.template bit_cast_view<fp16>();
     simd<fp16, 512> fp16VState;
-    simd<fp16, 32> compensationTemp;  // declared at loop scope for use after barrier
+    simd<float, 16> fp32CompSaved;    // fp32 compensation saved for overflow-safe multiply
     tempOutput = 0;
 
     // ===== Q @ K^T =====
@@ -225,9 +225,8 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
       fp32SoftMaxCompensation = __ESIMD_NS::exp2<float, 16, float>(fp32SoftMaxCompensation);
       fp32SoftMaxTemp.select<16, 1>(0) = fp32SoftMaxTemp.select<16, 1>(0) * fp32SoftMaxCompensation.select<16, 1>(0);
 
-      // EARLY fp16 convert — before sum reduction, so sum ALU overlaps with convert latency
-      compensationTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
-      compensationTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
+      // Save fp32 compensation for overflow-safe multiply after barrier
+      fp32CompSaved = fp32SoftMaxCompensation;
 
       // Sum reduction
       #pragma unroll
@@ -277,10 +276,15 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
     // ===== Interleaved compensation + S×V by output-dim half =====
     {
       // --- l=0: finalOutput[0..1023] ---
-      // Compensate l=0 half
+      // Compensate l=0 half — fp32 multiply + clamp to prevent fp16 overflow
       #pragma unroll
       for (int kk = 0; kk < 32; kk++) {
-        finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * compensationTemp.select<32, 1>(0);
+        simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
+        f32tmp.select<16, 1>(0) *= fp32CompSaved;
+        f32tmp.select<16, 1>(16) *= fp32CompSaved;
+        f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
+        f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
+        finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
       }
       // Block 1 (V rows 0-31), l=0
       #pragma unroll
@@ -329,10 +333,15 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
       }
 
       // --- l=1: finalOutput[1024..2047] ---
-      // Compensate l=1 half (overlaps with l=0 DPAS pipeline)
+      // Compensate l=1 half — fp32 multiply + clamp
       #pragma unroll
       for (int kk = 32; kk < 64; kk++) {
-        finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * compensationTemp.select<32, 1>(0);
+        simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
+        f32tmp.select<16, 1>(0) *= fp32CompSaved;
+        f32tmp.select<16, 1>(16) *= fp32CompSaved;
+        f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
+        f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
+        finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
       }
       // Block 1 (V rows 0-31), l=1
       #pragma unroll
@@ -411,7 +420,7 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
     uint32_t slmPingpongLoad = (loopIdx) & 0x1;
     slmPingpongLoad = slmPingpongLoad * 64 * 128 * sizeof(fp16);
     auto tempQkAsFp16 = tempOutput.template bit_cast_view<fp16>();
-    simd<fp16, 32> compensationTemp;  // declared at scope for use after barrier
+    simd<float, 16> fp32CompSaved;    // fp32 compensation for overflow-safe multiply
     tempOutput = 0;
 
     // Q @ K^T
@@ -508,9 +517,8 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
         fp32SoftMaxTemp.select<16, 1>(0) = fp32SoftMaxTemp.select<16, 1>(0) * fp32SoftMaxCompensation.select<16, 1>(0);
       }
 
-      // EARLY fp16 convert — before sum reduction
-      compensationTemp.select<16, 1>(0) = fp32SoftMaxCompensation;
-      compensationTemp.select<16, 1>(16) = fp32SoftMaxCompensation;
+      // Save fp32 compensation for overflow-safe multiply after barrier
+      fp32CompSaved = fp32SoftMaxCompensation;
 
       #pragma unroll
       for (int kk = 0; kk < 4; kk++) {
@@ -562,7 +570,12 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
         // --- l=0: finalOutput[0..1023] ---
         #pragma unroll
         for (int kk = 0; kk < 32; kk++) {
-          finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * compensationTemp.select<32, 1>(0);
+          simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
+          f32tmp.select<16, 1>(0) *= fp32CompSaved;
+          f32tmp.select<16, 1>(16) *= fp32CompSaved;
+          f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
+          f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
+          finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
         }
       }
       // Block 1, l=0
@@ -615,7 +628,12 @@ ESIMD_INLINE void flashAttnBMha128Fp16OptPrecomputed(
         // --- l=1: finalOutput[1024..2047] ---
         #pragma unroll
         for (int kk = 32; kk < 64; kk++) {
-          finalOutput.select<32, 1>(32 * kk) = finalOutput.select<32, 1>(32 * kk) * compensationTemp.select<32, 1>(0);
+          simd<float, 32> f32tmp = finalOutput.select<32, 1>(32 * kk);
+          f32tmp.select<16, 1>(0) *= fp32CompSaved;
+          f32tmp.select<16, 1>(16) *= fp32CompSaved;
+          f32tmp = __ESIMD_NS::min<float>(f32tmp, simd<float, 32>(65504.0f));
+          f32tmp = __ESIMD_NS::max<float>(f32tmp, simd<float, 32>(-65504.0f));
+          finalOutput.select<32, 1>(32 * kk) = simd<fp16, 32>(f32tmp);
         }
       }
       // Block 1, l=1

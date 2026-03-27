@@ -159,6 +159,7 @@ PYBIND11_MODULE(_C, m) {
         "ESIMD Flash Attention for Intel XPU\n"
         "Input: q/k/v [B, L, H, 128] fp16/bf16 contiguous on XPU\n"
         "Constraints: B == 1, head_dim == 128\n"
+        "V is automatically per-head scaled to prevent fp16 accumulator overflow.\n"
         "Output: [B, Lq, H, 128] same dtype as q",
         py::arg("q"), py::arg("k"), py::arg("v"));
 }
