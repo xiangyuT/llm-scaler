@@ -331,7 +331,8 @@ void page_attn_decode(
   torch::Tensor seq_lens,
   torch::Tensor& out,
   int64_t max_query_len,
-  int64_t max_seq_len
+  int64_t max_seq_len,
+  std::optional<torch::Tensor> temp_p_opt = std::nullopt
 ) {
   TORCH_CHECK(block_table.dim() == 2);
   TORCH_CHECK(seq_lens.dim() == 1);
@@ -377,8 +378,22 @@ void page_attn_decode(
   size_t szGlobalSoftmaxSum = batches * reduceCount * headQk;
   size_t totalSize = szP + szGroupMax + szGlobalMax + szGlobalPollP + szOutTemp + szGlobalSoftmaxSum;
 
-  torch::Tensor temp_p = torch::zeros({ static_cast<long>(totalSize) },
-    torch::device(kv_cache.device()).dtype(torch::kFloat32));
+  // If caller passes a pre-allocated temp_p (for XPUGraph capture/replay
+  // stability), reuse it and zero it in-place; otherwise allocate fresh.
+  torch::Tensor temp_p;
+  if (temp_p_opt.has_value()) {
+    temp_p = temp_p_opt.value();
+    TORCH_CHECK(temp_p.numel() >= static_cast<long>(totalSize),
+                "temp_p buffer too small: ", temp_p.numel(), " < ", totalSize);
+    TORCH_CHECK(temp_p.scalar_type() == torch::kFloat32,
+                "temp_p must be float32");
+    TORCH_CHECK(temp_p.device() == kv_cache.device(),
+                "temp_p must be on the same device as kv_cache");
+    temp_p.zero_();
+  } else {
+    temp_p = torch::zeros({ static_cast<long>(totalSize) },
+      torch::device(kv_cache.device()).dtype(torch::kFloat32));
+  }
 
   float* pState = (float*)temp_p.data_ptr();
   float* pGroupMax = pState + szP;
@@ -419,7 +434,7 @@ void page_attn_decode(
 
 TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("gdn_eagle(Tensor! qkvz, Tensor! z_out, Tensor conv_w, Tensor? conv_b, Tensor! conv_state, Tensor accepted_tokens, Tensor ba, Tensor a_log, Tensor dt_bias, Tensor! state_in, Tensor ssm_state_idx, Tensor norm_w, int max_query_len) -> Tensor");
-    m.def("page_attn_decode(Tensor query, Tensor kv_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len) -> ()");
+    m.def("page_attn_decode(Tensor query, Tensor kv_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, Tensor(a!)? temp_p=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {

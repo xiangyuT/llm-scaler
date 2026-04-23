@@ -640,6 +640,33 @@ def eagle_gdn(
         state_in, ssm_state_idx, norm_w, max_query_len)
 
 
+def eagle_page_attn_decode_temp_size(
+    batches: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    max_seq_len: int,
+) -> int:
+    """Number of float32 elements needed for the scratch buffer of
+    eagle_page_attn_decode at a given max_seq_len.
+
+    Mirrors the C++ sizing in csrc/eagle/eagle.sycl page_attn_decode:
+        szP + szGroupMax + szGlobalMax + szGlobalPollP + szOutTemp + szGlobalSoftmaxSum
+    """
+    hidden_dim_p = ((max_seq_len + 63) // 64) * 64
+    hidden_dim_p_max = ((max_seq_len + 63) // 64)
+    reduce_count = ((max_seq_len + 1023) // 1024)
+    gqa_ratio = num_q_heads // num_kv_heads
+    sz_p = batches * num_q_heads * hidden_dim_p
+    sz_group_max = batches * num_q_heads * hidden_dim_p_max
+    sz_global_max = batches * gqa_ratio * num_kv_heads
+    sz_global_poll_p = batches * gqa_ratio * num_kv_heads
+    sz_out_temp = batches * reduce_count * head_dim * num_q_heads
+    sz_global_softmax_sum = batches * reduce_count * num_q_heads
+    return (sz_p + sz_group_max + sz_global_max + sz_global_poll_p
+            + sz_out_temp + sz_global_softmax_sum)
+
+
 def eagle_page_attn_decode(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -648,6 +675,7 @@ def eagle_page_attn_decode(
     out: torch.Tensor,
     max_query_len: int,
     max_seq_len: int,
+    temp_p: torch.Tensor | None = None,
 ) -> None:
     """Eagle paged attention decode.
 
@@ -656,10 +684,15 @@ def eagle_page_attn_decode(
     block_table: [batches, max_blocks] int32
     seq_lens:    [batches] int32
     out:         [batches, num_heads, head_dim] fp16 (output)
+    temp_p:      optional pre-allocated scratch buffer (float32). Must be
+                 sized for the worst-case max_seq_len the caller will use.
+                 When provided, the kernel zeros it in-place and reuses it
+                 instead of allocating fresh each call — required for
+                 XPUGraph capture/replay to see a stable data_ptr.
     """
     return _eagle_ops.page_attn_decode(
         query, kv_cache, block_table, seq_lens, out,
-        max_query_len, max_seq_len)
+        max_query_len, max_seq_len, temp_p)
 
 
 # ---- MoE Batch Ops (Router, TopK, Up/Down, Accumulate) ----
