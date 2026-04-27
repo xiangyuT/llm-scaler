@@ -1156,6 +1156,28 @@ std::tuple<torch::Tensor, torch::Tensor> moe_topk(
 
 // ═══════════════════════════════════════════════════════════════════════════
 // FUSED: DownFinalize (gate+shared_down+accumulate in 1 submit, 2048 WGs)
+//
+// NOTE on the "redundant gate_dot" fusion choice (2026-04-27):
+//
+// On paper the per-WI recompute of sigmoid(x · shared_expert_gate_weight)
+// inside all 2048 hidden-dim WIs looks wasteful (4M redundant FMAs / MoE
+// layer). We tried splitting it out to `moe_down_gate_precompute_kernel`
+// followed by a gate-free DownFinalize that only does shared_down GEMV:
+//
+//   moe_down_routed_e5m2_kernel(...)          // unchanged
+//   moe_down_gate_precompute_kernel(...)      // +1 kernel launch (~3us)
+//   moe_down_finalize_e5m2_kernel(...)        // no gate dot
+//
+// Result on BMG B70 TP=4 Qwen3-Coder-Next (BSZ=1 decode, ctx=1k/8k/32k):
+// TPOT unchanged within ±0.1 ms. The theoretical "redundant compute" is
+// absorbed by L1 cache — every WI reads the same 4 KB gate weight slice,
+// so 2047/2048 reads are L1 hits and the dot is nearly free. The precompute
+// path adds one launch per MoE layer (~3us × 48 = 150us/step) that cancels
+// any compute savings. For BSZ>1 the tradeoff flips (see moe_forward_full_v2
+// which uses moe_down_gate_precompute_kernel + moe_down_shared + accumulate).
+//
+// Kernel kept in fused form for BSZ=1 (this function) and
+// `moe_forward_fused`/`moe_forward_full` callers below.
 // ═══════════════════════════════════════════════════════════════════════════
 void moe_down_finalize_e5m2_kernel(
     const fp16* x, const fp16* intermediates, const fp16* routed_output,
@@ -1218,6 +1240,11 @@ torch::Tensor moe_forward_fused(
         n_tokens, hidden_size, intermediate_size, top_k, rows_per_token, x.device());
     auto final_output = torch::empty({n_tokens, hidden_size},
         torch::device(x.device()).dtype(torch::kHalf));
+    // NOTE: DownFinalize recomputes sigmoid(x·gate_w) per-WI. Splitting it
+    // out to moe_down_gate_precompute_kernel was tried (2026-04-27) and
+    // showed no TPOT gain at BSZ=1 — L1 absorbs the 4KB gate weight reread
+    // and the extra launch (~3us/layer) cancels the compute savings.
+    // See the comment on moe_down_finalize_e5m2_kernel above.
     moe_down_finalize_e5m2_kernel((const fp16*)x.data_ptr(),
         (const fp16*)intermediates.data_ptr(), (const fp16*)routed_output.data_ptr(),
         (const uint8_t*)shared_down_weight.data_ptr(), shared_down_scale.data_ptr<float>(),
@@ -1304,7 +1331,11 @@ torch::Tensor moe_forward_full(
         (fp16*)s_routed_output.data_ptr(),
         n_tokens, hidden_size, intermediate_size, top_k, rows_per_token, x.device());
 
-    // Down finalize
+    // Down finalize — keep the fused form; see comment on
+    // moe_down_finalize_e5m2_kernel. Splitting gate out to
+    // moe_down_gate_precompute_kernel was tried (2026-04-27) and showed no
+    // BSZ=1 TPOT gain (L1 absorbs the gate weight reread, extra launch
+    // ~3us × 48 layers cancels the compute win).
     moe_down_finalize_e5m2_kernel((const fp16*)x.data_ptr(),
         (const fp16*)s_intermediates.data_ptr(), (const fp16*)s_routed_output.data_ptr(),
         (const uint8_t*)shared_down_weight.data_ptr(), shared_down_scale.data_ptr<float>(),
