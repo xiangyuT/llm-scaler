@@ -7,20 +7,20 @@
 
 // FP8 weight GEMV with per-N scale: output = input @ dequant(weight_fp8) * scale
 // FP32 accumulation, element-wise acc + deferred scale. Optimized for decode (M=1).
-void esimd_gemv_fp8_pern(
+at::Tensor esimd_gemv_fp8_pern(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output,
     int64_t N, int64_t K);
 
 // Fused FP8 GEMV: single kernel submit for 2 weight matrices (same input, same K)
-void esimd_gemv_fp8_pern_fused2(
+at::Tensor esimd_gemv_fp8_pern_fused2(
     at::Tensor input,
     at::Tensor w0, at::Tensor s0, at::Tensor o0, int64_t N0,
     at::Tensor w1, at::Tensor s1, at::Tensor o1, int64_t N1,
     int64_t K);
 
 // Fused FP8 GEMV: single kernel submit for 3 weight matrices (same input, same K)
-void esimd_gemv_fp8_pern_fused3(
+at::Tensor esimd_gemv_fp8_pern_fused3(
     at::Tensor input,
     at::Tensor w0, at::Tensor s0, at::Tensor o0, int64_t N0,
     at::Tensor w1, at::Tensor s1, at::Tensor o1, int64_t N1,
@@ -28,16 +28,16 @@ void esimd_gemv_fp8_pern_fused3(
     int64_t K);
 
 // Per-tensor scale variants: scale is fp32 scalar, N/K auto-detected from tensor shapes
-void esimd_gemv_fp8_pert(
+at::Tensor esimd_gemv_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
-void esimd_gemv_fp8_pert_fused2(
+at::Tensor esimd_gemv_fp8_pert_fused2(
     at::Tensor input,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
     at::Tensor w1, at::Tensor s1, at::Tensor o1);
 
-void esimd_gemv_fp8_pert_fused3(
+at::Tensor esimd_gemv_fp8_pert_fused3(
     at::Tensor input,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
     at::Tensor w1, at::Tensor s1, at::Tensor o1,
@@ -51,7 +51,7 @@ void esimd_gemv_fp8_pert_fused3(
 // v_out:     [nTokens, kvHead*256] fp16
 // norm_wq/wk: [256] fp16 — RMSNorm weights
 // positions: [nTokens] int32 — RoPE position indices
-void esimd_qkv_split_norm_rope(
+at::Tensor esimd_qkv_split_norm_rope(
     at::Tensor qkv_state,
     at::Tensor q_out, at::Tensor gate_out,
     at::Tensor k_out, at::Tensor v_out,
@@ -73,7 +73,7 @@ void esimd_qkv_split_norm_rope(
 // ssm_state_indices:  [N] int32
 // output:             [N, HV, V] fp16
 // z_out:              [N, HV, V] fp16 — z gate extracted from qkvz
-void esimd_gdn_conv_fused(
+at::Tensor esimd_gdn_conv_fused(
     at::Tensor qkvz,
     at::Tensor conv_state, at::Tensor conv_weight, at::Tensor conv_bias,
     at::Tensor conv_state_indices,
@@ -88,7 +88,7 @@ void esimd_gdn_conv_fused(
 // Fused Conv1d + GDN for SEQUENTIAL qkvz layout [q_all|k_all|v_all|z_all]
 // Same as esimd_gdn_conv_fused but reads qkvz/ba in sequential (non-interleaved) order.
 // For models like Qwen3.5-35B-A3B where GEMV outputs sequential layout.
-void esimd_gdn_conv_fused_seq(
+at::Tensor esimd_gdn_conv_fused_seq(
     at::Tensor qkvz,
     at::Tensor conv_state, at::Tensor conv_weight, at::Tensor conv_bias,
     at::Tensor conv_state_indices,
@@ -101,7 +101,7 @@ void esimd_gdn_conv_fused_seq(
     double scale);
 
 // Fused ResidualAdd + RMSNorm + FP8 GEMV (post_attn_norm + router)
-void esimd_resadd_norm_gemv_fp8_pert(
+at::Tensor esimd_resadd_norm_gemv_fp8_pert(
     at::Tensor hidden_states, at::Tensor residual, at::Tensor norm_weight,
     at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output, at::Tensor normed_out,
     double eps);
@@ -114,13 +114,13 @@ void esimd_resadd_norm_gemv_fp8_pert(
 // gemv_scale:    [N, K/128] fp16 — per-block scale
 // output:        [1, N] fp16
 // normed_out:    [1, K] fp16
-void esimd_resadd_norm_gemv_int4_pert(
+at::Tensor esimd_resadd_norm_gemv_int4_pert(
     at::Tensor hidden_states, at::Tensor residual, at::Tensor norm_weight,
     at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output, at::Tensor normed_out,
     double eps);
 
 // Fused ResidualAdd + RMSNorm + 2-matrix FP8 GEMV (input_norm + GDN in_proj)
-void esimd_resadd_norm_gemv2_fp8_pert(
+at::Tensor esimd_resadd_norm_gemv2_fp8_pert(
     at::Tensor hidden_states, at::Tensor residual, at::Tensor norm_weight,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
     at::Tensor w1, at::Tensor s1, at::Tensor o1,
@@ -133,7 +133,7 @@ void esimd_resadd_norm_gemv2_fp8_pert(
 // gemv_weight:  [N, K] FP8, K = HV*V — out_proj weight
 // gemv_scale:   [1] fp32 — per-tensor FP8 scale
 // output:       [1, N] fp16
-void esimd_norm_gemv_fp8_pert(
+at::Tensor esimd_norm_gemv_fp8_pert(
     at::Tensor x, at::Tensor z, at::Tensor norm_weight,
     at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
     int64_t HV, int64_t V, double eps);
@@ -145,21 +145,21 @@ void esimd_norm_gemv_fp8_pert(
 // gemv_weight:  [N, K/8] int32, K = HV*V — packed INT4 out_proj weight
 // gemv_scale:   [N, K/128] fp16 — per-block INT4 scale
 // output:       [1, N] fp16
-void esimd_norm_gemv_int4_pert(
+at::Tensor esimd_norm_gemv_int4_pert(
     at::Tensor x, at::Tensor z, at::Tensor norm_weight,
     at::Tensor gemv_weight, at::Tensor gemv_scale, at::Tensor output,
     int64_t HV, int64_t V, double eps);
 
 // Fused Add + RMSNorm (Gemma-style)
-void esimd_fused_add_rms_norm(
+at::Tensor esimd_fused_add_rms_norm(
     at::Tensor hidden_states, at::Tensor residual,
     at::Tensor weight, double eps);
 
-void esimd_rms_norm_gated(
+at::Tensor esimd_rms_norm_gated(
     at::Tensor x, at::Tensor z, at::Tensor weight,
     at::Tensor output, double eps);
 
-void esimd_fused_add_rms_norm_batched(
+at::Tensor esimd_fused_add_rms_norm_batched(
     at::Tensor hidden_states, at::Tensor residual,
     at::Tensor weight, double eps);
 
@@ -203,7 +203,7 @@ at::Tensor esimd_moe_gemm_fp8(
 
 // FP8 GEMM per-tensor scale: input [M, K] fp16, weight [N, K] fp8, output [M, N] fp16
 // Auto-dispatches: M<=3 → batched GEMV, M>=2 E4M3 → DPAS V9, else → WS
-void esimd_gemm_fp8_pert(
+at::Tensor esimd_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
@@ -214,13 +214,13 @@ void esimd_gemm_fp8_pert(
 // Scale:  [N, K/128] fp16 (per-group). N and K inferred from tensor shapes.
 
 // Single INT4 GEMV: output[1,N] = input[1,K] @ dequant(weight[N,K/2])^T
-void esimd_gemv_int4(
+at::Tensor esimd_gemv_int4(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
 // Fused 2-matrix INT4 GEMV: two GEMVs sharing the same input, single kernel submit.
 // Used for GDN input projection (in_proj_qkvz + in_proj_ba).
-void esimd_gemv_int4_fused2(
+at::Tensor esimd_gemv_int4_fused2(
     at::Tensor input,
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
     at::Tensor w1, at::Tensor s1, at::Tensor o1);
