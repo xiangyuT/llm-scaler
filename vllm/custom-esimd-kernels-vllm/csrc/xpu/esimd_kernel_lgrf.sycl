@@ -18,7 +18,7 @@ static inline sycl::queue& get_device_queue(const at::Tensor& tensor) {
     return c10::xpu::getCurrentXPUStream(tensor.device().index()).queue();
 }
 
-at::Tensor esimd_gdn_conv_fused(
+void esimd_gdn_conv_fused(
     at::Tensor qkvz,                // [N, qkvz_dim] fp16 — projected_states_qkvz
     at::Tensor conv_state,           // [num_cache, 3, 2048] fp16, strided dim0
     at::Tensor conv_weight,          // [2048, 4] fp16
@@ -65,10 +65,9 @@ at::Tensor esimd_gdn_conv_fused(
         (float)scale, conv_stride0, ssm_stride0,
         dpcpp_queue);
 
-    return output;
 }
 
-at::Tensor esimd_gdn_conv_fused_seq(
+void esimd_gdn_conv_fused_seq(
     at::Tensor qkvz,                // [N, qkvz_dim] fp16 — sequential [q|k|v|z]
     at::Tensor conv_state,
     at::Tensor conv_weight,
@@ -113,5 +112,4 @@ at::Tensor esimd_gdn_conv_fused_seq(
         (float)scale, conv_stride0, ssm_stride0,
         dpcpp_queue);
 
-    return output;
 }
