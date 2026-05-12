@@ -1,6 +1,11 @@
 #define FP32_MIN (-1e+38)
 // kv cache shape [2 (k/v), reserved size, page_size, head_num, head_dim]
 // kv cache strid: [2 * page_size * head_num * head_dim, page_size * head_num * head_dim, head_dim, head_dim, 1]
+//
+// Kernels templated on storage dtype `T` (fp16 or bf16). Compute is fp32.
+// Only load/store/cast operations use T; byte strides are unchanged since
+// sizeof(fp16) == sizeof(bf16) == 2.
+template <typename T>
 ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   uint8_t* qState,
   uint8_t* kState,
@@ -11,7 +16,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   uint32_t* pageTable,
   uint32_t* batchKvSeqLen,
   uint32_t batchSize,
-  uint32_t kvCacheBatchStride0, 
+  uint32_t kvCacheBatchStride0,
   uint32_t kvCacheBatchStride1,
   uint32_t pageTableBatchStride,
   uint32_t pageTableSizeLog2,
@@ -47,17 +52,17 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
 
   simd<uint32_t, 16> baseOffsetInc16AsSimd(baseOffsetInc16);
   simd<float, 64 * 4> qqFp32;
-  simd<fp16, 64 * 4> qqFp16;
+  simd<T, 64 * 4> qqT;
   simd<float, 16 * 4> ppFp32;
-  simd<fp16, 16 * 64> kkCache;
+  simd<T, 16 * 64> kkCache;
   simd<float, 1> ppMax;
 
   uint32_t headQ = headKv * gqaRatio;
   uint64_t outputOffset = qHeadIdx * pStride + globalLinearId1 * outputPerGroup + hh * pStride + batchIdx * headQ * pStride;
   uint32_t outputMaxOffset = qHeadIdx * maxStride + globalLinearId1 + hh * maxStride + batchIdx * headQ * maxStride;
-  uint32_t offsetQ = qHeadIdx * headDim * sizeof(fp16) + hh * 32 * sizeof(fp16) + batchIdx * headQ * headDim * sizeof(fp16);
+  uint32_t offsetQ = qHeadIdx * headDim * sizeof(T) + hh * 32 * sizeof(T) + batchIdx * headQ * headDim * sizeof(T);
   uint32_t baseCoordK = globalLinearId1 * outputPerGroup;
-  uint32_t offsetBaseK = hh * 32 * sizeof(fp16) + headDim * kvHeadIdx * sizeof(fp16);
+  uint32_t offsetBaseK = hh * 32 * sizeof(T) + headDim * kvHeadIdx * sizeof(T);
   uint32_t kvSeqOffset = baseCoordK;
 
   if (baseCoordK >= kvSeqLen) {
@@ -68,17 +73,17 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   for (int qn = 0; qn < 4; qn++) {
 #pragma unroll
     for (int qk = 0; qk < 2; qk++) {
-      qqFp16.template bit_cast_view<uint8_t>().select<64, 1>(128 * qn + 64 * qk) =
+      qqT.template bit_cast_view<uint8_t>().template select<64, 1>(128 * qn + 64 * qk) =
         __ESIMD_ENS::lsc_block_load<
         uint8_t,
         64,
         __ESIMD_ENS::lsc_data_size::default_size,
         __ESIMD_ENS::cache_hint::cached,
-        __ESIMD_ENS::cache_hint::cached>((uint8_t*)qState + offsetQ + qn * headDim * sizeof(fp16) + qk * 4 * 32 * sizeof(fp16));
+        __ESIMD_ENS::cache_hint::cached>((uint8_t*)qState + offsetQ + qn * headDim * sizeof(T) + qk * 4 * 32 * sizeof(T));
     }
   }
 
-  qqFp32 = qqFp16;
+  qqFp32 = qqT;
 
 #pragma unroll
   for (int loopIdx = 0; loopIdx < loopCount; loopIdx++) {
@@ -96,18 +101,18 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
       maskNeg = logicSimdOffsetK >= kvSeqLen;
       simdOffsetsK = baseOffsetInc16AsSimd;
 
-      simdOffsetsK = 
-        simdOffsetsK * headKv * headDim * sizeof(fp16) +
+      simdOffsetsK =
+        simdOffsetsK * headKv * headDim * sizeof(T) +
         offsetBaseK +
-        pageIdx * kvCacheBatchStride1 * sizeof(fp16) +
-        pageTableOffset * headKv * headDim * sizeof(fp16)
+        pageIdx * kvCacheBatchStride1 * sizeof(T) +
+        pageTableOffset * headKv * headDim * sizeof(T)
         ;
 
 #pragma unroll
       for (int kk = 0; kk < 2; kk++) {
 #pragma unroll
         for (int kkk = 0; kkk < 4; kkk++) {
-          kkCache.template bit_cast_view<uint32_t>().select<64, 1>(256 * kk + 64 * kkk) =
+          kkCache.template bit_cast_view<uint32_t>().template select<64, 1>(256 * kk + 64 * kkk) =
             __ESIMD_ENS::lsc_gather<
             uint32_t,
             4,
@@ -117,15 +122,15 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
             16,
             uint32_t
             >((uint32_t*)kState, simdOffsetsK, mask);
-          simdOffsetsK += 8 * sizeof(fp16);
+          simdOffsetsK += 8 * sizeof(T);
         }
 
-        simdOffsetsK += 3 * 32 * sizeof(fp16);
+        simdOffsetsK += 3 * 32 * sizeof(T);
 
 #pragma unroll
         for (int kkk = 0; kkk < 16; kkk++) {
-          kkFp32.select<16, 1>(32 * kkk + 16 * 0) = kkCache.select<16, 2>(512 * kk + 32 * kkk + 0);
-          kkFp32.select<16, 1>(32 * kkk + 16 * 1) = kkCache.select<16, 2>(512 * kk + 32 * kkk + 1);
+          kkFp32.select<16, 1>(32 * kkk + 16 * 0) = kkCache.template select<16, 2>(512 * kk + 32 * kkk + 0);
+          kkFp32.select<16, 1>(32 * kkk + 16 * 1) = kkCache.template select<16, 2>(512 * kk + 32 * kkk + 1);
         }
 
 #pragma unroll
@@ -221,6 +226,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   }
 }
 
+template <typename T>
 ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   uint8_t* pState,
   float* pGroupMax,
@@ -280,7 +286,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
 
   simd<float, 4 * 32> ppFp32;
   simd<float, 4> historicMax;
-  simd<fp16, 32 * 16> vvCache;
+  simd<T, 32 * 16> vvCache;
   simd<float, 16 * 16> vvFp32;
   simd<float, 4 * 16> softmaxSum;
   simd<float, 4 * 16> outputFp32;
@@ -298,7 +304,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   uint32_t offsetP = qBaseIdx * pStride + hh * 32 + groupIdx * 1024 + batchIdx * headQ * pStride;
   uint32_t offsetMax = qBaseIdx * maxStride + batchIdx * headQ * maxStride + groupIdx * 16;
   uint32_t offsetGlobalMax = batchIdx * headQ + qBaseIdx;
-  uint32_t widthV = headKv * headDim * sizeof(fp16) - 1;
+  uint32_t widthV = headKv * headDim * sizeof(T) - 1;
   uint32_t heightV = pageTableSize - 1;
   uint32_t vX = channelOffset * 16 + headDim * kvHeadIdx;
   uint32_t vY = 32 * hh;
@@ -307,7 +313,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   if (kvSeqLen == 0) {
     lastPageHeight = 0;
   }
-  fp16* vPtrBase = (fp16*)vState + kvCacheBatchStride0;
+  T* vPtrBase = (T*)vState + kvCacheBatchStride0;
 
   historicMax = FP32_MIN * matMulQuantCoeff;
   softmaxSum = 0;
@@ -340,7 +346,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
 #pragma unroll
   for (uint32_t loop = 0; loop < 16; loop++) {
     if (kvSeqOffset + loop * 64 < kvSeqLen) {
-      fp16* currPtrV = vPtrBase + pageAlignedOffsets[loop];
+      T* currPtrV = vPtrBase + pageAlignedOffsets[loop];
       if (pageTableIndice[loop] + 1 < totalPages) {
         heightV = pageTableSize - 1;
       }
@@ -355,9 +361,9 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
         currMax[pn] = pGroupMax[offsetMax + maxStride * pn];
       }
 
-      vvCache.select<256, 1>(0 * 256) =
+      vvCache.template select<256, 1>(0 * 256) =
         __ESIMD_ENS::lsc_load_2d<
-        fp16,
+        T,
         16,
         16,
         1,
@@ -368,9 +374,9 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
         >(currPtrV, widthV, heightV, widthV, vX, vY);
       vY += 16;
 
-      vvCache.select<256, 1>(1 * 256) =
+      vvCache.template select<256, 1>(1 * 256) =
         __ESIMD_ENS::lsc_load_2d<
-        fp16,
+        T,
         16,
         16,
         1,
@@ -398,7 +404,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
 
 #pragma unroll
       for (int vk = 0; vk < 2; vk++) {
-        vvFp32 = vvCache.select<256, 1>(256 * vk);
+        vvFp32 = vvCache.template select<256, 1>(256 * vk);
 #pragma unroll
         for (int oc = 0; oc < 4; oc++) {
 #pragma unroll
@@ -446,10 +452,10 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
       for (int oc = 0; oc < 2; oc++) {
         outputFp32.select<16, 1>(16 * oc) = outputFp32.select<16, 1>(16 * oc) * softmaxMul[oc];
       }
-      simd<fp16, 32> outputTemp = outputFp32.select<32, 1>(0);
+      simd<T, 32> outputTemp = outputFp32.select<32, 1>(0);
 #pragma unroll
       for (int oc = 0; oc < 2; oc++) {
-        block_store<fp16, 16>((fp16*)out + outputOffset + oc * headDim, outputTemp.select<16, 1>(16 * oc));
+        block_store<T, 16>((T*)out + outputOffset + oc * headDim, outputTemp.template select<16, 1>(16 * oc));
       }
     }
     else {
@@ -463,6 +469,7 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   }
 }
 
+template <typename T>
 ESIMD_INLINE void sdpaDecodeGqa4Phase3(
   float* pTempOut,
   float* pSoftmaxSum,
@@ -546,6 +553,6 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase3(
   float softmaxMul = __ESIMD_DNS::sum<float, float, 16>(smSumFp32.select<16, 1>(0));
   softmaxMul = 1.0f / softmaxMul;
   output.select<16, 1>(0) = output.select<16, 1>(0)* softmaxMul;
-  simd<fp16, 16> outputTemp = output.select<16, 1>(0);
-  block_store<fp16, 16>((fp16*)out + outOffset, outputTemp);
+  simd<T, 16> outputTemp = output.select<16, 1>(0);
+  block_store<T, 16>((T*)out + outOffset, outputTemp);
 }
