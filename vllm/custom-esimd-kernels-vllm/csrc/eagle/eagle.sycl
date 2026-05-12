@@ -39,6 +39,8 @@ static inline uint32_t getHighestBit(uint32_t in) {
 
 #include "eagle.kernels.fp16.h"
 #include "eagle.kernels.bf16.h"
+#include "extend.kernels.fp16.h"
+#include "extend.kernels.bf16.h"
 #include "page.attn.h"
 
 // ── Kernel 1: MTP causal conv1d update kernel ───────────────────────────────
@@ -417,17 +419,138 @@ void page_attn_decode(
   );
 }
 
+// ── chunk_gated_delta_rule_extend: GDN prefill extend kernel ────────────────
+//
+// Per-token outer loop executed inside the kernel (grid = H_v × n_seqs,
+// threads_per_head = 16).  See extend.kernels.fp16.h for math.
+//
+// Shapes (all contiguous):
+//   q, k          : [T_total, H_k, K]           same dtype (fp16 or bf16)
+//   v             : [T_total, H_v, V]
+//   g             : [T_total, H_v]              fp32 (log-space decay)
+//   beta          : [T_total, H_v]              fp32 (post-sigmoid, from fused_gdn_gating)
+//   initial_state : [n_seqs, H_v, V, K]         fp32 (matches mamba_ssm_dtype), IN/OUT
+//   cu_seqlens    : [n_seqs + 1]                int32
+//   out (return)  : [T_total, H_v, V]           same dtype as q
+//
+// Constraints (dense-GDN-only simplifications):
+//   H_k == H_v
+//   K == V == 128
+//
+// Returns:
+//   (out, last_state)  — last_state aliases initial_state (mutated in place)
+//                       and is returned as a convenience so the caller can
+//                       scatter ssm_states[cache_indices] = last_state.
+std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    torch::Tensor& v,
+    torch::Tensor& g,
+    torch::Tensor& beta,
+    torch::Tensor& initial_state,
+    torch::Tensor& cu_seqlens,
+    double scale)
+{
+  TORCH_CHECK(q.scalar_type() == torch::kHalf || q.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(k.scalar_type() == q.scalar_type());
+  TORCH_CHECK(v.scalar_type() == q.scalar_type());
+  TORCH_CHECK(g.scalar_type() == torch::kFloat32,
+              "g must be fp32 (log-space decay)");
+  TORCH_CHECK(beta.scalar_type() == torch::kFloat32,
+              "beta must be fp32 (post-sigmoid); matches fused_gdn_gating output");
+  TORCH_CHECK(initial_state.scalar_type() == torch::kFloat32,
+              "initial_state must be fp32 (matches mamba_ssm_dtype=float32)");
+  TORCH_CHECK(cu_seqlens.scalar_type() == torch::kInt32);
+
+  // q: [1?, T_total, H_k, K] — the caller passes an extra leading batch dim
+  // of size 1 (see gdn_triton.py::extend, matches CUDA contract). Squeeze it.
+  TORCH_CHECK(q.dim() == 4 && q.size(0) == 1, "q must be [1, T_total, H_k, K]");
+  TORCH_CHECK(k.dim() == 4 && k.size(0) == 1);
+  TORCH_CHECK(v.dim() == 4 && v.size(0) == 1);
+  TORCH_CHECK(g.dim() == 3 && g.size(0) == 1);
+  TORCH_CHECK(beta.dim() == 3 && beta.size(0) == 1);
+
+  const int64_t T_total = q.size(1);
+  const int64_t H_k = q.size(2);
+  const int64_t K = q.size(3);
+  const int64_t H_v = v.size(2);
+  const int64_t V = v.size(3);
+
+  TORCH_CHECK(H_k == H_v, "Only dense GDN (H_k == H_v) supported; got H_k=", H_k, " H_v=", H_v);
+  TORCH_CHECK(K == 128 && V == 128, "Only head_dim=128 supported; got K=", K, " V=", V);
+  TORCH_CHECK(initial_state.dim() == 4);
+  TORCH_CHECK(initial_state.size(1) == H_v && initial_state.size(2) == V && initial_state.size(3) == K);
+
+  const int64_t n_seqs = cu_seqlens.size(0) - 1;
+  TORCH_CHECK(initial_state.size(0) == n_seqs, "initial_state.size(0) must equal n_seqs");
+
+  auto out = torch::empty({1, T_total, H_v, V}, q.options());
+
+  sycl::range<2> globalRange(H_v * 16, n_seqs);
+  sycl::range<2> localRange(16, 1);
+  sycl::nd_range<2> range(globalRange, localRange);
+  std::function<void(sycl::handler&)> kernel;
+
+  const uint32_t headQk = (uint32_t)H_k;
+  const uint32_t headV  = (uint32_t)H_v;
+  const uint32_t headDim = (uint32_t)K;
+  const float qScale = (float)scale;
+
+  uint8_t* qPtr = (uint8_t*)q.data_ptr();
+  uint8_t* kPtr = (uint8_t*)k.data_ptr();
+  uint8_t* vPtr = (uint8_t*)v.data_ptr();
+  uint8_t* gPtr = (uint8_t*)g.data_ptr();
+  uint8_t* bPtr = (uint8_t*)beta.data_ptr();
+  uint8_t* sPtr = (uint8_t*)initial_state.data_ptr();
+  uint8_t* oPtr = (uint8_t*)out.data_ptr();
+  uint32_t* cuPtr = (uint32_t*)cu_seqlens.data_ptr();
+
+  switch (q.scalar_type()) {
+    case torch::kHalf:
+      kernel = [=](sycl::handler& cgh) {
+        cgh.parallel_for<class chunkGdnExtendFp16>(
+          range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+            chunkGatedDeltaRuleExtendFp16(
+              qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
+              headQk, headV, headDim, qScale, ndi);
+          });
+      };
+      submit_kernel(kernel, q.device(), "chunk_gated_delta_rule_extend fp16");
+      break;
+    case torch::kBFloat16:
+      kernel = [=](sycl::handler& cgh) {
+        cgh.parallel_for<class chunkGdnExtendBf16>(
+          range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+            chunkGatedDeltaRuleExtendBf16(
+              qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
+              headQk, headV, headDim, qScale, ndi);
+          });
+      };
+      submit_kernel(kernel, q.device(), "chunk_gated_delta_rule_extend bf16");
+      break;
+    default:
+      TORCH_CHECK(false, "unreachable dtype check");
+  }
+
+  return std::make_tuple(out, initial_state);
+}
+
 TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("gdn_eagle(Tensor! qkvz, Tensor! z_out, Tensor conv_w, Tensor? conv_b, Tensor! conv_state, Tensor accepted_tokens, Tensor ba, Tensor a_log, Tensor dt_bias, Tensor! state_in, Tensor ssm_state_idx, Tensor norm_w, int max_query_len) -> Tensor");
     m.def("page_attn_decode(Tensor query, Tensor kv_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len) -> ()");
+    m.def("chunk_gated_delta_rule_extend(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor! initial_state, Tensor cu_seqlens, float scale) -> (Tensor, Tensor)");
+    // Contract: q/k/v/initial_state are fp16 or bf16 (all same); g and beta are fp32
+    // (both emitted by fused_gdn_gating). cu_seqlens is int32.
 }
 
 TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
     m.impl("gdn_eagle", &gdn_eagle);
     m.impl("page_attn_decode", &page_attn_decode);
+    m.impl("chunk_gated_delta_rule_extend", &chunk_gated_delta_rule_extend);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gdn_eagle", &gdn_eagle, "gdn_eagle");
     m.def("page_attn_decode", &page_attn_decode, "page_attn_decode");
+    m.def("chunk_gated_delta_rule_extend", &chunk_gated_delta_rule_extend, "chunk_gated_delta_rule_extend");
 }
