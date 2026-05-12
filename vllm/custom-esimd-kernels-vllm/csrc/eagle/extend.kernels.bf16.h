@@ -14,7 +14,7 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendBf16(
   uint8_t* stateBuf,      // bf16 in/out
   uint8_t* oState,        // bf16 out
   uint32_t* cuSeqlens,
-  uint32_t headQk,
+  uint32_t headQk,        // H_k: headV must be a multiple of this (GQA on GDN)
   uint32_t headV,
   uint32_t headDim,
   float    qScale,
@@ -40,7 +40,8 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendBf16(
   const uint32_t gTokStride  = headV;
   const uint32_t stateHeadElems = headDim * headDim;
   const uint32_t stateSeqElems  = headV * stateHeadElems;
-  const uint32_t kHeadIdx = headIdx;  // H_k == H_v
+  // GQA on GDN: v-heads share k-heads (repeat = H_v / H_k).
+  const uint32_t kHeadIdx = headIdx / (headV / headQk);
 
   bf16* qPtr     = (bf16*)qState;
   bf16* kPtr     = (bf16*)kState;

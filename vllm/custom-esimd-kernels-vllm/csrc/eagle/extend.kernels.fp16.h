@@ -41,7 +41,7 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendFp16(
   uint8_t* stateBuf,      // FP32 in/out: initial_state on entry, last_state on exit
   uint8_t* oState,
   uint32_t* cuSeqlens,
-  uint32_t headQk,        // must equal headV (dense GDN only)
+  uint32_t headQk,        // H_k: headV must be a multiple of this (GQA on GDN)
   uint32_t headV,
   uint32_t headDim,       // = 128
   float    qScale,
@@ -72,7 +72,9 @@ ESIMD_INLINE void chunkGatedDeltaRuleExtendFp16(
   const uint32_t stateHeadElems = headDim * headDim;                      // per head, in fp16 elements
   const uint32_t stateSeqElems  = headV * stateHeadElems;                 // per seq, in fp16 elements
 
-  const uint32_t kHeadIdx = headIdx;  // H_k == H_v here
+  // GQA on GDN: multiple v-heads share one k-head (repeat = H_v / H_k).
+  // H_k == H_v is the common case (repeat = 1, "dense GDN").
+  const uint32_t kHeadIdx = headIdx / (headV / headQk);
 
   fp16* qPtr     = (fp16*)qState;
   fp16* kPtr     = (fp16*)kState;

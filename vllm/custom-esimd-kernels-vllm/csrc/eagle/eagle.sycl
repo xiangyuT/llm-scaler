@@ -433,8 +433,8 @@ void page_attn_decode(
 //   cu_seqlens    : [n_seqs + 1]                int32
 //   out (return)  : [T_total, H_v, V]           same dtype as q
 //
-// Constraints (dense-GDN-only simplifications):
-//   H_k == H_v
+// Constraints:
+//   H_v % H_k == 0    (dense-GDN: ==1; Qwen3.5-4B: ==2)
 //   K == V == 128
 //
 // Returns:
@@ -476,7 +476,8 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
   const int64_t H_v = v.size(2);
   const int64_t V = v.size(3);
 
-  TORCH_CHECK(H_k == H_v, "Only dense GDN (H_k == H_v) supported; got H_k=", H_k, " H_v=", H_v);
+  TORCH_CHECK(H_v % H_k == 0,
+              "GDN extend kernel requires H_v % H_k == 0; got H_k=", H_k, " H_v=", H_v);
   TORCH_CHECK(K == 128 && V == 128, "Only head_dim=128 supported; got K=", K, " V=", V);
   TORCH_CHECK(initial_state.dim() == 4);
   TORCH_CHECK(initial_state.size(1) == H_v && initial_state.size(2) == V && initial_state.size(3) == K);
