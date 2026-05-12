@@ -167,6 +167,16 @@ inline void dumpDeviceMem(sycl::queue& debugDumpQueue, void* deviceMem, size_t s
 }
 
 // ── Kernel 3: page attention kernel ───────────────────────────────
+// Templated on storage dtype T (fp16 or bf16). The kernel class tags (paPhase*)
+// must be distinct per T so SYCL doesn't coalesce the two instantiations.
+template <typename T>
+class paPhase1ForwardT;
+template <typename T>
+class paPhase2ForwardT;
+template <typename T>
+class paPhase3ForwardT;
+
+template <typename T>
 void page_attention_forward_kernel(
   uint8_t* qState,
   uint8_t* kvCache,
@@ -224,25 +234,25 @@ void page_attention_forward_kernel(
   std::function<void(sycl::handler&)> kernelPhase3;
 
   kernelPhase1 = [&](sycl::handler& cgh) {
-    cgh.parallel_for<class paPhase1Forward>(
+    cgh.parallel_for<paPhase1ForwardT<T>>(
       rangePaPhase1, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
-        sdpaDecodeGqa4Phase1(qState, kvCache, (uint8_t*)pState, pGroupMax, pGlobalMax, pPollP, pageTable, kvSeqLens,
+        sdpaDecodeGqa4Phase1<T>(qState, kvCache, (uint8_t*)pState, pGroupMax, pGlobalMax, pPollP, pageTable, kvSeqLens,
           batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, idx);
       });
     };
 
   kernelPhase2 = [&](sycl::handler& cgh) {
-    cgh.parallel_for<class paPhase2Forward>(
+    cgh.parallel_for<paPhase2ForwardT<T>>(
       rangePaPhase2, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
-        sdpaDecodeGqa4Phase2((uint8_t*)pState, pGroupMax, kvCache, pGlobalMax, pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens,
+        sdpaDecodeGqa4Phase2<T>((uint8_t*)pState, pGroupMax, kvCache, pGlobalMax, pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens,
           batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, maxKvSeqLen, flag, gqaRatio, idx);
       });
     };
 
   kernelPhase3 = [&](sycl::handler& cgh) {
-    cgh.parallel_for<class paPhase3Forward>(
+    cgh.parallel_for<paPhase3ForwardT<T>>(
       rangePaPhase3, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
-        sdpaDecodeGqa4Phase3(pTempOut, pGlobalSoftmaxSum, out, kvSeqLens,
+        sdpaDecodeGqa4Phase3<T>(pTempOut, pGlobalSoftmaxSum, out, kvSeqLens,
           batches, headV, maxKvSeqLen, gqaRatio, idx);
       });
     };
@@ -339,9 +349,12 @@ void page_attn_decode(
   TORCH_CHECK(seq_lens.dim() == 1);
   TORCH_CHECK(kv_cache.dim() == 5);
   TORCH_CHECK(query.dim() == 3, "query must be [batches, num_q_heads, head_dim]");
-  TORCH_CHECK(query.scalar_type() == torch::kHalf);
-  TORCH_CHECK(kv_cache.scalar_type() == torch::kHalf);
-  TORCH_CHECK(out.scalar_type() == torch::kHalf);
+  TORCH_CHECK(query.scalar_type() == torch::kHalf || query.scalar_type() == torch::kBFloat16,
+              "query must be fp16 or bf16");
+  TORCH_CHECK(kv_cache.scalar_type() == query.scalar_type(),
+              "kv_cache dtype must match query dtype");
+  TORCH_CHECK(out.scalar_type() == query.scalar_type(),
+              "out dtype must match query dtype");
 
   uint32_t kvCacheStride0 = kv_cache.stride(0);
   uint32_t kvCacheStride1 = kv_cache.stride(1);
@@ -390,33 +403,41 @@ void page_attn_decode(
   float* pGloablSoftmaxSum = (float*)pOutTemp + szOutTemp;
   sycl::queue& queue = c10::xpu::getCurrentXPUStream(kv_cache.device().index()).queue();
 
-  page_attention_forward_kernel(
-    (uint8_t*)query.data_ptr(),
-    (uint8_t*)kv_cache.data_ptr(),
-    (uint32_t*)block_table.data_ptr(),
-    (uint32_t*)seq_lens.data_ptr(),
-    (uint8_t*)out.data_ptr(),
-    pState,
-    pGroupMax,
-    pGlobalMax,
-    pPollP,
-    pOutTemp,
-    pGloablSoftmaxSum,
-    batches,
-    nTokens,
-    headQk,
-    headV,
-    headDim,
-    kvCacheStride0,
-    kvCacheStride1,
-    pageTableBatchStride,
-    pageTableSizeLog2,
-    hiddenDimP,
-    hiddenDimPMax,
-    maxSeqLen,
-    gqaRatio,
-    kv_cache.device()
-  );
+  auto launch = [&](auto dtypeTag) {
+    using T = decltype(dtypeTag);
+    page_attention_forward_kernel<T>(
+      (uint8_t*)query.data_ptr(),
+      (uint8_t*)kv_cache.data_ptr(),
+      (uint32_t*)block_table.data_ptr(),
+      (uint32_t*)seq_lens.data_ptr(),
+      (uint8_t*)out.data_ptr(),
+      pState,
+      pGroupMax,
+      pGlobalMax,
+      pPollP,
+      pOutTemp,
+      pGloablSoftmaxSum,
+      batches,
+      nTokens,
+      headQk,
+      headV,
+      headDim,
+      kvCacheStride0,
+      kvCacheStride1,
+      pageTableBatchStride,
+      pageTableSizeLog2,
+      hiddenDimP,
+      hiddenDimPMax,
+      maxSeqLen,
+      gqaRatio,
+      kv_cache.device()
+    );
+  };
+  if (query.scalar_type() == torch::kHalf) {
+    launch(fp16{});
+  } else {
+    launch(bf16{});
+  }
 }
 
 // ── chunk_gated_delta_rule_extend: GDN prefill extend kernel ────────────────
