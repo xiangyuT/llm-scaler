@@ -56,73 +56,73 @@ ext_modules.append(
 ### for lgrf esimd kernels
 
 ### MoE auxiliary kernels — no DPAS, standard compilation
-ext_modules.append(
-    SyclExtension(
-        name="custom_esimd_kernels_vllm.custom_esimd_kernels_moe",
-        sources=[
-            "csrc/xpu/esimd_kernel_moe.sycl",
-            "csrc/xpu/torch_extension_moe.cc",
-        ],
-        include_dirs=[
-            root / "include",
-            root / "csrc",
-        ],
-        extra_compile_args={
-            "cxx": ["-O3", "-std=c++17"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     f"-I{torch_include}"],
-        },
-        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-        py_limited_api=False,
-    )
-)
+# [skip-ptl-moe-aux] ext_modules.append(
+# [skip-ptl-moe-aux]     SyclExtension(
+# [skip-ptl-moe-aux]         name="custom_esimd_kernels_vllm.custom_esimd_kernels_moe",
+# [skip-ptl-moe-aux]         sources=[
+# [skip-ptl-moe-aux]             "csrc/xpu/esimd_kernel_moe.sycl",
+# [skip-ptl-moe-aux]             "csrc/xpu/torch_extension_moe.cc",
+# [skip-ptl-moe-aux]         ],
+# [skip-ptl-moe-aux]         include_dirs=[
+# [skip-ptl-moe-aux]             root / "include",
+# [skip-ptl-moe-aux]             root / "csrc",
+# [skip-ptl-moe-aux]         ],
+# [skip-ptl-moe-aux]         extra_compile_args={
+# [skip-ptl-moe-aux]             "cxx": ["-O3", "-std=c++17"],
+# [skip-ptl-moe-aux]             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+# [skip-ptl-moe-aux]                      f"-I{torch_include}"],
+# [skip-ptl-moe-aux]         },
+# [skip-ptl-moe-aux]         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+# [skip-ptl-moe-aux]         py_limited_api=False,
+# [skip-ptl-moe-aux]     )
+# [skip-ptl-moe-aux] )
 ### MoE auxiliary kernels
 
 ### FP8 GEMM (M>1) — uses DPAS, compile with JIT only (no AOT to avoid device mismatch)
-ext_modules.append(
-    SyclExtension(
-        name="custom_esimd_kernels_vllm.custom_esimd_kernels_gemm",
-        sources=[
-            "csrc/xpu/esimd_kernel_gemm.sycl",
-            "csrc/xpu/torch_extension_gemm.cc",
-        ],
-        include_dirs=[
-            root / "include",
-            root / "csrc",
-        ],
-        extra_compile_args={
-            "cxx": ["-O3", "-std=c++17"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     f"-I{torch_include}"],
-        },
-        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-        py_limited_api=False,
-    )
-)
+# [skip-ptl-fp8-gemm] ext_modules.append(
+# [skip-ptl-fp8-gemm]     SyclExtension(
+# [skip-ptl-fp8-gemm]         name="custom_esimd_kernels_vllm.custom_esimd_kernels_gemm",
+# [skip-ptl-fp8-gemm]         sources=[
+# [skip-ptl-fp8-gemm]             "csrc/xpu/esimd_kernel_gemm.sycl",
+# [skip-ptl-fp8-gemm]             "csrc/xpu/torch_extension_gemm.cc",
+# [skip-ptl-fp8-gemm]         ],
+# [skip-ptl-fp8-gemm]         include_dirs=[
+# [skip-ptl-fp8-gemm]             root / "include",
+# [skip-ptl-fp8-gemm]             root / "csrc",
+# [skip-ptl-fp8-gemm]         ],
+# [skip-ptl-fp8-gemm]         extra_compile_args={
+# [skip-ptl-fp8-gemm]             "cxx": ["-O3", "-std=c++17"],
+# [skip-ptl-fp8-gemm]             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+# [skip-ptl-fp8-gemm]                      f"-I{torch_include}"],
+# [skip-ptl-fp8-gemm]         },
+# [skip-ptl-fp8-gemm]         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+# [skip-ptl-fp8-gemm]         py_limited_api=False,
+# [skip-ptl-fp8-gemm]     )
+# [skip-ptl-fp8-gemm] )
 ### FP8 GEMM kernels
 
 ### TopK V2 — vectorized softmax+topk for 512 experts (AOT for BMG)
-ext_modules.append(
-    SyclExtension(
-        name="custom_esimd_kernels_vllm.esimd_topk_v2",
-        sources=[
-            "csrc/xpu/esimd_kernel_topk_v2.sycl",
-            "csrc/xpu/torch_extension_topk_v2.cc",
-        ],
-        include_dirs=[
-            root / "include",
-            root / "csrc",
-        ],
-        extra_compile_args={
-            "cxx": ["-O3", "-std=c++17"],
-            "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
-                     f"-I{torch_include}"],
-        },
-        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-        py_limited_api=False,
-    )
-)
+# [skip-ptl-topk-v2] ext_modules.append(
+# [skip-ptl-topk-v2]     SyclExtension(
+# [skip-ptl-topk-v2]         name="custom_esimd_kernels_vllm.esimd_topk_v2",
+# [skip-ptl-topk-v2]         sources=[
+# [skip-ptl-topk-v2]             "csrc/xpu/esimd_kernel_topk_v2.sycl",
+# [skip-ptl-topk-v2]             "csrc/xpu/torch_extension_topk_v2.cc",
+# [skip-ptl-topk-v2]         ],
+# [skip-ptl-topk-v2]         include_dirs=[
+# [skip-ptl-topk-v2]             root / "include",
+# [skip-ptl-topk-v2]             root / "csrc",
+# [skip-ptl-topk-v2]         ],
+# [skip-ptl-topk-v2]         extra_compile_args={
+# [skip-ptl-topk-v2]             "cxx": ["-O3", "-std=c++17"],
+# [skip-ptl-topk-v2]             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
+# [skip-ptl-topk-v2]                      "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+# [skip-ptl-topk-v2]                      f"-I{torch_include}"],
+# [skip-ptl-topk-v2]         },
+# [skip-ptl-topk-v2]         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+# [skip-ptl-topk-v2]         py_limited_api=False,
+# [skip-ptl-topk-v2]     )
+# [skip-ptl-topk-v2] )
 ### TopK V2 kernels
 
 ### Eagle kernels (GDN + Page Attention) — from custom-esimd-kernels-vllm-eagle
@@ -147,71 +147,71 @@ ext_modules.append(
 ### Eagle kernels
 
 ### MoE Batch kernels (Router, TopK, Up/Down, Accumulate) — FP8
-ext_modules.append(
-    SyclExtension(
-        name="custom_esimd_kernels_vllm.moe_ops",
-        sources=[
-            "csrc/moe_batch/moe.sycl",
-        ],
-        include_dirs=[
-            root / "csrc" / "moe_batch",
-        ],
-        extra_compile_args={
-            "cxx": ["-O3", "-std=c++20"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     f"-I{torch_include}"],
-        },
-        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-        py_limited_api=False,
-    )
-)
+# [skip-ptl-moe-batch] ext_modules.append(
+# [skip-ptl-moe-batch]     SyclExtension(
+# [skip-ptl-moe-batch]         name="custom_esimd_kernels_vllm.moe_ops",
+# [skip-ptl-moe-batch]         sources=[
+# [skip-ptl-moe-batch]             "csrc/moe_batch/moe.sycl",
+# [skip-ptl-moe-batch]         ],
+# [skip-ptl-moe-batch]         include_dirs=[
+# [skip-ptl-moe-batch]             root / "csrc" / "moe_batch",
+# [skip-ptl-moe-batch]         ],
+# [skip-ptl-moe-batch]         extra_compile_args={
+# [skip-ptl-moe-batch]             "cxx": ["-O3", "-std=c++20"],
+# [skip-ptl-moe-batch]             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+# [skip-ptl-moe-batch]                      f"-I{torch_include}"],
+# [skip-ptl-moe-batch]         },
+# [skip-ptl-moe-batch]         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+# [skip-ptl-moe-batch]         py_limited_api=False,
+# [skip-ptl-moe-batch]     )
+# [skip-ptl-moe-batch] )
 ### MoE Batch kernels (FP8)
 
 ### MoE INT4 Batch kernels (Router, TopK, Up/Down, Finalize) — INT4
-ext_modules.append(
-    SyclExtension(
-        name="custom_esimd_kernels_vllm.moe_int4_ops",
-        sources=[
-            "csrc/moe_batch/moe_int4.sycl",
-        ],
-        include_dirs=[
-            root / "csrc" / "moe_batch",
-            root / "csrc" / "xpu" / "esimd_kernels",  # for moe_ops.h (TopK V2)
-            root / "csrc",  # for relative includes
-        ],
-        extra_compile_args={
-            "cxx": ["-O3", "-std=c++20"],
-            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     f"-I{torch_include}"],
-        },
-        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-        py_limited_api=False,
-    )
-)
+# [skip-ptl-moe-int4] ext_modules.append(
+# [skip-ptl-moe-int4]     SyclExtension(
+# [skip-ptl-moe-int4]         name="custom_esimd_kernels_vllm.moe_int4_ops",
+# [skip-ptl-moe-int4]         sources=[
+# [skip-ptl-moe-int4]             "csrc/moe_batch/moe_int4.sycl",
+# [skip-ptl-moe-int4]         ],
+# [skip-ptl-moe-int4]         include_dirs=[
+# [skip-ptl-moe-int4]             root / "csrc" / "moe_batch",
+# [skip-ptl-moe-int4]             root / "csrc" / "xpu" / "esimd_kernels",  # for moe_ops.h (TopK V2)
+# [skip-ptl-moe-int4]             root / "csrc",  # for relative includes
+# [skip-ptl-moe-int4]         ],
+# [skip-ptl-moe-int4]         extra_compile_args={
+# [skip-ptl-moe-int4]             "cxx": ["-O3", "-std=c++20"],
+# [skip-ptl-moe-int4]             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+# [skip-ptl-moe-int4]                      f"-I{torch_include}"],
+# [skip-ptl-moe-int4]         },
+# [skip-ptl-moe-int4]         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+# [skip-ptl-moe-int4]         py_limited_api=False,
+# [skip-ptl-moe-int4]     )
+# [skip-ptl-moe-int4] )
 ### MoE INT4 Batch kernels
 
 ### MoE INT4 Prefill kernels (DPAS-based, for large-M prefill) — AOT BMG only
-ext_modules.append(
-    SyclExtension(
-        name="custom_esimd_kernels_vllm.moe_int4_prefill_ops",
-        sources=[
-            "csrc/moe_prefill/moe_prefill_int4.sycl",
-        ],
-        include_dirs=[
-            root / "csrc" / "moe_prefill",
-            root / "csrc" / "xpu" / "esimd_kernels",  # for moe_ops.h (TopK V2)
-            root / "csrc",
-        ],
-        extra_compile_args={
-            "cxx": ["-O3", "-std=c++20"],
-            "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
-                     "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
-                     f"-I{torch_include}"],
-        },
-        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-        py_limited_api=False,
-    )
-)
+# [skip-ptl-moe-int4-prefill] ext_modules.append(
+# [skip-ptl-moe-int4-prefill]     SyclExtension(
+# [skip-ptl-moe-int4-prefill]         name="custom_esimd_kernels_vllm.moe_int4_prefill_ops",
+# [skip-ptl-moe-int4-prefill]         sources=[
+# [skip-ptl-moe-int4-prefill]             "csrc/moe_prefill/moe_prefill_int4.sycl",
+# [skip-ptl-moe-int4-prefill]         ],
+# [skip-ptl-moe-int4-prefill]         include_dirs=[
+# [skip-ptl-moe-int4-prefill]             root / "csrc" / "moe_prefill",
+# [skip-ptl-moe-int4-prefill]             root / "csrc" / "xpu" / "esimd_kernels",  # for moe_ops.h (TopK V2)
+# [skip-ptl-moe-int4-prefill]             root / "csrc",
+# [skip-ptl-moe-int4-prefill]         ],
+# [skip-ptl-moe-int4-prefill]         extra_compile_args={
+# [skip-ptl-moe-int4-prefill]             "cxx": ["-O3", "-std=c++20"],
+# [skip-ptl-moe-int4-prefill]             "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
+# [skip-ptl-moe-int4-prefill]                      "-fsycl-targets=spir64_gen", "-Xs", "-device bmg",
+# [skip-ptl-moe-int4-prefill]                      f"-I{torch_include}"],
+# [skip-ptl-moe-int4-prefill]         },
+# [skip-ptl-moe-int4-prefill]         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+# [skip-ptl-moe-int4-prefill]         py_limited_api=False,
+# [skip-ptl-moe-int4-prefill]     )
+# [skip-ptl-moe-int4-prefill] )
 ### MoE INT4 Prefill kernels
 
 setup(
