@@ -177,7 +177,8 @@ class paPhase3ForwardT;
 template <typename T>
 void page_attention_forward_kernel(
   uint8_t* qState,
-  uint8_t* kvCache,
+  uint8_t* kCache,
+  uint8_t* vCache,
   uint32_t* pageTable,
   uint32_t* kvSeqLens,
   uint8_t* out,
@@ -192,7 +193,6 @@ void page_attention_forward_kernel(
   uint32_t headQk,
   uint32_t headV,
   uint32_t headDim,
-  uint32_t kvCacheStride0,
   uint32_t kvCacheStride1,
   uint32_t pageTableBatchStride,
   uint32_t pageTableSizeLog2,
@@ -234,16 +234,16 @@ void page_attention_forward_kernel(
   kernelPhase1 = [&](sycl::handler& cgh) {
     cgh.parallel_for<paPhase1ForwardT<T>>(
       rangePaPhase1, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
-        sdpaDecodeGqa4Phase1<T>(qState, kvCache, (uint8_t*)pState, pGroupMax, pGlobalMax, pPollP, pageTable, kvSeqLens,
-          batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, idx);
+        sdpaDecodeGqa4Phase1<T>(qState, kCache, (uint8_t*)pState, pGroupMax, pGlobalMax, pPollP, pageTable, kvSeqLens,
+          batches, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, idx);
       });
     };
 
   kernelPhase2 = [&](sycl::handler& cgh) {
     cgh.parallel_for<paPhase2ForwardT<T>>(
       rangePaPhase2, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
-        sdpaDecodeGqa4Phase2<T>((uint8_t*)pState, pGroupMax, kvCache, pGlobalMax, pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens,
-          batches, kvCacheStride0, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, maxKvSeqLen, flag, gqaRatio, idx);
+        sdpaDecodeGqa4Phase2<T>((uint8_t*)pState, pGroupMax, vCache, pGlobalMax, pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens,
+          batches, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, maxKvSeqLen, flag, gqaRatio, idx);
       });
     };
 
@@ -336,7 +336,8 @@ torch::Tensor gdn_eagle(
 
 void page_attn_decode(
   torch::Tensor query,
-  torch::Tensor kv_cache,
+  torch::Tensor key_cache,
+  torch::Tensor value_cache,
   torch::Tensor block_table,
   torch::Tensor seq_lens,
   torch::Tensor& out,
@@ -346,22 +347,32 @@ void page_attn_decode(
 ) {
   TORCH_CHECK(block_table.dim() == 2);
   TORCH_CHECK(seq_lens.dim() == 1);
-  TORCH_CHECK(kv_cache.dim() == 5);
+  TORCH_CHECK(key_cache.dim() == 4,
+              "key_cache must be [num_pages, page_size, num_kv_heads, head_dim]");
+  TORCH_CHECK(value_cache.dim() == 4,
+              "value_cache must be [num_pages, page_size, num_kv_heads, head_dim]");
+  TORCH_CHECK(key_cache.sizes() == value_cache.sizes(),
+              "key_cache and value_cache must have identical shape");
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0),
+              "key_cache and value_cache must have identical page stride");
   TORCH_CHECK(query.dim() == 3, "query must be [batches, num_q_heads, head_dim]");
   TORCH_CHECK(query.scalar_type() == torch::kHalf || query.scalar_type() == torch::kBFloat16,
               "query must be fp16 or bf16");
-  TORCH_CHECK(kv_cache.scalar_type() == query.scalar_type(),
-              "kv_cache dtype must match query dtype");
+  TORCH_CHECK(key_cache.scalar_type() == query.scalar_type(),
+              "key_cache dtype must match query dtype");
+  TORCH_CHECK(value_cache.scalar_type() == query.scalar_type(),
+              "value_cache dtype must match query dtype");
   TORCH_CHECK(out.scalar_type() == query.scalar_type(),
               "out dtype must match query dtype");
 
-  uint32_t kvCacheStride0 = kv_cache.stride(0);
-  uint32_t kvCacheStride1 = kv_cache.stride(1);
-  uint32_t totalDimsKv = kv_cache.dim();
+  // Page stride = stride(0) when K/V are separate [num_pages, page_size, H, D]
+  // tensors. This replaces the old merged [2, N, P, H, D] layout's stride(1).
+  uint32_t kvCacheStride1 = key_cache.stride(0);
+  uint32_t totalDimsKv = key_cache.dim();
 
-  uint32_t headDim = kv_cache.size(totalDimsKv - 1);
-  uint32_t headV = kv_cache.size(totalDimsKv - 2);
-  uint32_t pageSize = kv_cache.size(totalDimsKv - 3);
+  uint32_t headDim = key_cache.size(totalDimsKv - 1);
+  uint32_t headV = key_cache.size(totalDimsKv - 2);
+  uint32_t pageSize = key_cache.size(totalDimsKv - 3);
   uint32_t batches = seq_lens.size(0);
   // Derive headQk from query tensor shape instead of hardcoding gqaRatio=4
   uint32_t headQk = query.size(1);
@@ -400,12 +411,12 @@ void page_attn_decode(
                 "temp_p buffer too small: ", temp_p.numel(), " < ", totalSize);
     TORCH_CHECK(temp_p.scalar_type() == torch::kFloat32,
                 "temp_p must be float32");
-    TORCH_CHECK(temp_p.device() == kv_cache.device(),
-                "temp_p must be on the same device as kv_cache");
+    TORCH_CHECK(temp_p.device() == key_cache.device(),
+                "temp_p must be on the same device as key_cache");
     temp_p.zero_();
   } else {
     temp_p = torch::zeros({ static_cast<long>(totalSize) },
-      torch::device(kv_cache.device()).dtype(torch::kFloat32));
+      torch::device(key_cache.device()).dtype(torch::kFloat32));
   }
 
   float* pState = (float*)temp_p.data_ptr();
@@ -414,13 +425,14 @@ void page_attn_decode(
   uint32_t* pPollP = (uint32_t*)pGlobalMax + szGlobalMax;
   float* pOutTemp = (float*)pPollP + szGlobalPollP;
   float* pGloablSoftmaxSum = (float*)pOutTemp + szOutTemp;
-  sycl::queue& queue = c10::xpu::getCurrentXPUStream(kv_cache.device().index()).queue();
+  sycl::queue& queue = c10::xpu::getCurrentXPUStream(key_cache.device().index()).queue();
 
   auto launch = [&](auto dtypeTag) {
     using T = decltype(dtypeTag);
     page_attention_forward_kernel<T>(
       (uint8_t*)query.data_ptr(),
-      (uint8_t*)kv_cache.data_ptr(),
+      (uint8_t*)key_cache.data_ptr(),
+      (uint8_t*)value_cache.data_ptr(),
       (uint32_t*)block_table.data_ptr(),
       (uint32_t*)seq_lens.data_ptr(),
       (uint8_t*)out.data_ptr(),
@@ -435,7 +447,6 @@ void page_attn_decode(
       headQk,
       headV,
       headDim,
-      kvCacheStride0,
       kvCacheStride1,
       pageTableBatchStride,
       pageTableSizeLog2,
@@ -443,7 +454,7 @@ void page_attn_decode(
       hiddenDimPMax,
       maxSeqLen,
       gqaRatio,
-      kv_cache.device()
+      key_cache.device()
     );
   };
   if (query.scalar_type() == torch::kHalf) {
@@ -455,7 +466,7 @@ void page_attn_decode(
 
 TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("gdn_eagle(Tensor! qkvz, Tensor! z_out, Tensor conv_w, Tensor? conv_b, Tensor! conv_state, Tensor accepted_tokens, Tensor ba, Tensor a_log, Tensor dt_bias, Tensor! state_in, Tensor ssm_state_idx, Tensor norm_w, int max_query_len) -> Tensor");
-    m.def("page_attn_decode(Tensor query, Tensor kv_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, Tensor(a!)? temp_p=None) -> ()");
+    m.def("page_attn_decode(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, Tensor(a!)? temp_p=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
