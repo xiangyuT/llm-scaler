@@ -1,62 +1,127 @@
+"""custom_esimd_kernels_vllm — PTL iGPU (XeLPG) tolerant __init__.
+
+Some compiled extensions require XMX (DPAS) intrinsics which are not
+available on XeLPG (Panther Lake iGPU). On such hosts we build only a
+subset of the extensions; the remaining ones are absent. Everything Qwen3.5
+dense production needs (``esimd_qkv_split_norm_rope`` from
+``custom_esimd_kernels`` and ``eagle_page_attn_decode`` from ``eagle_ops``)
+lives in DPAS-free extensions.
+
+Each ext import and each op re-export is wrapped in a best-effort block so
+a missing extension does not prevent the package from loading. Missing ops
+surface as AttributeError only at call time.
+"""
+import logging
+
 import torch
 
-# Core ESIMD kernels (4 compiled modules)
-from custom_esimd_kernels_vllm import custom_esimd_kernels
-from custom_esimd_kernels_vllm import custom_esimd_kernels_lgrf
-from custom_esimd_kernels_vllm import custom_esimd_kernels_moe
-from custom_esimd_kernels_vllm import custom_esimd_kernels_gemm
+_log = logging.getLogger(__name__)
+_MISSING_EXTS = []
 
-# Eagle kernels — registers torch.ops.eagle_ops.*
-from custom_esimd_kernels_vllm import eagle_ops
 
-# MoE Batch kernels — registers torch.ops.moe_ops.*
-from custom_esimd_kernels_vllm import moe_ops
+def _try_import_ext(name):
+    """Import a compiled extension and also re-dlopen it with RTLD_GLOBAL.
 
-# MoE INT4 Batch kernels — registers torch.ops.moe_int4_ops.*
-from custom_esimd_kernels_vllm import moe_int4_ops
+    Without RTLD_GLOBAL the TORCH_LIBRARY static initializers in some of
+    these .so files do not register their ops into torch.ops.<namespace>.
+    Confirmed via nm: symbols TORCH_LIBRARY_FRAGMENT_static_init_<ns> exist
+    but are not invoked under the default Python ext loader's RTLD_LOCAL.
+    """
+    import ctypes
+    import os
+    try:
+        mod = __import__(f"custom_esimd_kernels_vllm.{name}")
+        sub = getattr(mod, name)
+        so_path = getattr(sub, "__file__", None)
+        if so_path and os.path.exists(so_path):
+            # idempotent: CDLL caches by path internally
+            ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+        return True
+    except ImportError as e:
+        _MISSING_EXTS.append((name, str(e)))
+        return False
 
-from custom_esimd_kernels_vllm.ops import (
-    # Core ESIMD ops
-    esimd_gemv_fp8_pern,
-    esimd_gemv_fp8_pern_fused2,
-    esimd_gemv_fp8_pern_fused3,
-    esimd_gemv_fp8_pert,
-    esimd_gemv_fp8_pert_fused2,
-    esimd_gemv_fp8_pert_fused3,
+
+# Compiled extension modules (each registers ops into torch.ops).
+_try_import_ext("custom_esimd_kernels")        # always expected (Qwen3.5 path)
+_try_import_ext("custom_esimd_kernels_lgrf")   # always expected (Qwen3.5 path)
+_try_import_ext("custom_esimd_kernels_moe")    # XeLPG: skipped (DPAS-dep)
+_try_import_ext("custom_esimd_kernels_gemm")   # XeLPG: skipped (DPAS-dep)
+_try_import_ext("eagle_ops")                   # Qwen3.5 decode uses this
+_try_import_ext("moe_ops")                     # XeLPG: skipped (DPAS-dep)
+_try_import_ext("moe_int4_ops")                # XeLPG: skipped (DPAS-dep)
+
+if _MISSING_EXTS:
+    _log.info(
+        "custom_esimd_kernels_vllm: extensions unavailable on this host: %s. "
+        "Ops from those extensions will raise AttributeError at call time.",
+        ", ".join(n for n, _ in _MISSING_EXTS),
+    )
+
+# Python wrappers. ops.py does not eagerly call any kernel; each function
+# only touches torch.ops.custom_esimd_kernels_vllm.<name> when invoked.
+# Re-export them individually so a missing op (e.g. an MoE helper that the
+# skipped extension would have registered) doesn't block loading the rest.
+from custom_esimd_kernels_vllm import ops as _ops_mod  # noqa: E402
+
+_EXPORTS = [
+    # Core ESIMD ops (custom_esimd_kernels)
+    "esimd_gemv_fp8_pern",
+    "esimd_gemv_fp8_pern_fused2",
+    "esimd_gemv_fp8_pern_fused3",
+    "esimd_gemv_fp8_pert",
+    "esimd_gemv_fp8_pert_fused2",
+    "esimd_gemv_fp8_pert_fused3",
     # INT4 GEMV ops
-    esimd_gemv_int4,
-    esimd_gemv_int4_fused2,
-    esimd_qkv_split_norm_rope,
-    esimd_gdn_conv_fused,
-    esimd_fused_add_rms_norm,
-    esimd_rms_norm_gated,
-    esimd_fused_add_rms_norm_batched,
-    esimd_resadd_norm_gemv_fp8_pert,
-    esimd_resadd_norm_gemv_int4_pert,
-    esimd_resadd_norm_gemv2_fp8_pert,
-    esimd_norm_gemv_fp8_pert,
-    esimd_norm_gemv_int4_pert,
-    esimd_gdn_conv_fused_seq,
-    esimd_moe_topk,
-    esimd_moe_scatter_fused,
-    esimd_moe_silu_mul,
-    esimd_moe_gather,
-    esimd_moe_gemm_fp8,
-    esimd_moe_gemm_fp8_pert,
-    esimd_gemm_fp8_pert,
+    "esimd_gemv_int4",
+    "esimd_gemv_int4_fused2",
+    "esimd_qkv_split_norm_rope",
+    "esimd_gdn_conv_fused",
+    "esimd_fused_add_rms_norm",
+    "esimd_rms_norm_gated",
+    "esimd_fused_add_rms_norm_batched",
+    "esimd_resadd_norm_gemv_fp8_pert",
+    "esimd_resadd_norm_gemv_int4_pert",
+    "esimd_resadd_norm_gemv2_fp8_pert",
+    "esimd_norm_gemv_fp8_pert",
+    "esimd_norm_gemv_int4_pert",
+    "esimd_gdn_conv_fused_seq",
+    "esimd_moe_topk",
+    "esimd_moe_scatter_fused",
+    "esimd_moe_silu_mul",
+    "esimd_moe_gather",
+    "esimd_moe_gemm_fp8",
+    "esimd_moe_gemm_fp8_pert",
+    "esimd_gemm_fp8_pert",
     # Eagle ops
-    eagle_gdn,
-    eagle_page_attn_decode,
-    eagle_page_attn_decode_temp_size,
+    "eagle_gdn",
+    "eagle_page_attn_decode",
+    "eagle_page_attn_decode_temp_size",
     # MoE Batch ops
-    moe_router_forward,
-    moe_batch_topk,
-    moe_up_forward,
-    moe_down_forward,
-    moe_accumulate,
-    moe_forward_fused,
-    moe_forward_full,
+    "moe_router_forward",
+    "moe_batch_topk",
+    "moe_up_forward",
+    "moe_down_forward",
+    "moe_accumulate",
+    "moe_forward_fused",
+    "moe_forward_full",
     # MoE INT4 Batch ops
-    moe_router_forward_int4,
-    moe_forward_full_int4,
-)
+    "moe_router_forward_int4",
+    "moe_forward_full_int4",
+]
+
+_MISSING_OPS = []
+for _name in _EXPORTS:
+    try:
+        globals()[_name] = getattr(_ops_mod, _name)
+    except AttributeError:
+        _MISSING_OPS.append(_name)
+
+if _MISSING_OPS:
+    _log.info(
+        "custom_esimd_kernels_vllm: %d python ops not available on this host "
+        "(e.g. %s%s)",
+        len(_MISSING_OPS),
+        ", ".join(_MISSING_OPS[:3]),
+        " ..." if len(_MISSING_OPS) > 3 else "",
+    )
