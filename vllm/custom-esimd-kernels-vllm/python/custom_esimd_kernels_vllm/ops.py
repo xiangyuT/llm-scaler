@@ -1,4 +1,6 @@
 """Python wrappers for custom ESIMD kernels."""
+from typing import Optional
+
 import torch
 
 _ops = torch.ops.custom_esimd_kernels_vllm
