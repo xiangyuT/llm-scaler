@@ -672,7 +672,8 @@ def eagle_page_attn_decode_temp_size(
 
 def eagle_page_attn_decode(
     query: torch.Tensor,
-    kv_cache: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     out: torch.Tensor,
@@ -682,19 +683,24 @@ def eagle_page_attn_decode(
 ) -> None:
     """Eagle paged attention decode.
 
-    query:       [batches, num_heads, head_dim] fp16
-    kv_cache:    paged KV cache tensor
-    block_table: [batches, max_blocks] int32
-    seq_lens:    [batches] int32
-    out:         [batches, num_heads, head_dim] fp16 (output)
-    temp_p:      optional pre-allocated scratch buffer (float32). Must be
-                 sized for the worst-case max_seq_len the caller will use.
-                 When provided, the kernel zeros it in-place and reuses it
-                 instead of allocating fresh each call — required for
-                 XPUGraph capture/replay to see a stable data_ptr.
+    query:        [batches, num_heads, head_dim] fp16/bf16
+    key_cache:    [num_pages, page_size, num_kv_heads, head_dim]
+    value_cache:  [num_pages, page_size, num_kv_heads, head_dim]
+                  K and V must share shape and page stride. For callers with a
+                  vllm-style merged [2, N, P, H, D] buffer, pass kv[0] and
+                  kv[1]; for sglang's separated-K/V pool, pass the pool
+                  tensors directly (no gather needed).
+    block_table:  [batches, max_blocks] int32
+    seq_lens:     [batches] int32
+    out:          [batches, num_heads, head_dim] fp16/bf16 (output)
+    temp_p:       optional pre-allocated scratch buffer (float32). Must be
+                  sized for the worst-case max_seq_len the caller will use.
+                  When provided, the kernel zeros it in-place and reuses it
+                  instead of allocating fresh each call — required for
+                  XPUGraph capture/replay to see a stable data_ptr.
     """
     return _eagle_ops.page_attn_decode(
-        query, kv_cache, block_table, seq_lens, out,
+        query, key_cache, value_cache, block_table, seq_lens, out,
         max_query_len, max_seq_len, temp_p)
 
 

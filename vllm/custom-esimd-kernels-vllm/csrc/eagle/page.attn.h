@@ -1,6 +1,9 @@
 #define FP32_MIN (-1e+38)
-// kv cache shape [2 (k/v), reserved size, page_size, head_num, head_dim]
-// kv cache strid: [2 * page_size * head_num * head_dim, page_size * head_num * head_dim, head_dim, head_dim, 1]
+// K and V caches are passed as two independent tensors, each shaped
+// [reserved_size, page_size, head_num, head_dim] with page stride =
+// kvCacheBatchStride1. This matches sglang's separated-K/V pool layout;
+// the vllm-style merged [2, reserved_size, ...] layout can still be used
+// by slicing (tensor[0], tensor[1]) at the call site.
 //
 // Kernels templated on storage dtype `T` (fp16 or bf16). Compute is fp32.
 // Only load/store/cast operations use T; byte strides are unchanged since
@@ -16,7 +19,6 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase1(
   uint32_t* pageTable,
   uint32_t* batchKvSeqLen,
   uint32_t batchSize,
-  uint32_t kvCacheBatchStride0,
   uint32_t kvCacheBatchStride1,
   uint32_t pageTableBatchStride,
   uint32_t pageTableSizeLog2,
@@ -238,7 +240,6 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   uint32_t* pageTable,
   uint32_t* batchKvSeqLen,
   uint32_t batchSize,
-  uint32_t kvCacheBatchStride0,
   uint32_t kvCacheBatchStride1,
   uint32_t pageTableBatchStride,
   uint32_t pageTableSizeLog2,
@@ -313,7 +314,8 @@ ESIMD_INLINE void sdpaDecodeGqa4Phase2(
   if (kvSeqLen == 0) {
     lastPageHeight = 0;
   }
-  T* vPtrBase = (T*)vState + kvCacheBatchStride0;
+  // vState is V's independent base pointer (no K-to-V offset needed).
+  T* vPtrBase = (T*)vState;
 
   historicMax = FP32_MIN * matMulQuantCoeff;
   softmaxSum = 0;
