@@ -102,6 +102,43 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
   m.def("esimd_fused_add_rms_norm_batched(Tensor hidden_states, Tensor residual, "
         "Tensor weight, float eps) -> Tensor");
   m.impl("esimd_fused_add_rms_norm_batched", torch::kXPU, &esimd_fused_add_rms_norm_batched);
+
+  // ============ PTL non-DPAS replacements (XE2-only AOT bypass) ============
+
+  // SDPA Decode (non-paged)
+  m.def("esimd_sdpa_decode(Tensor q, Tensor k, Tensor v, "
+        "bool is_causal, float? scale) -> Tensor");
+  m.impl("esimd_sdpa_decode", torch::kXPU, &esimd_sdpa_decode);
+
+  // SDPA Decode Varlen (paged KV cache) — replaces _vllm_fa2_C.varlen_fwd
+  m.def("esimd_sdpa_decode_varlen(Tensor q, Tensor key_cache, "
+        "Tensor value_cache, Tensor cu_seqlens_q, "
+        "int max_seqlen_k, bool is_causal, float? scale, "
+        "Tensor block_table, Tensor? seqused_k) -> Tensor");
+  m.impl("esimd_sdpa_decode_varlen", torch::kXPU, &esimd_sdpa_decode_varlen);
+
+  // GDN Attention — replaces _xpu_C.gdn_attention
+  m.def("esimd_gdn_attention(Tensor core_attn_out, Tensor z, "
+        "Tensor projected_states_qkvz, Tensor projected_states_ba, "
+        "int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, "
+        "Tensor conv_state, Tensor ssm_state, "
+        "Tensor conv_weights, Tensor? conv_bias, "
+        "str activation, Tensor A_log, Tensor dt_bias, "
+        "int num_prefills, int num_decodes, "
+        "Tensor? has_initial_state, "
+        "Tensor non_spec_query_start_loc, Tensor non_spec_state_indices_tensor, "
+        "int num_actual_tokens, int tp_size, bool reorder_input) -> ()");
+  m.impl("esimd_gdn_attention", torch::kXPU, &esimd_gdn_attention);
+
+  // BF16 GEMV (single matrix)
+  m.def("esimd_gemv_bf16(Tensor input, Tensor weight, Tensor output) -> Tensor");
+  m.impl("esimd_gemv_bf16", torch::kXPU, &esimd_gemv_bf16);
+
+  // BF16 GEMV fused (2 matrices sharing input)
+  m.def("esimd_gemv_bf16_fused2(Tensor input, "
+        "Tensor w0, Tensor o0, "
+        "Tensor w1, Tensor o1) -> Tensor");
+  m.impl("esimd_gemv_bf16_fused2", torch::kXPU, &esimd_gemv_bf16_fused2);
 }
 
 PyMODINIT_FUNC PyInit_custom_esimd_kernels() {

@@ -230,3 +230,63 @@ at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,
     at::Tensor output, at::Tensor expert_idx,
     int64_t N, int64_t K, int64_t num_experts, int64_t max_tokens_per_expert);
+
+// ======================== PTL non-DPAS replacements ========================
+// Replace XE2-only AOT vllm_xpu_kernels ops with pure-SYCL ESIMD kernels
+// (SPIR64 IR — JIT to running GPU; works on Xe2 BMG and Xe3 PTL alike).
+
+// SDPA decode — non-paged. q [seq_len, n_heads, HD], k/v [kv_len, n_kv_heads, HD].
+// HD must be 256. Replaces non-paged FA path.
+at::Tensor esimd_sdpa_decode(
+    at::Tensor q, at::Tensor k, at::Tensor v,
+    bool is_causal,
+    std::optional<double> scale);
+
+// SDPA decode — paged KV cache. q [total_q, n_heads, HD]; key_cache/value_cache
+// [num_blocks, block_size, n_kv_heads, HD]. block_table [batch, max_blks] int32.
+// HD must be 256. Replaces vllm_xpu_kernels._vllm_fa2_C.varlen_fwd on PTL.
+at::Tensor esimd_sdpa_decode_varlen(
+    at::Tensor q, at::Tensor key_cache, at::Tensor value_cache,
+    at::Tensor cu_seqlens_q,
+    int64_t max_seqlen_k,
+    bool is_causal,
+    std::optional<double> scale,
+    at::Tensor block_table,
+    std::optional<at::Tensor> seqused_k);
+
+// GDN attention — Causal Conv1d + Gated Delta Rule fused.
+// Replaces vllm_xpu_kernels._xpu_C.gdn_attention on PTL.
+// ssm_state layout: [num_blocks, num_v_heads/tp, head_v_dim, head_k_dim] (H, V, K).
+void esimd_gdn_attention(
+    at::Tensor core_attn_out,
+    at::Tensor z,
+    at::Tensor projected_states_qkvz,
+    at::Tensor projected_states_ba,
+    int64_t num_k_heads, int64_t num_v_heads,
+    int64_t head_k_dim, int64_t head_v_dim,
+    at::Tensor conv_state,
+    at::Tensor ssm_state,
+    at::Tensor conv_weights,
+    std::optional<at::Tensor> conv_bias,
+    std::string activation,
+    at::Tensor A_log,
+    at::Tensor dt_bias,
+    int64_t num_prefills,
+    int64_t num_decodes,
+    std::optional<at::Tensor> has_initial_state,
+    at::Tensor non_spec_query_start_loc,
+    at::Tensor non_spec_state_indices_tensor,
+    int64_t num_actual_tokens,
+    int64_t tp_size,
+    bool reorder_input);
+
+// BF16 GEMV — single matrix.
+// input: [1, K] bf16, weight: [N, K] bf16, output: [1, N] bf16. Auto-VL.
+at::Tensor esimd_gemv_bf16(
+    at::Tensor input, at::Tensor weight, at::Tensor output);
+
+// BF16 GEMV — fused 2 matrices sharing the same input.
+at::Tensor esimd_gemv_bf16_fused2(
+    at::Tensor input,
+    at::Tensor w0, at::Tensor o0,
+    at::Tensor w1, at::Tensor o1);

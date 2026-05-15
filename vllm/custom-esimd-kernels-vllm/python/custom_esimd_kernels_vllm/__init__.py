@@ -108,6 +108,12 @@ _EXPORTS = [
     # MoE INT4 Batch ops
     "moe_router_forward_int4",
     "moe_forward_full_int4",
+    # PTL non-DPAS replacements (XE2-only AOT bypass)
+    "esimd_sdpa_decode",
+    "esimd_sdpa_decode_varlen",
+    "esimd_gdn_attention",
+    "esimd_gemv_bf16",
+    "esimd_gemv_bf16_fused2",
 ]
 
 _MISSING_OPS = []

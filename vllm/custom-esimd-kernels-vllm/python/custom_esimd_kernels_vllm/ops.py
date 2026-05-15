@@ -933,3 +933,158 @@ def moe_forward_full_int4(
         shared_expert_gate_weight,
         top_k, num_shared_experts, n_routed_experts,
         use_ggml_layout)
+
+
+# ============================================================================
+# PTL non-DPAS replacements (XE2-only AOT bypass).
+# Ported from intel-sandbox/vLLM-XPU-Win
+# (custom-esimd-kernels-vllm-otherops/python/.../ops.py).
+# These ops compile to SPIR64 IR and JIT to the running GPU, so they work
+# on Xe3 PTL where the upstream vllm_xpu_kernels XE2 AOT binaries fail.
+# ============================================================================
+
+# ---- SDPA Decode (non-paged) ----
+
+def esimd_sdpa_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    is_causal: bool = False,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Scaled Dot-Product Attention (decode) with online softmax.
+
+    q:   [seq_len, n_heads,    256] fp16/bf16
+    k:   [kv_len,  n_kv_heads, 256] fp16/bf16
+    v:   [kv_len,  n_kv_heads, 256] fp16/bf16
+
+    Returns: [seq_len, n_heads, 256] fp16/bf16
+
+    Supports GQA/MQA (n_heads must be divisible by n_kv_heads).
+    head_dim=256 only.
+    """
+    return _ops.esimd_sdpa_decode(q, k, v, is_causal, scale)
+
+
+# ---- SDPA Decode Varlen (paged KV cache) ----
+
+def esimd_sdpa_decode_varlen(
+    q: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_k: int,
+    is_causal: bool = False,
+    scale: float | None = None,
+    block_table: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Variable-length SDPA decode with paged KV cache.
+
+    q:           [total_q, n_heads, 256]                        fp16/bf16
+    key_cache:   [num_blocks, block_size, n_kv_heads, 256]      fp16/bf16
+    value_cache: [num_blocks, block_size, n_kv_heads, 256]      fp16/bf16
+    cu_seqlens_q: [batch_size+1]   int32
+    block_table:  [batch_size, max_num_blocks_per_seq]  int32
+    seqused_k:    [batch_size]     int32  (optional)
+
+    Returns: [total_q, n_heads, 256] fp16/bf16
+    """
+    return _ops.esimd_sdpa_decode_varlen(
+        q, key_cache, value_cache,
+        cu_seqlens_q, max_seqlen_k, is_causal, scale,
+        block_table, seqused_k)
+
+
+# ---- GDN Attention (Causal Conv1d + Gated Delta Rule) ----
+
+def esimd_gdn_attention(
+    core_attn_out: torch.Tensor,
+    z: torch.Tensor,
+    projected_states_qkvz: torch.Tensor,
+    projected_states_ba: torch.Tensor,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    conv_state: torch.Tensor,
+    ssm_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    activation: str,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    num_prefills: int,
+    num_decodes: int,
+    has_initial_state: torch.Tensor | None,
+    non_spec_query_start_loc: torch.Tensor,
+    non_spec_state_indices_tensor: torch.Tensor,
+    num_actual_tokens: int,
+    tp_size: int,
+    reorder_input: bool,
+) -> None:
+    """GDN Attention: Causal Conv1d + Gated Delta Rule, single op.
+
+    Replaces vllm_xpu_kernels._xpu_C.gdn_attention. Same signature, same
+    ssm_state layout: [cache_batch_size, num_v_heads/tp, head_v_dim, head_k_dim]
+    (i.e. (H, V, K)).
+
+    core_attn_out:            [num_actual_tokens, num_v_heads/tp, head_v_dim]
+    z:                        [num_actual_tokens, num_v_heads/tp, head_v_dim]
+    projected_states_qkvz:    [num_actual_tokens, qkvz_dim]
+    projected_states_ba:      [num_actual_tokens, 2*num_v_heads/tp]
+    conv_state:               [cache_batch_size, width-1, conv_elems]
+    ssm_state:                [cache_batch_size, num_v_heads/tp, head_v_dim, head_k_dim]
+    conv_weights:             [conv_elems, width]
+    conv_bias:                [conv_elems] or None
+    A_log, dt_bias:           [num_v_heads/tp]
+    has_initial_state:        [batch_size] bool or None
+    non_spec_query_start_loc: [batch_size+1] int32
+    non_spec_state_indices_tensor: [batch_size] int32
+    activation:               "silu" or "swish"
+    """
+    _ops.esimd_gdn_attention(
+        core_attn_out, z,
+        projected_states_qkvz, projected_states_ba,
+        num_k_heads, num_v_heads, head_k_dim, head_v_dim,
+        conv_state, ssm_state,
+        conv_weights, conv_bias,
+        activation, A_log, dt_bias,
+        num_prefills, num_decodes,
+        has_initial_state,
+        non_spec_query_start_loc, non_spec_state_indices_tensor,
+        num_actual_tokens, tp_size, reorder_input)
+
+
+# ---- BF16 GEMV (W16A16, no quantisation) ----
+
+def esimd_gemv_bf16(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """BF16 GEMV: output = input @ weight^T.
+
+    input:  [1, K] bf16
+    weight: [N, K] bf16
+    output: [1, N] bf16
+
+    FP32 accumulation, no scale/zero-point.
+    """
+    return _ops.esimd_gemv_bf16(input, weight, output)
+
+
+def esimd_gemv_bf16_fused2(
+    input: torch.Tensor,
+    w0: torch.Tensor, o0: torch.Tensor,
+    w1: torch.Tensor, o1: torch.Tensor,
+) -> torch.Tensor:
+    """Fused BF16 GEMV for 2 weight matrices sharing the same input.
+
+    input: [1, K] bf16
+    w0:    [N0, K] bf16   o0: [1, N0] bf16
+    w1:    [N1, K] bf16   o1: [1, N1] bf16
+
+    Single dispatch: work-groups 0..N0-1 -> w0, N0..N0+N1-1 -> w1.
+    """
+    return _ops.esimd_gemv_bf16_fused2(input, w0, o0, w1, o1)
