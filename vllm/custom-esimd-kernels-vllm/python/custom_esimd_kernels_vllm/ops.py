@@ -1088,3 +1088,25 @@ def esimd_gemv_bf16_fused2(
     Single dispatch: work-groups 0..N0-1 -> w0, N0..N0+N1-1 -> w1.
     """
     return _ops.esimd_gemv_bf16_fused2(input, w0, o0, w1, o1)
+
+
+def esimd_reshape_and_cache_flash(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Paged KV cache scatter for flash layout (graph-capture-safe).
+
+    key, value:               [num_tokens, num_kv_heads, head_size] fp16/bf16
+    key_cache, value_cache:   [num_blocks, block_size, num_kv_heads, head_size]
+    slot_mapping:             [num_tokens] int64 — flat index into the
+                              [num_blocks, block_size] grid; values < 0
+                              are silently skipped.
+
+    Replacement for the PyTorch fallback that uses .nonzero() and is
+    therefore incompatible with SYCL command-graph capture.
+    """
+    return _ops.esimd_reshape_and_cache_flash(
+        key, value, key_cache, value_cache, slot_mapping)

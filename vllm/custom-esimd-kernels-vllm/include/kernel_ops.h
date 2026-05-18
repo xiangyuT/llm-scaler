@@ -290,3 +290,12 @@ at::Tensor esimd_gemv_bf16_fused2(
     at::Tensor input,
     at::Tensor w0, at::Tensor o0,
     at::Tensor w1, at::Tensor o1);
+
+// Paged KV cache scatter for flash layout — graph-capture-safe replacement
+// for torch.ops._C_cache_ops.reshape_and_cache_flash.
+void esimd_reshape_and_cache_flash(
+    at::Tensor key,
+    at::Tensor value,
+    at::Tensor key_cache,
+    at::Tensor value_cache,
+    at::Tensor slot_mapping);

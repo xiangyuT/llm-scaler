@@ -139,6 +139,15 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "Tensor w0, Tensor o0, "
         "Tensor w1, Tensor o1) -> Tensor");
   m.impl("esimd_gemv_bf16_fused2", torch::kXPU, &esimd_gemv_bf16_fused2);
+
+  // Paged KV cache scatter — graph-capture-safe replacement for
+  // _C_cache_ops.reshape_and_cache_flash. In-place writes to key_cache /
+  // value_cache; declares mutability via Tensor(a!) annotations.
+  m.def("esimd_reshape_and_cache_flash(Tensor key, Tensor value, "
+        "Tensor(a!) key_cache, Tensor(b!) value_cache, "
+        "Tensor slot_mapping) -> ()");
+  m.impl("esimd_reshape_and_cache_flash",
+         torch::kXPU, &esimd_reshape_and_cache_flash);
 }
 
 PyMODINIT_FUNC PyInit_custom_esimd_kernels() {

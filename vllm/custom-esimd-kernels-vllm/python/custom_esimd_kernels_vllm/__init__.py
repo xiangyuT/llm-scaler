@@ -114,6 +114,7 @@ _EXPORTS = [
     "esimd_gdn_attention",
     "esimd_gemv_bf16",
     "esimd_gemv_bf16_fused2",
+    "esimd_reshape_and_cache_flash",
 ]
 
 _MISSING_OPS = []
