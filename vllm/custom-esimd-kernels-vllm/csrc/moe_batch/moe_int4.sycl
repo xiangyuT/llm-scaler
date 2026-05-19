@@ -305,20 +305,20 @@ void moe_up_routed_int4_kernel(
                         #pragma unroll
                         for (int c = 0; c < CHUNKS_PER_GROUP; c++) {
                             const int k = kg * GROUP + c * BS;
-                            simd<float, BS> xv = block_load<fp16, BS>(x_row + k);
+                            simd<float, BS> xv = convert<float>(block_load<fp16, BS>(x_row + k));
 
                             simd<uint8_t, BS / 2> gp = block_load<uint8_t, BS / 2>(g_row_u8 + k / 2);
                             simd<uint8_t, BS> gu;
                             gu.template select<BS / 2, 2>(0) = gp & 0x0F;
                             gu.template select<BS / 2, 2>(1) = (gp >> 4) & 0x0F;
-                            simd<float, BS> gw_dq = (simd<float, BS>(gu) - 8.0f) * g_scale;
+                            simd<float, BS> gw_dq = (convert<float>(gu) - 8.0f) * g_scale;
                             ag += xv * gw_dq;
 
                             simd<uint8_t, BS / 2> up = block_load<uint8_t, BS / 2>(u_row_u8 + k / 2);
                             simd<uint8_t, BS> uu;
                             uu.template select<BS / 2, 2>(0) = up & 0x0F;
                             uu.template select<BS / 2, 2>(1) = (up >> 4) & 0x0F;
-                            simd<float, BS> uw_dq = (simd<float, BS>(uu) - 8.0f) * u_scale;
+                            simd<float, BS> uw_dq = (convert<float>(uu) - 8.0f) * u_scale;
                             au += xv * uw_dq;
                         }
                     }
@@ -694,13 +694,13 @@ void moe_down_routed_int4_kernel(
                             #pragma unroll
                             for (int c = 0; c < CHUNKS_PER_GROUP; c++) {
                                 const int k = kg * GROUP + c * BS;
-                                simd<float, BS> hv = block_load<fp16, BS>(hi + k);
+                                simd<float, BS> hv = convert<float>(block_load<fp16, BS>(hi + k));
 
                                 simd<uint8_t, BS / 2> wp = block_load<uint8_t, BS / 2>(w_row_u8 + k / 2);
                                 simd<uint8_t, BS> wu;
                                 wu.template select<BS / 2, 2>(0) = wp & 0x0F;
                                 wu.template select<BS / 2, 2>(1) = (wp >> 4) & 0x0F;
-                                simd<float, BS> dw_dq = (simd<float, BS>(wu) - 8.0f) * s;
+                                simd<float, BS> dw_dq = (convert<float>(wu) - 8.0f) * s;
                                 a += hv * dw_dq;
                             }
                         }
