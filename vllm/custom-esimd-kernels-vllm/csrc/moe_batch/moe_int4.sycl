@@ -263,9 +263,16 @@ void moe_up_routed_int4_kernel(
     if (ggml_layout) {
         // GGML N-major: weight [E, 2*d_ff, K_packed], scale [E, 2*d_ff, K_groups]
         // Each WI computes 1 gate + 1 up output (scalar per N).
-        // Vectorize K with block_load<uint32_t, 16> (= 128 K elements,
-        // exactly one group_size of fp16 weights, so the scale read is a
-        // single scalar per block) and block_load<fp16, 128> for x.
+        //
+        // Inner loop ports the v3 vectorized dequant pattern (commit
+        // 62f6ea4 in frameworks.ai.client-ai.esimd-kernels):
+        //   - block_load<uint8_t, BS/2> the packed nibbles
+        //   - simd<>::select<BS/2, 2> + bit-and / shift to unpack 32 nibbles
+        //     into a uint8 vector in-place (no scalar j*8+b loop)
+        //   - convert<float>() + simd FMA into a BS-wide accumulator
+        //   - sum<>() at the end
+        // BS=32 = ESIMD vector width; group_size=128 -> 4 BS chunks share a
+        // scalar scale lookup.
         auto cgf = [&](sycl::handler& cgh) {
             cgh.parallel_for<class MoeUpRoutedInt4GGML>(
                 sycl::range<2>(n_tokens * top_k, intermediate_size),
@@ -281,45 +288,42 @@ void moe_up_routed_int4_kernel(
                     const uint32_t* w_base = gate_up_qweight + (size_t)eid * two_dff * K_packed;
                     const fp16* s_base = gate_up_scales + (size_t)eid * two_dff * K_groups;
 
-                    const uint32_t* g_row = w_base + (size_t)n_col * K_packed;
-                    const uint32_t* u_row = w_base + (size_t)(intermediate_size + n_col) * K_packed;
+                    // View the int32-packed rows as uint8 (LSB nibble order
+                    // matches the int32 byte layout, see _dequant_int4_to_fp16).
+                    const uint8_t* g_row_u8 = (const uint8_t*)(w_base + (size_t)n_col * K_packed);
+                    const uint8_t* u_row_u8 = (const uint8_t*)(w_base + (size_t)(intermediate_size + n_col) * K_packed);
                     const fp16* g_s_row = s_base + (size_t)n_col * K_groups;
                     const fp16* u_s_row = s_base + (size_t)(intermediate_size + n_col) * K_groups;
 
-                    constexpr int VEC = 16;  // 16 int32 packs == 128 K == 1 group
-                    float g_acc = 0.f, u_acc = 0.f;
-                    for (int kp_blk = 0; kp_blk < K_packed; kp_blk += VEC) {
-                        simd<uint32_t, VEC> g_pk =
-                            block_load<uint32_t, VEC>(g_row + kp_blk);
-                        simd<uint32_t, VEC> u_pk =
-                            block_load<uint32_t, VEC>(u_row + kp_blk);
-                        simd<fp16, 128> xv16 =
-                            block_load<fp16, 128>(x_row + kp_blk * 8);
-                        const int gi = kp_blk / VEC;  // VEC int32 == 1 group
-                        const float g_scale = (float)g_s_row[gi];
-                        const float u_scale = (float)u_s_row[gi];
-
-                        // Stack copy lets the inner unrolled loop use scalar
-                        // floats (avoiding the simd<>::operator[] ambiguity).
-                        simd<float, 128> xv_f = xv16;  // fp16 -> fp32 promote
-                        float xv_arr[128];
+                    constexpr int BS = 32;          // ESIMD vector width
+                    constexpr int GROUP = 128;      // q4_0 group size
+                    constexpr int CHUNKS_PER_GROUP = GROUP / BS;  // = 4
+                    simd<float, BS> ag(0.f), au(0.f);
+                    for (int kg = 0; kg < K_groups; kg++) {
+                        const float g_scale = (float)g_s_row[kg];
+                        const float u_scale = (float)u_s_row[kg];
                         #pragma unroll
-                        for (int t = 0; t < 128; t++) xv_arr[t] = xv_f[t];
+                        for (int c = 0; c < CHUNKS_PER_GROUP; c++) {
+                            const int k = kg * GROUP + c * BS;
+                            simd<float, BS> xv = block_load<fp16, BS>(x_row + k);
 
-                        #pragma unroll
-                        for (int j = 0; j < VEC; j++) {
-                            const uint32_t gp = g_pk[j];
-                            const uint32_t up = u_pk[j];
-                            #pragma unroll
-                            for (int b = 0; b < 8; b++) {
-                                const float xv = xv_arr[j * 8 + b];
-                                const float g_val = ((float)((gp >> (b * 4)) & 0xFu) - 8.f) * g_scale;
-                                const float u_val = ((float)((up >> (b * 4)) & 0xFu) - 8.f) * u_scale;
-                                g_acc += g_val * xv;
-                                u_acc += u_val * xv;
-                            }
+                            simd<uint8_t, BS / 2> gp = block_load<uint8_t, BS / 2>(g_row_u8 + k / 2);
+                            simd<uint8_t, BS> gu;
+                            gu.template select<BS / 2, 2>(0) = gp & 0x0F;
+                            gu.template select<BS / 2, 2>(1) = (gp >> 4) & 0x0F;
+                            simd<float, BS> gw_dq = (simd<float, BS>(gu) - 8.0f) * g_scale;
+                            ag += xv * gw_dq;
+
+                            simd<uint8_t, BS / 2> up = block_load<uint8_t, BS / 2>(u_row_u8 + k / 2);
+                            simd<uint8_t, BS> uu;
+                            uu.template select<BS / 2, 2>(0) = up & 0x0F;
+                            uu.template select<BS / 2, 2>(1) = (up >> 4) & 0x0F;
+                            simd<float, BS> uw_dq = (simd<float, BS>(uu) - 8.0f) * u_scale;
+                            au += xv * uw_dq;
                         }
                     }
+                    const float g_acc = sycl::ext::intel::esimd::detail::sum<float, float, BS>(ag);
+                    const float u_acc = sycl::ext::intel::esimd::detail::sum<float, float, BS>(au);
 
                     float silu = g_acc / (1.f + sycl::exp(-g_acc));
                     const int routed_row = token * rows_per_token + k_idx;
@@ -658,8 +662,8 @@ void moe_down_routed_int4_kernel(
 
     if (ggml_layout) {
         // GGML N-major: weight [E, d_model, K_packed_inter], scale [E, d_model, K_groups_inter]
-        // Vectorize K with block_load<uint32_t,16> = 128 K elements = 1 group;
-        // single scalar scale per block.
+        // Same v3-style vectorized dequant as the Up kernel: BS=32 ESIMD
+        // vector + 4 chunks per q4_0 group of 128.
         auto cgf = [&](sycl::handler& cgh) {
             cgh.parallel_for<class MoeDownRoutedInt4GGML>(
                 sycl::range<2>(n_tokens * top_k, hidden_size),
@@ -673,50 +677,51 @@ void moe_down_routed_int4_kernel(
                     const int routed_row = token * rows_per_token + k_idx;
                     const fp16* hi = intermediates + (size_t)routed_row * intermediate_size;
 
-                    const uint32_t* w_row = down_qweight + (size_t)eid * hidden_size * K_packed + (size_t)j * K_packed;
-                    const fp16* s_row = down_scales + (size_t)eid * hidden_size * K_groups + (size_t)j * K_groups;
+                    const uint8_t* w_row_u8 = (const uint8_t*)(down_qweight
+                        + (size_t)eid * hidden_size * K_packed
+                        + (size_t)j * K_packed);
+                    const fp16* s_row = down_scales
+                        + (size_t)eid * hidden_size * K_groups
+                        + (size_t)j * K_groups;
 
-                    constexpr int VEC = 16;  // 16 packs == 128 K == 1 group
-                    float acc = 0.f;
-                    if (K_packed >= VEC) {
-                        for (int kp_blk = 0; kp_blk < K_packed; kp_blk += VEC) {
-                            simd<uint32_t, VEC> wpk =
-                                block_load<uint32_t, VEC>(w_row + kp_blk);
-                            simd<fp16, 128> hi_blk =
-                                block_load<fp16, 128>(hi + kp_blk * 8);
-                            const int gi = kp_blk / VEC;
-                            const float s = (float)s_row[gi];
-
-                            simd<float, 128> hi_f = hi_blk;
-                            float hi_arr[128];
+                    constexpr int BS = 32;
+                    constexpr int GROUP = 128;
+                    constexpr int CHUNKS_PER_GROUP = GROUP / BS;  // = 4
+                    simd<float, BS> a(0.f);
+                    if (K_groups > 0) {
+                        for (int kg = 0; kg < K_groups; kg++) {
+                            const float s = (float)s_row[kg];
                             #pragma unroll
-                            for (int t = 0; t < 128; t++) hi_arr[t] = hi_f[t];
+                            for (int c = 0; c < CHUNKS_PER_GROUP; c++) {
+                                const int k = kg * GROUP + c * BS;
+                                simd<float, BS> hv = block_load<fp16, BS>(hi + k);
 
-                            #pragma unroll
-                            for (int j_v = 0; j_v < VEC; j_v++) {
-                                const uint32_t packed = wpk[j_v];
-                                #pragma unroll
-                                for (int b = 0; b < 8; b++) {
-                                    const float w_val =
-                                        ((float)((packed >> (b * 4)) & 0xFu) - 8.f) * s;
-                                    acc += w_val * hi_arr[j_v * 8 + b];
-                                }
+                                simd<uint8_t, BS / 2> wp = block_load<uint8_t, BS / 2>(w_row_u8 + k / 2);
+                                simd<uint8_t, BS> wu;
+                                wu.template select<BS / 2, 2>(0) = wp & 0x0F;
+                                wu.template select<BS / 2, 2>(1) = (wp >> 4) & 0x0F;
+                                simd<float, BS> dw_dq = (simd<float, BS>(wu) - 8.0f) * s;
+                                a += hv * dw_dq;
                             }
                         }
                     } else {
-                        // Fallback for tiny K_packed (<16) — scalar.
+                        // Path for unusually small intermediate (no full group):
+                        // walk the residual K elements scalar-style.
                         for (int kp = 0; kp < K_packed; kp++) {
-                            const uint32_t packed = w_row[kp];
+                            const uint32_t packed = down_qweight[
+                                (size_t)eid * hidden_size * K_packed
+                                + (size_t)j * K_packed + kp];
                             const int gi = kp / 16;
                             const float s = (float)s_row[gi];
                             #pragma unroll
                             for (int b = 0; b < 8; b++) {
                                 const float w_val =
                                     ((float)((packed >> (b * 4)) & 0xFu) - 8.f) * s;
-                                acc += w_val * (float)hi[kp * 8 + b];
+                                a[0] += w_val * (float)hi[kp * 8 + b];
                             }
                         }
                     }
+                    float acc = sycl::ext::intel::esimd::detail::sum<float, float, BS>(a);
 
                     float w = (float)routing_weights[route_idx];
                     output[(size_t)routed_row * hidden_size + j] = fp16(acc * w);
