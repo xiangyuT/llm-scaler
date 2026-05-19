@@ -174,26 +174,28 @@ ext_modules.append(
 ### MoE Batch kernels (FP8)
 
 ### MoE INT4 Batch kernels (Router, TopK, Up/Down, Finalize) — INT4
-# [skip-ptl-moe-int4] ext_modules.append(
-# [skip-ptl-moe-int4]     SyclExtension(
-# [skip-ptl-moe-int4]         name="custom_esimd_kernels_vllm.moe_int4_ops",
-# [skip-ptl-moe-int4]         sources=[
-# [skip-ptl-moe-int4]             "csrc/moe_batch/moe_int4.sycl",
-# [skip-ptl-moe-int4]         ],
-# [skip-ptl-moe-int4]         include_dirs=[
-# [skip-ptl-moe-int4]             root / "csrc" / "moe_batch",
-# [skip-ptl-moe-int4]             root / "csrc" / "xpu" / "esimd_kernels",  # for moe_ops.h (TopK V2)
-# [skip-ptl-moe-int4]             root / "csrc",  # for relative includes
-# [skip-ptl-moe-int4]         ],
-# [skip-ptl-moe-int4]         extra_compile_args={
-# [skip-ptl-moe-int4]             "cxx": ["-O3", "-std=c++20"],
-# [skip-ptl-moe-int4]             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
-# [skip-ptl-moe-int4]                      f"-I{torch_include}"],
-# [skip-ptl-moe-int4]         },
-# [skip-ptl-moe-int4]         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-# [skip-ptl-moe-int4]         py_limited_api=False,
-# [skip-ptl-moe-int4]     )
-# [skip-ptl-moe-int4] )
+# Re-enabled on PTL (XeLPG): the kernel imports the xmx namespace but
+# doesn't actually issue dpas instructions, so it builds and runs on PTL.
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_vllm.moe_int4_ops",
+        sources=[
+            "csrc/moe_batch/moe_int4.sycl",
+        ],
+        include_dirs=[
+            root / "csrc" / "moe_batch",
+            root / "csrc" / "xpu" / "esimd_kernels",  # for moe_ops.h (TopK V2)
+            root / "csrc",  # for relative includes
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++20"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
 ### MoE INT4 Batch kernels
 
 setup(
