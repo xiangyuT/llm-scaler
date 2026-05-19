@@ -662,14 +662,21 @@ void moe_down_routed_int4_kernel(
 
     if (ggml_layout) {
         // GGML N-major: weight [E, d_model, K_packed_inter], scale [E, d_model, K_groups_inter]
-        // Same v3-style vectorized dequant as the Up kernel: BS=32 ESIMD
-        // vector + 4 chunks per q4_0 group of 128.
+        // V3-style VS=4: each WI emits 4 N-rows, sharing the K-loop's hi[]
+        // load 4× via 1 lsc_load_2d<uint8_t, BS/2, VS>. Surface dims are in
+        // BYTES (uint8 view of int32 weight = K_packed * 4 bytes per N-row).
+        // Grid divides hidden_size by VS.
+        constexpr int VS = 4;
+        TORCH_CHECK(hidden_size % VS == 0,
+            "moe down ggml VS=4 requires hidden_size % 4 == 0");
+        const int half_inter = K_packed * 4;  // bytes per N-row in uint8 view
         auto cgf = [&](sycl::handler& cgh) {
             cgh.parallel_for<class MoeDownRoutedInt4GGML>(
-                sycl::range<2>(n_tokens * top_k, hidden_size),
+                sycl::range<2>(n_tokens * top_k, hidden_size / VS),
                 [=](sycl::id<2> idx) SYCL_ESIMD_KERNEL {
                     const int route_idx = (int)idx[0];
-                    const int j         = (int)idx[1];
+                    const int j_blk     = (int)idx[1];
+                    const int j_base    = j_blk * VS;
                     const int token     = route_idx / top_k;
                     const int k_idx     = route_idx % top_k;
 
@@ -677,57 +684,64 @@ void moe_down_routed_int4_kernel(
                     const int routed_row = token * rows_per_token + k_idx;
                     const fp16* hi = intermediates + (size_t)routed_row * intermediate_size;
 
-                    const uint8_t* w_row_u8 = (const uint8_t*)(down_qweight
-                        + (size_t)eid * hidden_size * K_packed
-                        + (size_t)j * K_packed);
-                    const fp16* s_row = down_scales
-                        + (size_t)eid * hidden_size * K_groups
-                        + (size_t)j * K_groups;
+                    const uint8_t* dw_surface =
+                        (const uint8_t*)(down_qweight
+                            + (size_t)eid * hidden_size * K_packed);
+                    const fp16* ds_surface =
+                        down_scales + (size_t)eid * hidden_size * K_groups;
 
                     constexpr int BS = 32;
                     constexpr int GROUP = 128;
                     constexpr int CHUNKS_PER_GROUP = GROUP / BS;  // = 4
-                    simd<float, BS> a(0.f);
-                    if (K_groups > 0) {
-                        for (int kg = 0; kg < K_groups; kg++) {
-                            const float s = (float)s_row[kg];
-                            #pragma unroll
-                            for (int c = 0; c < CHUNKS_PER_GROUP; c++) {
-                                const int k = kg * GROUP + c * BS;
-                                simd<float, BS> hv = convert<float>(block_load<fp16, BS>(hi + k));
-
-                                simd<uint8_t, BS / 2> wp = block_load<uint8_t, BS / 2>(w_row_u8 + k / 2);
-                                simd<uint8_t, BS> wu;
-                                wu.template select<BS / 2, 2>(0) = wp & 0x0F;
-                                wu.template select<BS / 2, 2>(1) = (wp >> 4) & 0x0F;
-                                simd<float, BS> dw_dq = (convert<float>(wu) - 8.0f) * s;
-                                a += hv * dw_dq;
-                            }
+                    simd<float, VS * BS> acc(0.f);
+                    for (int kg = 0; kg < K_groups; kg++) {
+                        // Per-row scales for this group of 4 N-rows.
+                        float s_arr[VS];
+                        #pragma unroll
+                        for (int v = 0; v < VS; v++) {
+                            s_arr[v] = (float)ds_surface[(j_base + v) * K_groups + kg];
                         }
-                    } else {
-                        // Path for unusually small intermediate (no full group):
-                        // walk the residual K elements scalar-style.
-                        for (int kp = 0; kp < K_packed; kp++) {
-                            const uint32_t packed = down_qweight[
-                                (size_t)eid * hidden_size * K_packed
-                                + (size_t)j * K_packed + kp];
-                            const int gi = kp / 16;
-                            const float s = (float)s_row[gi];
+                        #pragma unroll
+                        for (int c = 0; c < CHUNKS_PER_GROUP; c++) {
+                            const int k = kg * GROUP + c * BS;
+                            simd<float, BS> hv = convert<float>(block_load<fp16, BS>(hi + k));
+
+                            // 1 LSC fetches BS/2=16 bytes × VS=4 rows = 64 bytes.
+                            simd<uint8_t, BS / 2 * VS> dp =
+                                __ESIMD_ENS::lsc_load_2d<
+                                    uint8_t, BS / 2, VS, 1, false, false,
+                                    __ESIMD_ENS::cache_hint::cached,
+                                    __ESIMD_ENS::cache_hint::cached>(
+                                        dw_surface,
+                                        (uint32_t)half_inter - 1u,    // surface width-1 (bytes)
+                                        (uint32_t)hidden_size - 1u,   // surface height-1
+                                        (uint32_t)half_inter - 1u,    // pitch-1 (bytes)
+                                        (uint32_t)(k / 2),            // x (byte offset)
+                                        (uint32_t)j_base);            // y (row)
+
                             #pragma unroll
-                            for (int b = 0; b < 8; b++) {
-                                const float w_val =
-                                    ((float)((packed >> (b * 4)) & 0xFu) - 8.f) * s;
-                                a[0] += w_val * (float)hi[kp * 8 + b];
+                            for (int v = 0; v < VS; v++) {
+                                simd<uint8_t, BS / 2> rp =
+                                    dp.template select<BS / 2, 1>(v * BS / 2);
+                                simd<uint8_t, BS> du;
+                                du.template select<BS / 2, 2>(0) = rp & 0x0F;
+                                du.template select<BS / 2, 2>(1) = (rp >> 4) & 0x0F;
+                                simd<float, BS> dw_dq =
+                                    (convert<float>(du) - 8.0f) * s_arr[v];
+                                acc.template select<BS, 1>(v * BS) += hv * dw_dq;
                             }
                         }
                     }
-                    float acc = sycl::ext::intel::esimd::detail::sum<float, float, BS>(a);
-
-                    float w = (float)routing_weights[route_idx];
-                    output[(size_t)routed_row * hidden_size + j] = fp16(acc * w);
+                    const float w = (float)routing_weights[route_idx];
+                    #pragma unroll
+                    for (int v = 0; v < VS; v++) {
+                        const float r = sycl::ext::intel::esimd::detail::sum<
+                            float, float, BS>(acc.template select<BS, 1>(v * BS));
+                        output[(size_t)routed_row * hidden_size + j_base + v] = fp16(r * w);
+                    }
                 });
         };
-        submit_kernel(cgf, device, "moe down routed int4 ggml");
+        submit_kernel(cgf, device, "moe down routed int4 ggml VS=4");
     } else {
         // IPEX K-major layout — optimized: 64-wide tiles (2×32), preload hi
         const int n_out_tiles_ipex = hidden_size / 64;
