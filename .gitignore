@@ -25,3 +25,6 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Quantized model checkpoints (19+ GB; produced by tools/quantize_offline.py)
+quant_out/
