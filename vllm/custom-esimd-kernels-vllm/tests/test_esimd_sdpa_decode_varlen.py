@@ -177,6 +177,97 @@ def test_decode_b1_short_bf16():
     _run_case([1], [8], dtype=torch.bfloat16)
 
 
+# --- Large-chunk chunked-prefill scenarios (the suspected crash path) ---
+# Mimics what vllm dispatches at mnbt=128/256/512: a single long query batch
+# with KV already containing a prefix.
+
+def test_chunk_q256_kv256():
+    """First chunk of a long prompt: q=256, kv=256 (no prefix)."""
+    _run_case([256], [256])
+
+
+def test_chunk_q256_kv512():
+    """Second chunk: q=256, kv=512 (256 prefix + this chunk)."""
+    _run_case([256], [512])
+
+
+def test_chunk_q256_kv1024():
+    _run_case([256], [1024])
+
+
+def test_chunk_q256_kv4096():
+    """4k context, last chunk before decode."""
+    _run_case([256], [4096])
+
+
+def test_chunk_q512_kv4096():
+    _run_case([512], [4096])
+
+
+def test_chunk_q128_kv4096():
+    _run_case([128], [4096])
+
+
+def test_chunk_q128_kv128():
+    _run_case([128], [128])
+
+
+def test_consecutive_chunks_q256_4chunks():
+    """Mimic vllm chunked-prefill of a 4×256 = 1024-token prompt.
+
+    Chunk i runs with (q_len=256, kv_len=256*(i+1)). The KV cache from
+    earlier chunks must be live during later chunks (this is what vllm
+    does between calls — same key_cache / value_cache tensor, more
+    valid kv_len). Block table grows over chunks too.
+    """
+    torch.manual_seed(123)
+    device = "xpu"
+    n_heads, n_kv_heads, hd = 8, 2, 256
+    block_size = 64
+    chunk_q = 256
+    n_chunks = 4
+    total_kv = chunk_q * n_chunks  # 1024
+
+    # Allocate cache big enough for the full prompt + sentinel block 0.
+    blocks_per_seq = (total_kv + block_size - 1) // block_size
+    num_blocks = blocks_per_seq + 4
+
+    key_cache = (torch.randn(num_blocks, block_size, n_kv_heads, hd,
+                             device=device, dtype=torch.float32) * 0.05
+                 ).to(torch.float16)
+    value_cache = (torch.randn(num_blocks, block_size, n_kv_heads, hd,
+                               device=device, dtype=torch.float32) * 0.05
+                   ).to(torch.float16)
+
+    # Block table fixed shape: [B=1, blocks_per_seq]. Block 0 unused (sentinel).
+    block_table = torch.full((1, blocks_per_seq), 0,
+                             dtype=torch.int32, device=device)
+    for j in range(blocks_per_seq):
+        block_table[0, j] = j + 1  # blocks 1..blocks_per_seq
+
+    scale = 1.0 / math.sqrt(hd)
+
+    for chunk_id in range(n_chunks):
+        kv_len = chunk_q * (chunk_id + 1)
+        q = (torch.randn(chunk_q, n_heads, hd, device=device,
+                         dtype=torch.float32) * 0.05).to(torch.float16)
+        cu_seqlens_q = torch.tensor([0, chunk_q], dtype=torch.int32, device=device)
+        seqused_k = torch.tensor([kv_len], dtype=torch.int32, device=device)
+
+        out = esimd_sdpa_decode_varlen(
+            q.contiguous(), key_cache, value_cache,
+            cu_seqlens_q, kv_len, True, scale,
+            block_table.contiguous(), seqused_k,
+        )
+        torch.xpu.synchronize()  # surface async crash here
+        n_nan = torch.isnan(out.to("cpu", torch.float32)).sum().item()
+        n_inf = torch.isinf(out.to("cpu", torch.float32)).sum().item()
+        print(f"  chunk{chunk_id}  q=256 kv={kv_len}  "
+              f"out.shape={tuple(out.shape)}  nan={n_nan} inf={n_inf}")
+        assert n_nan == 0 and n_inf == 0, (
+            f"chunk{chunk_id} kv={kv_len}: NaN/Inf in output")
+
+
 if __name__ == "__main__":
     # Run inline so we get a clear pass/fail per case.
     for fn in [
@@ -187,6 +278,14 @@ if __name__ == "__main__":
         test_prefill_b1_long,
         test_mixed_b2,
         test_decode_b1_short_bf16,
+        test_chunk_q128_kv128,
+        test_chunk_q128_kv4096,
+        test_chunk_q256_kv256,
+        test_chunk_q256_kv512,
+        test_chunk_q256_kv1024,
+        test_chunk_q256_kv4096,
+        test_chunk_q512_kv4096,
+        test_consecutive_chunks_q256_4chunks,
     ]:
         try:
             fn()
