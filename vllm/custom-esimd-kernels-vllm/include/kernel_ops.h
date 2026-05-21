@@ -254,6 +254,16 @@ at::Tensor esimd_sdpa_decode_varlen(
     at::Tensor block_table,
     std::optional<at::Tensor> seqused_k);
 
+// SDPA prefill DPAS — FA-2 style block-attention for HD=256.
+// `seq_lens` is full KV length per request (i32 [batch]); cu_seqlens_q is i32
+// [batch+1]. Output shape matches q. Ported from windows tree (task #135).
+at::Tensor esimd_sdpa_prefill_dpas(
+    at::Tensor q, at::Tensor key_cache, at::Tensor value_cache,
+    at::Tensor cu_seqlens_q, at::Tensor seq_lens,
+    bool is_causal,
+    std::optional<double> scale,
+    at::Tensor block_table);
+
 // GDN attention — Causal Conv1d + Gated Delta Rule fused.
 // Replaces vllm_xpu_kernels._xpu_C.gdn_attention on PTL.
 // ssm_state layout: [num_blocks, num_v_heads/tp, head_v_dim, head_k_dim] (H, V, K).

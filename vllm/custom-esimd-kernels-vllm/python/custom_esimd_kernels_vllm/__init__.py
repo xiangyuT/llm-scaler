@@ -111,6 +111,7 @@ _EXPORTS = [
     # PTL non-DPAS replacements (XE2-only AOT bypass)
     "esimd_sdpa_decode",
     "esimd_sdpa_decode_varlen",
+    "esimd_sdpa_prefill_dpas",
     "esimd_gdn_attention",
     "esimd_gemv_bf16",
     "esimd_gemv_bf16_fused2",

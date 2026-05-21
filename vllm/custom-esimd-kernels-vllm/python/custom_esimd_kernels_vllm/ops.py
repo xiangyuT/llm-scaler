@@ -996,6 +996,37 @@ def esimd_sdpa_decode_varlen(
         block_table, seqused_k)
 
 
+def esimd_sdpa_prefill_dpas(
+    q: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    is_causal: bool = True,
+    scale: float | None = None,
+    block_table: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """DPAS-based prefill SDPA (FA-2 style block-attention) for HD=256.
+
+    Drop-in replacement for `esimd_sdpa_decode_varlen` on the prefill
+    path (q_len > 1). Each work-group processes 128 query rows of one
+    (req, head); cooperatively loads K/V chunks of 128 tokens through
+    SLM ping-pong.
+
+    q:           [total_q, n_heads, 256]                        fp16/bf16
+    key_cache:   [num_blocks, block_size, n_kv_heads, 256]      fp16/bf16
+    value_cache: [num_blocks, block_size, n_kv_heads, 256]      fp16/bf16
+    cu_seqlens_q: [batch_size+1]   int32
+    seq_lens:     [batch_size]     int32  (full KV length per request)
+    block_table:  [batch_size, max_num_blocks_per_seq]  int32
+
+    Returns: [total_q, n_heads, 256] same dtype as q.
+    """
+    return _ops.esimd_sdpa_prefill_dpas(
+        q, key_cache, value_cache,
+        cu_seqlens_q, seq_lens, is_causal, scale, block_table)
+
+
 # ---- GDN Attention (Causal Conv1d + Gated Delta Rule) ----
 
 def esimd_gdn_attention(
