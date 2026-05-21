@@ -108,7 +108,8 @@ inline void fused_add_rms_norm_batched_host(
             sum.select<2, 1>(0)  += sum.select<2, 1>(2);
             sum[0] += sum[1];
 
-            float inv_rms = 1.0f / sycl::sqrt(sum[0] / (float)K + eps);
+            float inv_rms = 1.0f / sycl::ext::intel::esimd::sqrt(
+                simd<float, 1>(sum[0] / (float)K + eps))[0];
 
             // normalize × weight (fp32 multiply to match torch fallback precision)
             simd<float, VL> weight_f = weight_h;
