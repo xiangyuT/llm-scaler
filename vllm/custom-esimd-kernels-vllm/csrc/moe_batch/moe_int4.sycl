@@ -1228,6 +1228,365 @@ void moe_down_finalize_int4_kernel(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// PREFILL kernels — XMX DPAS path for M >= 16 (token-major weight reuse)
+// ═══════════════════════════════════════════════════════════════════════════════
+// Ported from frameworks.ai.client-ai.esimd-kernels/.../moe_prefill_v2.cpp
+// (moe_prefill_{gather,up,down}_forward_kernel).
+//
+// Key differences from the reference:
+//   - BS=128 (q4_0 group_size), reference uses BS=32. Inner k-loop iterates
+//     BS/2/8 = 8 times per group instead of 1.
+//   - Output layout matches our pipeline: writes go into the existing
+//     [n_tokens * rows_per_token, .] buffers using
+//       routed_row = (pair_idx / top_k) * rows_per_token + (pair_idx % top_k)
+//     so the existing accumulate / shared-down kernels work unchanged.
+//   - Down kernel applies routing weights inline (decode kernel already does).
+//
+// XMX DPAS<8,8,fp16,fp16,fp16,fp16> tile geometry:
+//   K=16 (DPAS K), MAX_M=32 (M = MS*16), N=16 (Up) or N=32 (Down)
+//   Per BS=128 group, K-axis takes 8 inner iters (BS/2 / 8 = 8).
+//   Per inner iter: 1 input b_tile (gather-load), 2 a_tile dequants
+//   (1 for up gate, 1 for up; or 1 for down).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Gather: histogram tokens by expert, build expert_offsets + expert_tokens ──
+// expert_tokens[i] stores pair_idx = (token * top_k + k_idx) sorted by expert.
+// A single workgroup (GS=1024) handles the whole gather using SLM atomics.
+template<int GS = 1024>
+sycl::event moe_prefill_gather_int4_kernel(
+    sycl::queue& q,
+    const int* selected_experts, int* expert_offsets, int* expert_tokens,
+    int num_experts, int total_seqlen) {
+    return q.submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> slm_counters(sycl::range<1>(num_experts), cgh);
+        sycl::local_accessor<int, 1> slm_offsets(sycl::range<1>(num_experts), cgh);
+        cgh.parallel_for<class MoePrefillGatherInt4>(
+            sycl::nd_range<1>(GS, GS),
+            [=](sycl::nd_item<1> item) {
+                const int lid = (int)item.get_local_id(0);
+                for (int i = lid; i < num_experts; i += GS) {
+                    slm_counters[i] = 0;
+                    slm_offsets[i] = 0;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int i = lid; i < total_seqlen; i += GS) {
+                    int eid = selected_experts[i];
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed,
+                        sycl::memory_scope::work_group,
+                        sycl::access::address_space::local_space> ref(slm_counters[eid]);
+                    ref.fetch_add(1);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (lid == 0) {
+                    int sum = 0;
+                    for (int i = 0; i < num_experts; i++) {
+                        slm_offsets[i] = sum;
+                        sum += slm_counters[i];
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                for (int i = lid; i < num_experts; i += GS) {
+                    expert_offsets[i] = slm_offsets[i];
+                }
+                for (int i = lid; i < total_seqlen; i += GS) {
+                    int eid = selected_experts[i];
+                    sycl::atomic_ref<int, sycl::memory_order::relaxed,
+                        sycl::memory_scope::work_group,
+                        sycl::access::address_space::local_space> ref(slm_offsets[eid]);
+                    int pos = ref.fetch_add(1);
+                    expert_tokens[pos] = i;
+                }
+            });
+    });
+}
+
+// ── Prefill Up: Gate+Up+SiLU via XMX DPAS, GGML layout, BS=128 ──
+// Each WI iterates over all tokens routed to one expert in MAX_M chunks,
+// producing N=16 contiguous output channels per (expert, n-tile).
+template<int BS = 128, int MAX_M = 32, int N = 16>
+sycl::event moe_prefill_up_routed_int4_kernel(
+    sycl::queue& q,
+    const fp16* x, const uint8_t* gate_up_weight, const fp16* gate_up_scale,
+    fp16* intermediate, const int* expert_offsets, const int* expert_tokens,
+    int num_experts, int total_seqlen, int hidden_size, int intermediate_size,
+    int top_k, int rows_per_token) {
+    static_assert(MAX_M % 16 == 0, "MAX_M must be multiple of 16");
+    static_assert(N % 8 == 0, "N must be multiple of 8");
+    static_assert(BS % 32 == 0, "BS must be multiple of 32");
+    constexpr int MS     = MAX_M / 16;
+    constexpr int NS     = N / 8;
+    constexpr int ACC_SZ = MS * NS * 128;
+
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoePrefillUpRoutedInt4>(
+            sycl::range<2>(num_experts, intermediate_size / N),
+            [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+                const int eid    = (int)id[0];
+                const int tid    = (int)id[1];
+                const int r_base = tid * N;
+                const int t0     = expert_offsets[eid];
+                const int t1     = (eid + 1 < num_experts) ? expert_offsets[eid + 1] : total_seqlen;
+                if (t0 == t1) return;
+
+                const int two_inter = 2 * intermediate_size;
+                const size_t gate_row_base = (size_t)eid * two_inter + r_base;
+                const size_t up_row_base   = gate_row_base + intermediate_size;
+                const uint8_t* gate_w_ptr = gate_up_weight + gate_row_base * (hidden_size / 2);
+                const uint8_t* up_w_ptr   = gate_up_weight + up_row_base * (hidden_size / 2);
+
+                // Per-N-row scale stride: K_groups = hidden_size / BS scales per row,
+                // contiguous (each row's scales are packed). To gather N scales for
+                // a given group, we offset by row * K_groups * sizeof(fp16).
+                const int K_groups = hidden_size / BS;
+                const simd<uint32_t, N> scl_byte_off =
+                    simd<uint32_t, N>(0u, 1u) * (uint32_t)(K_groups * sizeof(fp16));
+                const fp16* gate_s_base = gate_up_scale + gate_row_base * K_groups;
+                const fp16* up_s_base   = gate_up_scale + up_row_base * K_groups;
+
+                for (int m_base = t0; m_base < t1; m_base += MAX_M) {
+                    // Pad the M-chunk by replicating last valid index (matches reference).
+                    simd<uint32_t, MAX_M> sorted_idxs =
+                        min(simd<uint32_t, MAX_M>(0u, 1u) + (uint32_t)m_base,
+                            simd<uint32_t, MAX_M>((uint32_t)(t1 - 1)));
+                    simd<uint32_t, MAX_M> pair_idxs =
+                        convert<uint32_t>(gather<int, MAX_M>(expert_tokens, sorted_idxs * 4u));
+                    // Token row in input: pair_idx / top_k.
+                    simd<uint32_t, MAX_M> in_off =
+                        (pair_idxs / (uint32_t)top_k) * (uint32_t)(hidden_size * sizeof(fp16));
+
+                    simd<fp16, ACC_SZ> g_acc(fp16(0));
+                    simd<fp16, ACC_SZ> u_acc(fp16(0));
+
+                    for (int blk = 0; blk < hidden_size / BS; blk++) {
+                        const simd<fp16, N> gate_scl =
+                            gather<fp16, N>(gate_s_base + blk, scl_byte_off);
+                        const simd<fp16, N> up_scl =
+                            gather<fp16, N>(up_s_base + blk, scl_byte_off);
+
+                        for (int k_base = 0; k_base < BS / 2; k_base += 8) {
+                            const int x_byte = blk * (BS / 2) + k_base;
+                            const uint32_t k_off =
+                                (uint32_t)(blk * BS + k_base * 2) * (uint32_t)sizeof(fp16);
+
+                            // Gather b_tile: each token row contributes 16 fp16 (=8 uint32) elems.
+                            simd<fp16, MS * 256> b_tile;
+                            #pragma unroll
+                            for (int ms = 0; ms < MS; ms++) {
+                                simd<fp16, 256> btmp;
+                                btmp.template bit_cast_view<uint32_t>() =
+                                    xesimd::lsc_gather<uint32_t, 8,
+                                        xesimd::lsc_data_size::u32,
+                                        xesimd::cache_hint::cached, xesimd::cache_hint::cached,
+                                        16, uint32_t>(
+                                        reinterpret_cast<const uint32_t*>(x),
+                                        in_off.template select<16, 1>(ms * 16).read() + k_off);
+                                b_tile.template select<256, 1>(ms * 256) = btmp;
+                            }
+
+                            auto dequant_dpas =
+                                [&](const uint8_t* w_ptr, const simd<fp16, N>& scl,
+                                    simd<fp16, ACC_SZ>& acc) SYCL_ESIMD_FUNCTION {
+                                #pragma unroll
+                                for (int ns = 0; ns < NS; ns++) {
+                                    auto w_raw = xesimd::lsc_load_2d<uint8_t, 8, 8, 1,
+                                        false, false,
+                                        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(
+                                        w_ptr,
+                                        (unsigned)(hidden_size / 2 - 1),
+                                        (unsigned)(N - 1),
+                                        (unsigned)(hidden_size / 2 - 1),
+                                        x_byte,
+                                        ns * 8);
+
+                                    simd<uint8_t, 128> wu;
+                                    wu.template select<64, 2>(0) = w_raw & (uint8_t)0x0F;
+                                    wu.template select<64, 2>(1) = w_raw >> 4;
+                                    simd<fp16, 128> a_tile =
+                                        wu.template bit_cast_view<int8_t>() - (int8_t)8;
+                                    #pragma unroll
+                                    for (int r = 0; r < 8; ++r) {
+                                        a_tile.template select<16, 1>(r * 16) *= scl[ns * 8 + r];
+                                    }
+                                    #pragma unroll
+                                    for (int ms = 0; ms < MS; ms++) {
+                                        const int idx = ms * NS * 128 + ns * 128;
+                                        simd<fp16, 128> a = acc.template select<128, 1>(idx);
+                                        simd<fp16, 256> bv = b_tile.template select<256, 1>(ms * 256);
+                                        a = sycl::ext::intel::esimd::xmx::dpas<8, 8, fp16, fp16, fp16, fp16>(
+                                                a, bv, a_tile);
+                                        acc.template select<128, 1>(idx) = a;
+                                    }
+                                }
+                            };
+
+                            dequant_dpas(gate_w_ptr, gate_scl, g_acc);
+                            dequant_dpas(up_w_ptr,   up_scl,   u_acc);
+                        }
+                    }
+
+                    // SiLU(gate) * up
+                    simd<fp16, ACC_SZ> sv =
+                        (g_acc / (fp16(1) + sycl::ext::intel::esimd::exp(-g_acc))) * u_acc;
+
+                    // Scatter into [n_tokens * rows_per_token, intermediate_size]
+                    // routed_row = (pair_idx / top_k) * rows_per_token + (pair_idx % top_k)
+                    simd<uint32_t, MAX_M> tok = pair_idxs / (uint32_t)top_k;
+                    simd<uint32_t, MAX_M> kid = pair_idxs % (uint32_t)top_k;
+                    simd<uint32_t, MAX_M> routed_row = tok * (uint32_t)rows_per_token + kid;
+                    simd<uint32_t, MAX_M> out_off =
+                        routed_row * (uint32_t)(intermediate_size * sizeof(fp16));
+
+                    #pragma unroll
+                    for (int ms = 0; ms < MS; ms++) {
+                        simd<uint32_t, 16> ms_off =
+                            out_off.template select<16, 1>(ms * 16).read();
+                        #pragma unroll
+                        for (int r = 0; r < N; r++) {
+                            uint32_t ch = (uint32_t)(r_base + r) * (uint32_t)sizeof(fp16);
+                            simd<fp16, 16> val = sv.template select<16, 1>(ms * N * 16 + r * 16);
+                            scatter<fp16, 16>(intermediate, ms_off + ch, val);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+// ── Prefill Down: hidden = sum(intermediate × down_w) × routing_weight ──
+template<int BS = 128, int MAX_M = 32, int N = 32>
+sycl::event moe_prefill_down_routed_int4_kernel(
+    sycl::queue& q,
+    const fp16* intermediate, const uint8_t* down_weight, const fp16* down_scale,
+    const fp16* routing_weights,
+    fp16* expert_output, const int* expert_offsets, const int* expert_tokens,
+    int num_experts, int total_seqlen, int intermediate_size, int hidden_size,
+    int top_k, int rows_per_token) {
+    static_assert(MAX_M % 16 == 0, "MAX_M must be multiple of 16");
+    static_assert(N % 8 == 0, "N must be multiple of 8");
+    static_assert(BS % 32 == 0, "BS must be multiple of 32");
+    constexpr int MS     = MAX_M / 16;
+    constexpr int NS     = N / 8;
+    constexpr int ACC_SZ = MS * NS * 128;
+
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for<class MoePrefillDownRoutedInt4>(
+            sycl::range<2>(num_experts, hidden_size / N),
+            [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
+                const int eid    = (int)id[0];
+                const int tid    = (int)id[1];
+                const int d_base = tid * N;
+                const int t0     = expert_offsets[eid];
+                const int t1     = (eid + 1 < num_experts) ? expert_offsets[eid + 1] : total_seqlen;
+                if (t0 == t1) return;
+
+                const int K_groups = intermediate_size / BS;
+                const size_t row_base = (size_t)eid * hidden_size + d_base;
+                const uint8_t* down_w_ptr = down_weight + row_base * (intermediate_size / 2);
+
+                const simd<uint32_t, N> scl_byte_off =
+                    simd<uint32_t, N>(0u, 1u) * (uint32_t)(K_groups * sizeof(fp16));
+                const fp16* down_s_base = down_scale + row_base * K_groups;
+
+                for (int m_base = t0; m_base < t1; m_base += MAX_M) {
+                    simd<uint32_t, MAX_M> sorted_idxs =
+                        min(simd<uint32_t, MAX_M>(0u, 1u) + (uint32_t)m_base,
+                            simd<uint32_t, MAX_M>((uint32_t)(t1 - 1)));
+                    simd<uint32_t, MAX_M> pair_idxs =
+                        convert<uint32_t>(gather<int, MAX_M>(expert_tokens, sorted_idxs * 4u));
+
+                    // Routed_row in interleaved layout (Up wrote here)
+                    simd<uint32_t, MAX_M> tok = pair_idxs / (uint32_t)top_k;
+                    simd<uint32_t, MAX_M> kid = pair_idxs % (uint32_t)top_k;
+                    simd<uint32_t, MAX_M> routed_row = tok * (uint32_t)rows_per_token + kid;
+                    simd<uint32_t, MAX_M> in_off =
+                        routed_row * (uint32_t)(intermediate_size * sizeof(fp16));
+
+                    simd<fp16, ACC_SZ> acc(fp16(0));
+
+                    for (int blk = 0; blk < intermediate_size / BS; blk++) {
+                        const simd<fp16, N> down_scl =
+                            gather<fp16, N>(down_s_base + blk, scl_byte_off);
+
+                        for (int k_base = 0; k_base < BS / 2; k_base += 8) {
+                            const int x_byte = blk * (BS / 2) + k_base;
+                            const uint32_t k_off =
+                                (uint32_t)(blk * BS + k_base * 2) * (uint32_t)sizeof(fp16);
+
+                            simd<fp16, MS * 256> b_tile;
+                            #pragma unroll
+                            for (int ms = 0; ms < MS; ms++) {
+                                simd<fp16, 256> btmp;
+                                btmp.template bit_cast_view<uint32_t>() =
+                                    xesimd::lsc_gather<uint32_t, 8,
+                                        xesimd::lsc_data_size::u32,
+                                        xesimd::cache_hint::cached, xesimd::cache_hint::cached,
+                                        16, uint32_t>(
+                                        reinterpret_cast<const uint32_t*>(intermediate),
+                                        in_off.template select<16, 1>(ms * 16).read() + k_off);
+                                b_tile.template select<256, 1>(ms * 256) = btmp;
+                            }
+
+                            #pragma unroll
+                            for (int ns = 0; ns < NS; ns++) {
+                                auto dw_raw = xesimd::lsc_load_2d<uint8_t, 8, 8, 1,
+                                    false, false,
+                                    xesimd::cache_hint::cached, xesimd::cache_hint::cached>(
+                                    down_w_ptr,
+                                    (unsigned)(intermediate_size / 2 - 1),
+                                    (unsigned)(N - 1),
+                                    (unsigned)(intermediate_size / 2 - 1),
+                                    x_byte,
+                                    ns * 8);
+
+                                simd<uint8_t, 128> du;
+                                du.template select<64, 2>(0) = dw_raw & (uint8_t)0x0F;
+                                du.template select<64, 2>(1) = dw_raw >> 4;
+                                simd<fp16, 128> a_tile =
+                                    du.template bit_cast_view<int8_t>() - (int8_t)8;
+                                #pragma unroll
+                                for (int r = 0; r < 8; ++r) {
+                                    a_tile.template select<16, 1>(r * 16) *= down_scl[ns * 8 + r];
+                                }
+                                #pragma unroll
+                                for (int ms = 0; ms < MS; ms++) {
+                                    const int idx = ms * NS * 128 + ns * 128;
+                                    simd<fp16, 256> bv = b_tile.template select<256, 1>(ms * 256);
+                                    simd<fp16, 128> a = acc.template select<128, 1>(idx);
+                                    a = sycl::ext::intel::esimd::xmx::dpas<8, 8, fp16, fp16, fp16, fp16>(
+                                            a, bv, a_tile);
+                                    acc.template select<128, 1>(idx) = a;
+                                }
+                            }
+                        }
+                    }
+
+                    // Apply per-route routing weight before scatter (decode kernel does this).
+                    // routing_weights: [n_tokens, top_k] indexed by pair_idx directly.
+                    simd<fp16, MAX_M> rw =
+                        gather<fp16, MAX_M>(routing_weights, pair_idxs * (uint32_t)sizeof(fp16));
+
+                    simd<uint32_t, MAX_M> out_off =
+                        routed_row * (uint32_t)(hidden_size * sizeof(fp16));
+
+                    #pragma unroll
+                    for (int ms = 0; ms < MS; ms++) {
+                        simd<uint32_t, 16> ms_off =
+                            out_off.template select<16, 1>(ms * 16).read();
+                        simd<fp16, 16> rw_lane =
+                            rw.template select<16, 1>(ms * 16);
+                        #pragma unroll
+                        for (int r = 0; r < N; r++) {
+                            simd<fp16, 16> rv = acc.template select<16, 1>(ms * N * 16 + r * 16);
+                            uint32_t ch = (uint32_t)(d_base + r) * (uint32_t)sizeof(fp16);
+                            scatter<fp16, 16>(expert_output, ms_off + ch, rv * rw_lane);
+                        }
+                    }
+                }
+            });
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // moe_forward_full_int4 — Full pipeline: TopK → Up → Down → Finalize
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1236,6 +1595,26 @@ static thread_local torch::Tensor s_int4_routed_output, s_int4_final_output;
 static thread_local torch::Tensor s_int4_intermediates;
 static thread_local torch::Tensor s_int4_gate_values;  // BSZ>1 precomputed gate sigmoid
 static thread_local int s_int4_cached_ntokens = -1;
+
+// Prefill-only scratch — sized by (num_experts, total_seqlen=n_tokens*top_k).
+static thread_local torch::Tensor s_int4_expert_offsets;
+static thread_local torch::Tensor s_int4_expert_tokens;
+static thread_local int s_int4_prefill_cached_seqlen = -1;
+static thread_local int s_int4_prefill_cached_experts = -1;
+
+static void ensure_int4_prefill_buffers(int n_routed_experts, int total_seqlen,
+                                         const torch::Device& dev) {
+    if (s_int4_prefill_cached_experts != n_routed_experts) {
+        s_int4_expert_offsets = torch::empty(
+            {n_routed_experts}, torch::device(dev).dtype(torch::kInt32));
+        s_int4_prefill_cached_experts = n_routed_experts;
+    }
+    if (s_int4_prefill_cached_seqlen != total_seqlen) {
+        s_int4_expert_tokens = torch::empty(
+            {total_seqlen}, torch::device(dev).dtype(torch::kInt32));
+        s_int4_prefill_cached_seqlen = total_seqlen;
+    }
+}
 
 static void ensure_int4_moe_buffers(int n_tokens, int top_k, int num_shared_experts,
                                      int hidden_size, int intermediate_size,
@@ -1328,27 +1707,64 @@ torch::Tensor moe_forward_full_int4(
             queue);
     }
 
-    // ── Up: routed (INT4) — hybrid dispatch based on WI count ──
-    int up_wis = n_tokens * top_k * (intermediate_size / 16);
-    if (up_wis < 2048) {
-        // Few WIs → use SLM reduction for better GPU utilization
-        moe_up_routed_int4_slm_kernel(
-            (const fp16*)x.data_ptr(),
-            (const uint32_t*)gate_up_qweight.data_ptr(),
-            (const fp16*)gate_up_scales.data_ptr(),
+    // ── Up: routed (INT4) — prefill DPAS path when M ≥ threshold + GGML layout ──
+    // Threshold rationale: prefill kernel pads M to MAX_M=32 via clamp-replication.
+    // When n_tokens >= 16 the average tokens-per-active-expert × top_k makes the
+    // weight reuse worthwhile vs. decode GEMV.
+    // Crossover from microbench (Qwen3.5-35B-A3B TP=2 per-rank shape):
+    //   mnbt=16/32/64  -> decode kernel wins (0.47×/0.68×/0.95× of prefill)
+    //   mnbt=128       -> prefill 1.54× faster
+    //   mnbt=256       -> prefill 2.65× faster
+    // Default to 96 so mnbt=64 stays on decode and mnbt=128+ uses prefill.
+    static const int prefill_min_tokens = []() {
+        const char* env = std::getenv("VLLM_MOE_PREFILL_MIN_TOKENS");
+        return env ? std::atoi(env) : 96;
+    }();
+    bool use_prefill = use_ggml_layout && n_tokens >= prefill_min_tokens;
+
+    if (use_prefill) {
+        int total_seqlen = n_tokens * (int)top_k;
+        ensure_int4_prefill_buffers((int)n_routed_experts, total_seqlen, x.device());
+        moe_prefill_gather_int4_kernel<1024>(
+            queue,
             s_int4_topk_idx.data_ptr<int>(),
+            s_int4_expert_offsets.data_ptr<int>(),
+            s_int4_expert_tokens.data_ptr<int>(),
+            (int)n_routed_experts, total_seqlen);
+        // GGML layout: gate_up_qweight is int32-packed [E, 2*d_ff, K_packed]
+        // viewed byte-wise = [E, 2*d_ff, hidden_size/2] uint8.
+        moe_prefill_up_routed_int4_kernel<128, 32, 16>(
+            queue,
+            (const fp16*)x.data_ptr(),
+            (const uint8_t*)gate_up_qweight.data_ptr(),
+            (const fp16*)gate_up_scales.data_ptr(),
             (fp16*)s_int4_intermediates.data_ptr(),
-            n_tokens, hidden_size, intermediate_size,
-            top_k, rows_per_token, use_ggml_layout, x.device());
+            s_int4_expert_offsets.data_ptr<int>(),
+            s_int4_expert_tokens.data_ptr<int>(),
+            (int)n_routed_experts, total_seqlen,
+            hidden_size, intermediate_size, top_k, rows_per_token);
     } else {
-        moe_up_routed_int4_kernel(
-            (const fp16*)x.data_ptr(),
-            (const uint32_t*)gate_up_qweight.data_ptr(),
-            (const fp16*)gate_up_scales.data_ptr(),
-            s_int4_topk_idx.data_ptr<int>(),
-            (fp16*)s_int4_intermediates.data_ptr(),
-            n_tokens, hidden_size, intermediate_size,
-            top_k, rows_per_token, use_ggml_layout, x.device());
+        int up_wis = n_tokens * top_k * (intermediate_size / 16);
+        if (up_wis < 2048) {
+            // Few WIs → use SLM reduction for better GPU utilization
+            moe_up_routed_int4_slm_kernel(
+                (const fp16*)x.data_ptr(),
+                (const uint32_t*)gate_up_qweight.data_ptr(),
+                (const fp16*)gate_up_scales.data_ptr(),
+                s_int4_topk_idx.data_ptr<int>(),
+                (fp16*)s_int4_intermediates.data_ptr(),
+                n_tokens, hidden_size, intermediate_size,
+                top_k, rows_per_token, use_ggml_layout, x.device());
+        } else {
+            moe_up_routed_int4_kernel(
+                (const fp16*)x.data_ptr(),
+                (const uint32_t*)gate_up_qweight.data_ptr(),
+                (const fp16*)gate_up_scales.data_ptr(),
+                s_int4_topk_idx.data_ptr<int>(),
+                (fp16*)s_int4_intermediates.data_ptr(),
+                n_tokens, hidden_size, intermediate_size,
+                top_k, rows_per_token, use_ggml_layout, x.device());
+        }
     }
 
     // ── Up: shared — dispatch INT4 or FP16 based on weight dtype ──
@@ -1379,28 +1795,43 @@ torch::Tensor moe_forward_full_int4(
             top_k, num_shared_experts, rows_per_token, x.device());
     }
 
-    // ── Down: routed (INT4) — hybrid dispatch ──
-    int down_wis = n_tokens * top_k * (hidden_size / 16);
-    if (down_wis < 2048) {
-        moe_down_routed_int4_slm_kernel(
+    // ── Down: routed (INT4) — same prefill switch as Up ──
+    if (use_prefill) {
+        int total_seqlen = n_tokens * (int)top_k;
+        moe_prefill_down_routed_int4_kernel<128, 32, 32>(
+            queue,
             (const fp16*)s_int4_intermediates.data_ptr(),
-            (const uint32_t*)down_qweight.data_ptr(),
+            (const uint8_t*)down_qweight.data_ptr(),
             (const fp16*)down_scales.data_ptr(),
             (const fp16*)s_int4_topk_weight.data_ptr(),
-            s_int4_topk_idx.data_ptr<int>(),
             (fp16*)s_int4_routed_output.data_ptr(),
-            n_tokens, hidden_size, intermediate_size,
-            top_k, rows_per_token, use_ggml_layout, x.device());
+            s_int4_expert_offsets.data_ptr<int>(),
+            s_int4_expert_tokens.data_ptr<int>(),
+            (int)n_routed_experts, total_seqlen,
+            intermediate_size, hidden_size, top_k, rows_per_token);
     } else {
-        moe_down_routed_int4_kernel(
-            (const fp16*)s_int4_intermediates.data_ptr(),
-            (const uint32_t*)down_qweight.data_ptr(),
-            (const fp16*)down_scales.data_ptr(),
-            (const fp16*)s_int4_topk_weight.data_ptr(),
-            s_int4_topk_idx.data_ptr<int>(),
-            (fp16*)s_int4_routed_output.data_ptr(),
-            n_tokens, hidden_size, intermediate_size,
-            top_k, rows_per_token, use_ggml_layout, x.device());
+        int down_wis = n_tokens * top_k * (hidden_size / 16);
+        if (down_wis < 2048) {
+            moe_down_routed_int4_slm_kernel(
+                (const fp16*)s_int4_intermediates.data_ptr(),
+                (const uint32_t*)down_qweight.data_ptr(),
+                (const fp16*)down_scales.data_ptr(),
+                (const fp16*)s_int4_topk_weight.data_ptr(),
+                s_int4_topk_idx.data_ptr<int>(),
+                (fp16*)s_int4_routed_output.data_ptr(),
+                n_tokens, hidden_size, intermediate_size,
+                top_k, rows_per_token, use_ggml_layout, x.device());
+        } else {
+            moe_down_routed_int4_kernel(
+                (const fp16*)s_int4_intermediates.data_ptr(),
+                (const uint32_t*)down_qweight.data_ptr(),
+                (const fp16*)down_scales.data_ptr(),
+                (const fp16*)s_int4_topk_weight.data_ptr(),
+                s_int4_topk_idx.data_ptr<int>(),
+                (fp16*)s_int4_routed_output.data_ptr(),
+                n_tokens, hidden_size, intermediate_size,
+                top_k, rows_per_token, use_ggml_layout, x.device());
+        }
     }
 
     // ── Down Finalize: shared + accumulate ──

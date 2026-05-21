@@ -174,8 +174,8 @@ ext_modules.append(
 ### MoE Batch kernels (FP8)
 
 ### MoE INT4 Batch kernels (Router, TopK, Up/Down, Finalize) — INT4
-# Re-enabled on PTL (XeLPG): the kernel imports the xmx namespace but
-# doesn't actually issue dpas instructions, so it builds and runs on PTL.
+# On PTL (XeLPG/Xe3): decode kernels are pure simd-FMA. Prefill kernels
+# (moe_prefill_*_routed_int4_kernel) issue xmx::dpas — supported on Xe3 LPG.
 ext_modules.append(
     SyclExtension(
         name="custom_esimd_kernels_vllm.moe_int4_ops",
