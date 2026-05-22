@@ -75,6 +75,7 @@ _EXPORTS = [
     # INT4 GEMV ops
     "esimd_gemv_int4",
     "esimd_gemv_int4_fused2",
+    "esimd_gemm_int4_smallM",
     "esimd_qkv_split_norm_rope",
     "esimd_gdn_conv_fused",
     "esimd_fused_add_rms_norm",

@@ -225,6 +225,13 @@ at::Tensor esimd_gemv_int4_fused2(
     at::Tensor w0, at::Tensor s0, at::Tensor o0,
     at::Tensor w1, at::Tensor s1, at::Tensor o1);
 
+// Small-M INT4 GEMM (M in [1,4]). Same canonical layout as esimd_gemv_int4.
+// output[M,N] = input[M,K] @ dequant(weight[N,K/2])^T. Shares weight loads
+// across M rows in the WG to amortize LPDDR weight read at decode bsz>1.
+at::Tensor esimd_gemm_int4_smallM(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
 // MoE grouped GEMM — FP8 E5M2 with per-tensor scale (one scalar per expert)
 at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,

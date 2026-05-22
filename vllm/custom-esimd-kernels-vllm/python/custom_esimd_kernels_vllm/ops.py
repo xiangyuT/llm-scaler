@@ -112,6 +112,27 @@ def esimd_gemv_int4(
     return _ops.esimd_gemv_int4(input, weight, weight_scale, output)
 
 
+def esimd_gemm_int4_smallM(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Small-M INT4 GEMM (M in [1,4]), shared weight load across rows.
+
+    Computes: output[M, N] = input[M, K] @ dequant(weight)^T
+    Same canonical layout as esimd_gemv_int4 — input dim 0 generalizes to M.
+    Inside each WG (one per output row n), the weight tile is loaded once and
+    M FMAs run against M input slices, amortizing the LPDDR weight read.
+
+    input:        [M, K]            fp16  (M = 1..4)
+    weight:       [N, K/2]          uint8 — packed INT4 (canonical layout)
+    weight_scale: [N, K/128]        fp16  — per-group scale (group_size=128)
+    output:       [M, N]            fp16  — pre-allocated
+
+    M inferred from input.size(0); must be in [1, 4].
+    """
+    return _ops.esimd_gemm_int4_smallM(input, weight, weight_scale, output)
+
+
 def esimd_gemv_int4_fused2(
     input: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,

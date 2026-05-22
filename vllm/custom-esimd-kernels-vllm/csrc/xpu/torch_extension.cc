@@ -51,6 +51,11 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "Tensor w1, Tensor s1, Tensor o1) -> Tensor");
   m.impl("esimd_gemv_int4_fused2", torch::kXPU, &esimd_gemv_int4_fused2);
 
+  // Small-M INT4 GEMM (decode bsz>1). Same canonical layout, M in [1,4].
+  m.def("esimd_gemm_int4_smallM(Tensor input, Tensor weight, "
+        "Tensor weight_scale, Tensor output) -> Tensor");
+  m.impl("esimd_gemm_int4_smallM", torch::kXPU, &esimd_gemm_int4_smallM);
+
   // Fused QKV Split + RMSNorm + RoPE
   m.def("esimd_qkv_split_norm_rope(Tensor qkv_state, "
         "Tensor q_out, Tensor gate_out, Tensor k_out, Tensor v_out, "
