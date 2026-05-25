@@ -133,6 +133,28 @@ def esimd_gemm_int4_smallM(
     return _ops.esimd_gemm_int4_smallM(input, weight, weight_scale, output)
 
 
+def esimd_gemm_int4_prefill(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Dense INT4 GEMM for prefill (M >= 32, M % 32 == 0).
+
+    Computes: output[M, N] = input[M, K] @ dequant(weight)^T
+    Same canonical layout as esimd_gemv_int4. DPAS<8,8,fp16> tiles with
+    inline INT4 dequant inside the K-loop. Replaces the
+    `_dequant_int4_to_fp16 + torch.matmul` fallback in vllm
+    sym_int4._esimd_int4_apply for the M>1 prefill path.
+
+    input:        [M, K]            fp16  (M >= 32, M % 32 == 0)
+    weight:       [N, K/2]          uint8 — packed INT4 (canonical layout)
+    weight_scale: [N, K/128]        fp16  — per-group scale (group_size=128)
+    output:       [M, N]            fp16  — pre-allocated
+
+    Constraints: N % 16 == 0, K % 128 == 0.
+    """
+    return _ops.esimd_gemm_int4_prefill(input, weight, weight_scale, output)
+
+
 def esimd_gemv_int4_fused2(
     input: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,

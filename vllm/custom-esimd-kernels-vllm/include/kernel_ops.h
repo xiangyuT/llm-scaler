@@ -232,6 +232,13 @@ at::Tensor esimd_gemm_int4_smallM(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
+// Dense INT4 GEMM for prefill (M >= 32, M % 32 == 0). Same canonical layout
+// as esimd_gemv_int4. DPAS<8,8,fp16> tiles with inline INT4 dequant inside
+// the K-loop. Replaces dequant+matmul fallback in sym_int4.py:_esimd_int4_apply.
+at::Tensor esimd_gemm_int4_prefill(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
 // MoE grouped GEMM — FP8 E5M2 with per-tensor scale (one scalar per expert)
 at::Tensor esimd_moe_gemm_fp8_pert(
     at::Tensor input, at::Tensor weight, at::Tensor scale,

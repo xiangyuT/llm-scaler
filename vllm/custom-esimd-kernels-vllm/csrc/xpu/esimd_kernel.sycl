@@ -139,6 +139,7 @@ at::Tensor esimd_gemv_fp8_pert_fused3(
 
 #include "esimd_kernels/int4_GEMV.h"
 #include "esimd_kernels/int4_GEMM_smallM.h"
+#include "esimd_kernels/int4_GEMM_prefill.h"
 
 // Single INT4 GEMV.
 // input [1, K] fp16, weight [N, K/2] uint8 (packed), scale [N, K/128] fp16.
@@ -174,6 +175,43 @@ at::Tensor esimd_gemm_int4_smallM(
     GEMM_int4_smallM_host(p_in, p_w, p_sc, p_out,
                           (uint32_t)M, (uint32_t)N, (uint32_t)K,
                           dpcpp_queue);
+    return output;
+}
+
+// Dense INT4 GEMM for prefill (M >= 8 typically, M % 32 == 0).
+// Same canonical layout as esimd_gemv_int4 (weight [N, K/2] uint8 +
+// scale [N, K/128] fp16). Input/output contiguous [M,K] / [M,N] fp16.
+//
+// Replaces the "_dequant_int4_to_fp16 + torch.matmul" fallback for the
+// M>1 prefill path in vllm sym_int4. Uses DPAS<8,8,fp16> with inline
+// INT4 unpack inside the K-loop, mirroring moe_prefill_up_routed_int4.
+//
+// Constraints:
+//   M  % 32   == 0  (MAX_M=32 row-tile, no tail handling)
+//   N  % 16   == 0  (N_TILE=16 col-tile)
+//   K  % 128  == 0  (BS=128 K-step = 1 group of scales)
+at::Tensor esimd_gemm_int4_prefill(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t M = input.size(0);
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1) * 2;
+    TORCH_CHECK(M >= 32 && (M % 32) == 0,
+                "esimd_gemm_int4_prefill requires M >= 32 and M % 32 == 0; got M=", M);
+    TORCH_CHECK((N % 16) == 0,
+                "esimd_gemm_int4_prefill requires N % 16 == 0; got N=", N);
+    TORCH_CHECK((K % 128) == 0,
+                "esimd_gemm_int4_prefill requires K % 128 == 0; got K=", K);
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    auto* x_p   = reinterpret_cast<const fp16*>(p_in);
+    auto* w_p   = reinterpret_cast<const uint8_t*>(p_w);
+    auto* s_p   = reinterpret_cast<const fp16*>(p_sc);
+    auto* out_p = reinterpret_cast<fp16*>(p_out);
+    esimd_gemm_int4_prefill_kernel<128, 32, 16>(
+        dpcpp_queue, x_p, w_p, s_p, out_p,
+        (int)M, (int)N, (int)K);
     return output;
 }
 

@@ -56,6 +56,11 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "Tensor weight_scale, Tensor output) -> Tensor");
   m.impl("esimd_gemm_int4_smallM", torch::kXPU, &esimd_gemm_int4_smallM);
 
+  // Dense INT4 GEMM for prefill (M >= 32, M % 32 == 0). Inline dequant.
+  m.def("esimd_gemm_int4_prefill(Tensor input, Tensor weight, "
+        "Tensor weight_scale, Tensor output) -> Tensor");
+  m.impl("esimd_gemm_int4_prefill", torch::kXPU, &esimd_gemm_int4_prefill);
+
   // Fused QKV Split + RMSNorm + RoPE
   m.def("esimd_qkv_split_norm_rope(Tensor qkv_state, "
         "Tensor q_out, Tensor gate_out, Tensor k_out, Tensor v_out, "
