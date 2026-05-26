@@ -127,11 +127,8 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "Tensor block_table, Tensor? seqused_k) -> Tensor");
   m.impl("esimd_sdpa_decode_varlen", torch::kXPU, &esimd_sdpa_decode_varlen);
 
-  // SDPA Prefill DPAS (HD=256 only) — FA-2 style block-attention
-  m.def("esimd_sdpa_prefill_dpas(Tensor q, Tensor key_cache, "
-        "Tensor value_cache, Tensor cu_seqlens_q, Tensor seq_lens, "
-        "bool is_causal, float? scale, Tensor block_table) -> Tensor");
-  m.impl("esimd_sdpa_prefill_dpas", torch::kXPU, &esimd_sdpa_prefill_dpas);
+  // SDPA Prefill DPAS — moved to torch_extension_prefill_dpas.cc
+  // (separate Python module so its kernel can compile with -doubleGRF).
 
   // GDN Attention — replaces _xpu_C.gdn_attention
   m.def("esimd_gdn_attention(Tensor core_attn_out, Tensor z, "

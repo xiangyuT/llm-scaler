@@ -37,6 +37,35 @@ ext_modules = [
     )
 ]
 
+### Prefill DPAS attention kernel — ISOLATED .sycl unit with -doubleGRF.
+### Why separate: sdp_paged_prefill_dpas has heavy register state (A_tile=4KB,
+### ST_tile/ST_next=4KB, fp32_max/sum/delta) that spills 5120/4544 bytes at
+### default small-GRF. Compiling THIS kernel only with -doubleGRF (256 reg/thread)
+### eliminates spill and lifts XMX from 22% to 59-84% (-63% kernel time at long
+### context). The rest of esimd_kernel.sycl stays at single-GRF for thread occupancy.
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_vllm.custom_esimd_kernels_prefill_dpas",
+        sources=[
+            "csrc/xpu/esimd_kernel_prefill_dpas.sycl",
+            "csrc/xpu/torch_extension_prefill_dpas.cc",
+        ],
+        include_dirs=[
+            root / "include",
+            root / "csrc",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-Xs", "-doubleGRF",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
+### end prefill DPAS
+
 ### for lgrf esimd kernels (GDN conv fused — separate module, doubleGRF)
 ext_modules.append(
     SyclExtension(

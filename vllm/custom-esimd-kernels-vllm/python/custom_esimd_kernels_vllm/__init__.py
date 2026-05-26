@@ -43,13 +43,14 @@ def _try_import_ext(name):
 
 
 # Compiled extension modules (each registers ops into torch.ops).
-_try_import_ext("custom_esimd_kernels")        # always expected (Qwen3.5 path)
-_try_import_ext("custom_esimd_kernels_lgrf")   # always expected (Qwen3.5 path)
-_try_import_ext("custom_esimd_kernels_moe")    # XeLPG: skipped (DPAS-dep)
-_try_import_ext("custom_esimd_kernels_gemm")   # XeLPG: skipped (DPAS-dep)
-_try_import_ext("eagle_ops")                   # Qwen3.5 decode uses this
-_try_import_ext("moe_ops")                     # XeLPG: skipped (DPAS-dep)
-_try_import_ext("moe_int4_ops")                # PTL OK (uses xmx ns but no dpas)
+_try_import_ext("custom_esimd_kernels")               # always expected (Qwen3.5 path)
+_try_import_ext("custom_esimd_kernels_lgrf")          # always expected (Qwen3.5 path)
+_try_import_ext("custom_esimd_kernels_prefill_dpas")  # PTL: doubleGRF prefill attn
+_try_import_ext("custom_esimd_kernels_moe")           # XeLPG: skipped (DPAS-dep)
+_try_import_ext("custom_esimd_kernels_gemm")          # XeLPG: skipped (DPAS-dep)
+_try_import_ext("eagle_ops")                          # Qwen3.5 decode uses this
+_try_import_ext("moe_ops")                            # XeLPG: skipped (DPAS-dep)
+_try_import_ext("moe_int4_ops")                       # PTL OK (uses xmx ns but no dpas)
 
 if _MISSING_EXTS:
     _log.info(
