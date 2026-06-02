@@ -113,6 +113,48 @@ def esimd_gemv_int4(
     return _ops.esimd_gemv_int4(input, weight, weight_scale, output)
 
 
+def esimd_gemv_q4_0(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """GGUF q4_0 GEMV (decode M=1). group_size=32, split-half nibble layout.
+
+    Like esimd_gemv_int4 but matches llama.cpp q4_0 on-disk blocks:
+      - one fp16 scale per 32 elements (vs 128)
+      - within each 32-block, qs byte j: low nibble -> elem j (0..15),
+        high nibble -> elem j+16 (16..31) [split-half, NOT interleaved]
+      - dequant w = (nibble - 8) * scale (symmetric, scale may be negative)
+
+    input:        [1, K]      fp16
+    weight:       [N, K/2]    uint8 — 16 qs bytes per 32-block, contiguous
+    weight_scale: [N, K/32]   fp16  — per-block scale
+    output:       [1, N]      fp16  — pre-allocated
+
+    N inferred from weight.size(0), K from weight.size(1) * 2.
+    K must be a multiple of 32.
+    """
+    return _ops.esimd_gemv_q4_0(input, weight, weight_scale, output)
+
+
+def esimd_gemm_q4_0(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """GGUF q4_0 GEMM (prefill / batched M>=2) via DPAS.
+
+    Same interleaved weight layout as esimd_gemv_q4_0 (group_size=32). DPAS
+    XMX matrix engine; auto-dispatches K_THREADS/M_TILES from (M,N,K).
+
+    input:        [M, K]      fp16
+    weight:       [N, K/2]    uint8 — interleaved q4_0 (low=K_even, high=K_odd)
+    weight_scale: [N, K/32]   fp16
+    output:       [M, N]      fp16  — pre-allocated
+
+    Requires N % 16 == 0, K % 32 == 0. M = input.size(0), N = weight.size(0).
+    """
+    return _ops.esimd_gemm_q4_0(input, weight, weight_scale, output)
+
+
 def esimd_gemv_int4_fused2(
     input: torch.Tensor,
     w0: torch.Tensor, s0: torch.Tensor, o0: torch.Tensor,

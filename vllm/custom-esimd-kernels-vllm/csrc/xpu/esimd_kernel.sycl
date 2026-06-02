@@ -147,6 +147,49 @@ at::Tensor esimd_gemv_int4(
     return output;
 }
 
+// ---- GGUF q4_0 GEMV: group-32, split-half nibble layout ----
+
+#include "esimd_kernels/q4_0_GEMV.h"
+
+// GGUF q4_0 GEMV (decode M=1). Distinct from esimd_gemv_int4: group_size=32
+// and split-half nibble map, matching llama.cpp q4_0 on-disk blocks (repacked
+// to [N,K/2] u8 + [N,K/32] fp16). N=weight.size(0), K=weight.size(1)*2.
+at::Tensor esimd_gemv_q4_0(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1) * 2;  // packed: K/2 bytes → K elements
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    q4_0_gemv_host(reinterpret_cast<const fp16*>(p_in), p_w,
+                   reinterpret_cast<const fp16*>(p_sc),
+                   reinterpret_cast<fp16*>(p_out),
+                   (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
+#include "esimd_kernels/q4_0_GEMM.h"
+
+// GGUF q4_0 GEMM (prefill / batched M>=2), non-DPAS SIMD (PTL Xe3 has no XMX).
+// Same interleaved weight as esimd_gemv_q4_0. input [M,K] fp16,
+// weight [N,K/2] u8, scale [N,K/32] fp16, output [M,N] fp16.
+at::Tensor esimd_gemm_q4_0(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t M = input.size(0);
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1) * 2;
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    q4_0_gemm_host(reinterpret_cast<const fp16*>(p_in), p_w,
+                   reinterpret_cast<const fp16*>(p_sc),
+                   reinterpret_cast<fp16*>(p_out),
+                   (uint32_t)M, (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
 // Fused 2-matrix INT4 GEMV: two GEMVs sharing the same input vector.
 // Used for GDN input projection (in_proj_qkvz + in_proj_ba).
 at::Tensor esimd_gemv_int4_fused2(

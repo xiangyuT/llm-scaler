@@ -218,6 +218,17 @@ at::Tensor esimd_gemv_int4(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
+// GGUF q4_0 GEMV: like esimd_gemv_int4 but group_size=32 + interleaved nibble
+// layout (llama.cpp q4_0, repacked). weight [N,K/2] u8, scale [N,K/32] fp16.
+at::Tensor esimd_gemv_q4_0(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
+// GGUF q4_0 GEMM (prefill / M>=2) via DPAS. Same interleaved weight layout.
+at::Tensor esimd_gemm_q4_0(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
 // Fused 2-matrix INT4 GEMV: two GEMVs sharing the same input, single kernel submit.
 // Used for GDN input projection (in_proj_qkvz + in_proj_ba).
 at::Tensor esimd_gemv_int4_fused2(

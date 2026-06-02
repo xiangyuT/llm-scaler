@@ -45,6 +45,17 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "Tensor output) -> Tensor");
   m.impl("esimd_gemv_int4", torch::kXPU, &esimd_gemv_int4);
 
+  // GGUF q4_0 GEMV: group_size=32, split-half nibble layout (llama.cpp q4_0).
+  // weight [N, K/2] uint8, scale [N, K/32] fp16. N/K auto-detected.
+  m.def("esimd_gemv_q4_0(Tensor input, Tensor weight, Tensor weight_scale, "
+        "Tensor output) -> Tensor");
+  m.impl("esimd_gemv_q4_0", torch::kXPU, &esimd_gemv_q4_0);
+
+  // GGUF q4_0 GEMM (prefill / M>=2) via DPAS. Same interleaved weight layout.
+  m.def("esimd_gemm_q4_0(Tensor input, Tensor weight, Tensor weight_scale, "
+        "Tensor output) -> Tensor");
+  m.impl("esimd_gemm_q4_0", torch::kXPU, &esimd_gemm_q4_0);
+
   // Fused 2-matrix INT4 GEMV (GDN in_proj_qkvz + in_proj_ba)
   m.def("esimd_gemv_int4_fused2(Tensor input, "
         "Tensor w0, Tensor s0, Tensor o0, "
