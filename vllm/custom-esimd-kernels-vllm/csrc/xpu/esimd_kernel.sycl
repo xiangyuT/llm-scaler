@@ -265,6 +265,72 @@ at::Tensor esimd_gemv_q6_k(
     return output;
 }
 
+#include "esimd_kernels/moe_kquant_GEMV.h"
+
+// Fused GGUF k-quant MoE up/gate stage (Q4_K gate + Q4_K up -> silu*up).
+// gate_ql/up_ql [E,inter,hidden/2] u8; gate_sc/mn,up_sc/mn [E,inter,hidden/32]
+// fp16; sel [n_routed] int32; out inter [n_routed, intermediate] fp16.
+at::Tensor esimd_moe_up_q4k(
+    at::Tensor x, at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
+    at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
+    at::Tensor sel, at::Tensor inter,
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k) {
+    auto p_x = reinterpret_cast<const fp16*>(x.data_ptr());
+    auto p_gq = reinterpret_cast<const uint8_t*>(gate_ql.data_ptr());
+    auto p_gs = reinterpret_cast<const fp16*>(gate_sc.data_ptr());
+    auto p_gm = reinterpret_cast<const fp16*>(gate_mn.data_ptr());
+    auto p_uq = reinterpret_cast<const uint8_t*>(up_ql.data_ptr());
+    auto p_us = reinterpret_cast<const fp16*>(up_sc.data_ptr());
+    auto p_um = reinterpret_cast<const fp16*>(up_mn.data_ptr());
+    auto p_sel = reinterpret_cast<const int*>(sel.data_ptr());
+    auto p_int = reinterpret_cast<fp16*>(inter.data_ptr());
+    auto& dpcpp_queue = get_device_queue(x);
+    moe_up_q4k_host(p_x, p_gq, p_gs, p_gm, p_uq, p_us, p_um, p_sel, p_int,
+                    (int)n_tokens, (int)hidden, (int)intermediate, (int)top_k,
+                    dpcpp_queue);
+    return inter;
+}
+
+// Fused GGUF k-quant MoE down stage, PACKED (zero extra memory). Per-route
+// weighted partial [n_routed, hidden]; host sums over top_k. Separate q5k/q6k
+// (different group/format). inter K = intermediate; out N = hidden.
+at::Tensor esimd_moe_down_q5k(
+    at::Tensor inter, at::Tensor ql, at::Tensor qh, at::Tensor sc, at::Tensor mn,
+    at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k) {
+    auto p_int = reinterpret_cast<const fp16*>(inter.data_ptr());
+    auto p_ql = reinterpret_cast<const uint8_t*>(ql.data_ptr());
+    auto p_qh = reinterpret_cast<const uint8_t*>(qh.data_ptr());
+    auto p_sc = reinterpret_cast<const fp16*>(sc.data_ptr());
+    auto p_mn = reinterpret_cast<const fp16*>(mn.data_ptr());
+    auto p_sel = reinterpret_cast<const int*>(sel.data_ptr());
+    auto p_tw = reinterpret_cast<const fp16*>(topk_w.data_ptr());
+    auto p_out = reinterpret_cast<fp16*>(out_partial.data_ptr());
+    auto& dpcpp_queue = get_device_queue(inter);
+    moe_down_q5k_host(p_int, p_ql, p_qh, p_sc, p_mn, p_sel, p_tw, p_out,
+                      (int)n_tokens, (int)hidden, (int)intermediate, (int)top_k,
+                      dpcpp_queue);
+    return out_partial;
+}
+
+at::Tensor esimd_moe_down_q6k(
+    at::Tensor inter, at::Tensor ql, at::Tensor qh, at::Tensor sc,
+    at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k) {
+    auto p_int = reinterpret_cast<const fp16*>(inter.data_ptr());
+    auto p_ql = reinterpret_cast<const uint8_t*>(ql.data_ptr());
+    auto p_qh = reinterpret_cast<const uint8_t*>(qh.data_ptr());
+    auto p_sc = reinterpret_cast<const fp16*>(sc.data_ptr());
+    auto p_sel = reinterpret_cast<const int*>(sel.data_ptr());
+    auto p_tw = reinterpret_cast<const fp16*>(topk_w.data_ptr());
+    auto p_out = reinterpret_cast<fp16*>(out_partial.data_ptr());
+    auto& dpcpp_queue = get_device_queue(inter);
+    moe_down_q6k_host(p_int, p_ql, p_qh, p_sc, p_sel, p_tw, p_out,
+                      (int)n_tokens, (int)hidden, (int)intermediate, (int)top_k,
+                      dpcpp_queue);
+    return out_partial;
+}
+
 #include "esimd_kernels/q4_0_GEMM.h"
 
 // GGUF q4_0 GEMM (prefill / batched M>=2), non-DPAS SIMD (PTL Xe3 has no XMX).

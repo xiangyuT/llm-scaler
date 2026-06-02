@@ -73,6 +73,23 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "Tensor weight_scale, Tensor output) -> Tensor");
   m.impl("esimd_gemv_q6_k", torch::kXPU, &esimd_gemv_q6_k);
 
+  // Fused GGUF k-quant MoE up/gate (Q4_K) -> silu*up.
+  m.def("esimd_moe_up_q4k(Tensor x, Tensor gate_ql, Tensor gate_sc, "
+        "Tensor gate_mn, Tensor up_ql, Tensor up_sc, Tensor up_mn, Tensor sel, "
+        "Tensor inter, int n_tokens, int hidden, int intermediate, int top_k) "
+        "-> Tensor");
+  m.impl("esimd_moe_up_q4k", torch::kXPU, &esimd_moe_up_q4k);
+
+  // Fused GGUF k-quant MoE down (PACKED), separate Q5_K / Q6_K.
+  m.def("esimd_moe_down_q5k(Tensor inter, Tensor ql, Tensor qh, Tensor sc, "
+        "Tensor mn, Tensor sel, Tensor topk_w, Tensor out_partial, "
+        "int n_tokens, int hidden, int intermediate, int top_k) -> Tensor");
+  m.impl("esimd_moe_down_q5k", torch::kXPU, &esimd_moe_down_q5k);
+  m.def("esimd_moe_down_q6k(Tensor inter, Tensor ql, Tensor qh, Tensor sc, "
+        "Tensor sel, Tensor topk_w, Tensor out_partial, "
+        "int n_tokens, int hidden, int intermediate, int top_k) -> Tensor");
+  m.impl("esimd_moe_down_q6k", torch::kXPU, &esimd_moe_down_q6k);
+
   // GGUF q4_0 GEMM (prefill / M>=2) via DPAS. Same interleaved weight layout.
   m.def("esimd_gemm_q4_0(Tensor input, Tensor weight, Tensor weight_scale, "
         "Tensor output) -> Tensor");

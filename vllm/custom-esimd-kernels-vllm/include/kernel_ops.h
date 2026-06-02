@@ -249,6 +249,23 @@ at::Tensor esimd_gemv_q6_k(
     at::Tensor input, at::Tensor ql, at::Tensor qh,
     at::Tensor weight_scale, at::Tensor output);
 
+// Fused GGUF k-quant MoE up/gate (Q4_K) -> silu*up -> inter[n_routed,inter].
+at::Tensor esimd_moe_up_q4k(
+    at::Tensor x, at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,
+    at::Tensor up_ql, at::Tensor up_sc, at::Tensor up_mn,
+    at::Tensor sel, at::Tensor inter,
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k);
+
+// Fused GGUF k-quant MoE down, PACKED -> per-route weighted partial.
+at::Tensor esimd_moe_down_q5k(
+    at::Tensor inter, at::Tensor ql, at::Tensor qh, at::Tensor sc, at::Tensor mn,
+    at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k);
+at::Tensor esimd_moe_down_q6k(
+    at::Tensor inter, at::Tensor ql, at::Tensor qh, at::Tensor sc,
+    at::Tensor sel, at::Tensor topk_w, at::Tensor out_partial,
+    int64_t n_tokens, int64_t hidden, int64_t intermediate, int64_t top_k);
+
 // GGUF q4_0 GEMM (prefill / M>=2) via DPAS. Same interleaved weight layout.
 at::Tensor esimd_gemm_q4_0(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,

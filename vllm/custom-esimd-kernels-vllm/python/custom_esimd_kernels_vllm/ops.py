@@ -212,6 +212,56 @@ def esimd_gemv_q6_k(
     return _ops.esimd_gemv_q6_k(input, ql, qh, weight_scale, output)
 
 
+def esimd_moe_up_q4k(
+    x, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn, sel, inter,
+    n_tokens, hidden, intermediate, top_k,
+):
+    """Fused GGUF k-quant MoE up/gate stage (Q4_K gate + Q4_K up).
+
+    One launch over all routed (token,expert) pairs: dequant gate+up (Q4_K
+    interleaved nibble, per-32 scale+min), silu(gate)*up -> inter.
+    gate_ql/up_ql [E,inter,hidden/2] u8; gate_sc/mn,up_sc/mn [E,inter,hidden/32]
+    fp16; sel [n_routed] int32; inter [n_routed, intermediate] fp16 (out).
+    """
+    return _ops.esimd_moe_up_q4k(
+        x, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn, sel, inter,
+        n_tokens, hidden, intermediate, top_k,
+    )
+
+
+def esimd_moe_down_q5k(
+    inter, ql, qh, sc, mn, sel, topk_w, out_partial,
+    n_tokens, hidden, intermediate, top_k,
+):
+    """Fused GGUF Q5_K MoE down stage, PACKED (zero extra memory).
+
+    One launch over all routed (token,expert): packed Q5_K dequant
+    (ql nibble + pre-shuffled 1-bit qh + per-32 scale+min) . dot(inter) * topk_w
+    -> per-route partial out_partial [n_routed, hidden] (host sums top_k).
+    ql [E,hidden,inter/2] u8; qh [E,hidden,inter/8] u8; sc/mn [E,hidden,inter/32].
+    """
+    return _ops.esimd_moe_down_q5k(
+        inter, ql, qh, sc, mn, sel, topk_w, out_partial,
+        n_tokens, hidden, intermediate, top_k,
+    )
+
+
+def esimd_moe_down_q6k(
+    inter, ql, qh, sc, sel, topk_w, out_partial,
+    n_tokens, hidden, intermediate, top_k,
+):
+    """Fused GGUF Q6_K MoE down stage, PACKED, symmetric (zero extra memory).
+
+    Packed Q6_K dequant (ql nibble + pre-shuffled 2-bit qh + per-16 scale,
+    w=scale*(v6-32)) . dot(inter) * topk_w -> per-route partial.
+    ql [E,hidden,inter/2] u8; qh [E,hidden,inter/4] u8; sc [E,hidden,inter/16].
+    """
+    return _ops.esimd_moe_down_q6k(
+        inter, ql, qh, sc, sel, topk_w, out_partial,
+        n_tokens, hidden, intermediate, top_k,
+    )
+
+
 def esimd_gemm_q4_0(
     input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     output: torch.Tensor,
