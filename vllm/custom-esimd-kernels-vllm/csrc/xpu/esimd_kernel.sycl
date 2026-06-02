@@ -169,6 +169,102 @@ at::Tensor esimd_gemv_q4_0(
     return output;
 }
 
+// ---- GGUF q8_0 GEMV: group-32, signed int8, symmetric (no min) ----
+
+#include "esimd_kernels/q8_0_GEMV.h"
+
+// GGUF q8_0 GEMV (decode M=1). weight [N,K] int8 (signed), scale [N,K/32] fp16
+// (per-block d, repacked bit-exact from llama.cpp q8_0 blocks). dequant
+// w = d * qs. N=weight.size(0), K=weight.size(1) (unpacked: 1 byte/elem).
+at::Tensor esimd_gemv_q8_0(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1);  // int8: 1 byte/elem
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_sc, weight_scale);
+    EXTRACT_PTR(p_out, output);
+    auto p_w = reinterpret_cast<int8_t*>(weight.data_ptr());
+    auto& dpcpp_queue = get_device_queue(input);
+    q8_0_gemv_host(reinterpret_cast<const fp16*>(p_in), p_w,
+                   reinterpret_cast<const fp16*>(p_sc),
+                   reinterpret_cast<fp16*>(p_out),
+                   (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
+// ---- GGUF q4_K GEMV: group-32 interleaved, asymmetric (scale + min) ----
+
+#include "esimd_kernels/q4_k_GEMV.h"
+
+// GGUF q4_K GEMV (decode M=1). weight [N,K/2] u8 (interleaved nibble, same as
+// q4_0), scale [N,K/32] fp16 (= dall*sc6), min [N,K/32] fp16 (= dmin*mn6),
+// both pre-computed on host from the 6-bit sub-fields. dequant w = scale*nib
+// - min. N=weight.size(0), K=weight.size(1)*2.
+at::Tensor esimd_gemv_q4_k(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor weight_min, at::Tensor output) {
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1) * 2;  // packed: K/2 bytes → K elements
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_w, weight);
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_mn, weight_min);
+    EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    q4_k_gemv_host(reinterpret_cast<const fp16*>(p_in), p_w,
+                   reinterpret_cast<const fp16*>(p_sc),
+                   reinterpret_cast<const fp16*>(p_mn),
+                   reinterpret_cast<fp16*>(p_out),
+                   (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
+// ---- GGUF q5_K GEMV: PACKED (ql nibble + pre-shuffled 1-bit qh), asym ----
+
+#include "esimd_kernels/q5_k_GEMV.h"
+
+// ql [N,K/2] u8 nibble + qh [N,K/8] u8 (pre-shuffled 1-bit) + scale,min [N,K/32]
+// fp16. dequant v5=nibble|(qh<<4); w=scale*v5-min. K=ql.size(1)*2.
+at::Tensor esimd_gemv_q5_k(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor weight_min, at::Tensor output) {
+    int64_t N = ql.size(0);
+    int64_t K = ql.size(1) * 2;  // packed nibble: K/2 bytes -> K elements
+    EXTRACT_PTR(p_in, input);
+    auto p_ql = reinterpret_cast<uint8_t*>(ql.data_ptr());
+    auto p_qh = reinterpret_cast<uint8_t*>(qh.data_ptr());
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_mn, weight_min);
+    EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    q5_k_gemv_host(reinterpret_cast<const fp16*>(p_in), p_ql, p_qh,
+                   reinterpret_cast<const fp16*>(p_sc),
+                   reinterpret_cast<const fp16*>(p_mn),
+                   reinterpret_cast<fp16*>(p_out),
+                   (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
+// ---- GGUF q6_K GEMV: PACKED (ql nibble + pre-shuffled 2-bit qh), sym, g16 ----
+
+#include "esimd_kernels/q6_k_GEMV.h"
+
+// ql [N,K/2] u8 nibble + qh [N,K/4] u8 (pre-shuffled 2-bit) + scale [N,K/16]
+// fp16. SYMMETRIC v6=nibble|(qh<<4); w=scale*(v6-32). K=ql.size(1)*2.
+at::Tensor esimd_gemv_q6_k(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor output) {
+    int64_t N = ql.size(0);
+    int64_t K = ql.size(1) * 2;  // packed nibble: K/2 bytes -> K elements
+    EXTRACT_PTR(p_in, input);
+    auto p_ql = reinterpret_cast<uint8_t*>(ql.data_ptr());
+    auto p_qh = reinterpret_cast<uint8_t*>(qh.data_ptr());
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    q6_k_gemv_host(reinterpret_cast<const fp16*>(p_in), p_ql, p_qh,
+                   reinterpret_cast<const fp16*>(p_sc),
+                   reinterpret_cast<fp16*>(p_out),
+                   (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
 #include "esimd_kernels/q4_0_GEMM.h"
 
 // GGUF q4_0 GEMM (prefill / batched M>=2), non-DPAS SIMD (PTL Xe3 has no XMX).

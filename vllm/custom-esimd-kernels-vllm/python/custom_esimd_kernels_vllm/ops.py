@@ -136,6 +136,82 @@ def esimd_gemv_q4_0(
     return _ops.esimd_gemv_q4_0(input, weight, weight_scale, output)
 
 
+def esimd_gemv_q8_0(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """GGUF q8_0 GEMV (decode M=1). group_size=32, signed int8, symmetric.
+
+    Matches llama.cpp q8_0 on-disk blocks {half d; int8 qs[32]}:
+      - one fp16 scale (= d) per 32 elements
+      - dequant w = d * qs   (qs SIGNED int8, NO min — symmetric)
+
+    input:        [1, K]      fp16
+    weight:       [N, K]      int8 — signed quants, contiguous per row
+    weight_scale: [N, K/32]   fp16 — per-block d
+    output:       [1, N]      fp16 — pre-allocated
+
+    N inferred from weight.size(0), K from weight.size(1).
+    K must be a multiple of 32.
+    """
+    return _ops.esimd_gemv_q8_0(input, weight, weight_scale, output)
+
+
+def esimd_gemv_q4_k(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    weight_min: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """GGUF q4_K GEMV (decode M=1). group_size=32, interleaved nibble, asymmetric.
+
+    Matches llama.cpp q4_K super-blocks (256 elem, 8 sub-blocks of 32) after a
+    host repack that pre-computes the per-sub-block scale/min as fp16 from the
+    6-bit sub-fields (get_scale_min_k4) x dall/dmin:
+      - dequant w = scale * nibble - min   (nibble 0..15, asymmetric)
+      - same interleaved nibble layout as q4_0 (byte j: low->2j, high->2j+1)
+
+    input:        [1, K]      fp16
+    weight:       [N, K/2]    uint8 — interleaved nibbles
+    weight_scale: [N, K/32]   fp16  — = dall * sc6 (per 32-block)
+    weight_min:   [N, K/32]   fp16  — = dmin * mn6 (per 32-block)
+    output:       [1, N]      fp16  — pre-allocated
+
+    N inferred from weight.size(0), K from weight.size(1) * 2.
+    K must be a multiple of 32.
+    """
+    return _ops.esimd_gemv_q4_k(input, weight, weight_scale, weight_min, output)
+
+
+def esimd_gemv_q5_k(
+    input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
+    weight_scale: torch.Tensor, weight_min: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """GGUF q5_K GEMV (decode M=1). PACKED (zero extra memory).
+
+    ql [N,K/2] nibble (low->2j, high->2j+1) + qh [N,K/8] PRE-SHUFFLED 1-bit
+    (per 512-elem tile, host bit-transpose so the 5th-bit add is stride-1) +
+    scale,min [N,K/32] fp16 (= dall*sc6, dmin*mn6).
+      dequant v5 = ql_nibble | (qh_bit<<4); w = scale*v5 - min
+
+    input [1,K] fp16; output [1,N] fp16. N=ql.size(0), K=ql.size(1)*2 (mult 512).
+    """
+    return _ops.esimd_gemv_q5_k(input, ql, qh, weight_scale, weight_min, output)
+
+
+def esimd_gemv_q6_k(
+    input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
+    weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """GGUF q6_K GEMV (decode M=1). PACKED (zero extra memory), symmetric.
+
+    ql [N,K/2] nibble + qh [N,K/4] PRE-SHUFFLED 2-bit (per 512-elem tile) +
+    scale [N,K/16] fp16 (= d*sc_int8, may be negative).
+      dequant v6 = ql_nibble | (qh_2bit<<4); w = scale*(v6 - 32)
+
+    input [1,K] fp16; output [1,N] fp16. N=ql.size(0), K=ql.size(1)*2 (mult 512).
+    """
+    return _ops.esimd_gemv_q6_k(input, ql, qh, weight_scale, output)
+
+
 def esimd_gemm_q4_0(
     input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     output: torch.Tensor,

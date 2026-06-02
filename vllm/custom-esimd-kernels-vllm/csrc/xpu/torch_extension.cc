@@ -51,6 +51,28 @@ TORCH_LIBRARY(custom_esimd_kernels_vllm, m) {
         "Tensor output) -> Tensor");
   m.impl("esimd_gemv_q4_0", torch::kXPU, &esimd_gemv_q4_0);
 
+  // GGUF q8_0 GEMV: group_size=32, signed int8, symmetric (no min).
+  // weight [N, K] int8, scale [N, K/32] fp16. dequant w = d * qs.
+  m.def("esimd_gemv_q8_0(Tensor input, Tensor weight, Tensor weight_scale, "
+        "Tensor output) -> Tensor");
+  m.impl("esimd_gemv_q8_0", torch::kXPU, &esimd_gemv_q8_0);
+
+  // GGUF q4_K GEMV: group_size=32 interleaved, asymmetric (scale + min).
+  // weight [N, K/2] u8, scale + min [N, K/32] fp16. dequant w = scale*nib - min.
+  m.def("esimd_gemv_q4_k(Tensor input, Tensor weight, Tensor weight_scale, "
+        "Tensor weight_min, Tensor output) -> Tensor");
+  m.impl("esimd_gemv_q4_k", torch::kXPU, &esimd_gemv_q4_k);
+
+  // GGUF q5_K GEMV: PACKED (ql nibble + pre-shuffled 1-bit qh), asym scale+min.
+  m.def("esimd_gemv_q5_k(Tensor input, Tensor ql, Tensor qh, "
+        "Tensor weight_scale, Tensor weight_min, Tensor output) -> Tensor");
+  m.impl("esimd_gemv_q5_k", torch::kXPU, &esimd_gemv_q5_k);
+
+  // GGUF q6_K GEMV: PACKED (ql nibble + pre-shuffled 2-bit qh), symmetric g16.
+  m.def("esimd_gemv_q6_k(Tensor input, Tensor ql, Tensor qh, "
+        "Tensor weight_scale, Tensor output) -> Tensor");
+  m.impl("esimd_gemv_q6_k", torch::kXPU, &esimd_gemv_q6_k);
+
   // GGUF q4_0 GEMM (prefill / M>=2) via DPAS. Same interleaved weight layout.
   m.def("esimd_gemm_q4_0(Tensor input, Tensor weight, Tensor weight_scale, "
         "Tensor output) -> Tensor");

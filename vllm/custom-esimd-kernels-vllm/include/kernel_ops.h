@@ -224,6 +224,31 @@ at::Tensor esimd_gemv_q4_0(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
+// GGUF q8_0 GEMV: group_size=32, signed int8, symmetric (no min).
+// weight [N,K] int8, scale [N,K/32] fp16. dequant w = d * qs.
+at::Tensor esimd_gemv_q8_0(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
+// GGUF q4_K GEMV: group_size=32 interleaved nibble, asymmetric.
+// weight [N,K/2] u8, scale + min [N,K/32] fp16 (host-precomputed from 6-bit
+// sub-fields). dequant w = scale*nibble - min.
+at::Tensor esimd_gemv_q4_k(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor weight_min, at::Tensor output);
+
+// GGUF q5_K GEMV: PACKED (ql nibble [N,K/2] + pre-shuffled 1-bit qh [N,K/8]),
+// asymmetric scale+min [N,K/32]. dequant v5=nibble|(qh<<4); w=scale*v5-min.
+at::Tensor esimd_gemv_q5_k(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor weight_min, at::Tensor output);
+
+// GGUF q6_K GEMV: PACKED (ql nibble [N,K/2] + pre-shuffled 2-bit qh [N,K/4]),
+// symmetric scale [N,K/16]. dequant v6=nibble|(qh<<4); w=scale*(v6-32).
+at::Tensor esimd_gemv_q6_k(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor output);
+
 // GGUF q4_0 GEMM (prefill / M>=2) via DPAS. Same interleaved weight layout.
 at::Tensor esimd_gemm_q4_0(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
