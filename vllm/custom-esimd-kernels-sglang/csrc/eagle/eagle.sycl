@@ -1,0 +1,604 @@
+#include <torch/extension.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+#include <random>
+#include <sstream>
+#include <fstream>
+using fp16 = sycl::half;
+using namespace sycl::ext::intel::esimd;
+using namespace sycl::ext::intel::esimd::xmx;
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+static inline sycl::event submit_kernel(
+    std::function<void(sycl::handler&)> kernel,
+    const torch::Device& device,
+    const char* desc) {
+    sycl::queue& queue = c10::xpu::getCurrentXPUStream(device.index()).queue();
+    return queue.submit(kernel);
+}
+
+static inline bool isPowerOf2(uint32_t in) {
+  if (in == 0) {
+    return false;
+  } else {
+    return (in & (in - 1)) == 0 ? true : false;
+  }
+}
+
+static inline uint32_t getHighestBit(uint32_t in) {
+  uint32_t ret = 0;
+  uint32_t temp = in - 1;
+  while (temp != 0) {
+    temp = temp >> 1;
+    ret++;
+  }
+  return ret;
+}
+
+#include "eagle.kernels.fp16.h"
+#include "eagle.kernels.bf16.h"
+#include "extend.kernels.fp16.h"
+#include "extend.kernels.bf16.h"
+#include "page.attn.h"
+
+// ── Kernel 1: MTP causal conv1d update kernel ───────────────────────────────
+void conv1d_forward_kernel(
+  uint8_t* qkvzState,
+  uint8_t* zOut,
+  uint8_t* convW,
+  uint8_t* convB,
+  uint8_t* convState,
+  uint32_t* convStateIdx,
+  uint32_t* acceptedTokens,
+  torch::ScalarType fpType,
+  uint32_t batches,
+  uint32_t nTokens,
+  uint32_t headQk,
+  uint32_t headV,
+  uint32_t headDim,
+  uint32_t qkvzStride,
+  uint32_t conv_stride0,
+  const torch::Device& device) {
+  uint32_t totalHeads = headQk * 2 + headV;
+  uint32_t convDim = totalHeads * headDim;
+  uint32_t hiddenDim = qkvzStride; // (headQk * 2 + headV * 2) * headDim;
+  uint32_t groupH = convDim >> 7;
+  uint32_t groupV = batches;
+  sycl::range<2> globalConv1d(groupH, groupV);
+  sycl::range<2> localConv1d(1, 1);
+  sycl::nd_range<2> rangeConv1d(globalConv1d, localConv1d);
+
+  std::function<void(sycl::handler&)> kernel;
+  switch (fpType) {
+    case torch::kBFloat16:
+      kernel = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class eagleConv1dBf16Forward>(rangeConv1d, [=](sycl::nd_item<2> idx) SYCL_ESIMD_KERNEL{
+            causalConv1dUpdateBf16(
+              qkvzState, zOut, convW, convB, convState, convStateIdx, acceptedTokens,
+              nTokens, headQk, headV, headDim, qkvzStride, conv_stride0, idx
+            );
+          });
+        };
+
+      submit_kernel(kernel, device, "causal_conv1d_update forward");
+    break;
+    case torch::kHalf:
+      kernel = [&](sycl::handler& cgh) {
+        cgh.parallel_for<class eagleConv1dFp16Forward>(rangeConv1d, [=](sycl::nd_item<2> idx) SYCL_ESIMD_KERNEL{
+            causalConv1dUpdateFp16(
+              qkvzState, zOut, convW, convB, convState, convStateIdx, acceptedTokens,
+              nTokens, headQk, headV, headDim, qkvzStride, conv_stride0, idx
+            );
+          });
+        };
+
+      submit_kernel(kernel, device, "causal_conv1d_update forward");
+      break;
+    default:
+      break;
+  }
+}
+
+// ── Kernel 2: GDN eagle kernel ───────────────────────────────
+void gdn_eagle_forward_kernel(
+  uint8_t* qkvzState,
+  uint8_t* baState,
+  uint8_t* aLogW,
+  uint8_t* dtBias,
+  uint32_t* acceptedTokens,
+  uint32_t* ssmStateIdx,
+  uint8_t* lastRecurState,
+  uint8_t* outState,
+  torch::ScalarType fpType,
+  uint32_t batches,
+  uint32_t nTokens,
+  uint32_t headQk,
+  uint32_t headV,
+  uint32_t headDim,
+  uint32_t qkvzStride,
+  uint32_t ssm_stride0,
+  const torch::Device& device) {
+
+  sycl::range<2> globalGdnRecur(headV * 16, batches);
+  sycl::range<2> localGdnRecur(16, 1);
+  sycl::nd_range<2> rangeGdnRecur(globalGdnRecur, localGdnRecur);
+  std::function<void(sycl::handler&)> kernel;
+
+  switch (fpType) {
+  case torch::kBFloat16:
+    kernel = [&](sycl::handler& cgh) {
+      cgh.parallel_for<class eagleGdnRecurBf16Forward>(
+        rangeGdnRecur, [=](sycl::nd_item<2> idx) SYCL_ESIMD_KERNEL{
+          gdnRecurBf16(qkvzState, baState, (bf16*)aLogW, (bf16*)dtBias, acceptedTokens, ssmStateIdx, lastRecurState, outState,
+            nTokens, headQk, headV, headDim, qkvzStride, ssm_stride0, idx);
+        });
+      };
+
+    submit_kernel(kernel, device, "gdn_eagle forward");
+    break;
+  case torch::kHalf:
+    kernel = [&](sycl::handler& cgh) {
+      cgh.parallel_for<class eagleGdnRecurFp16Forward>(
+        rangeGdnRecur, [=](sycl::nd_item<2> idx) SYCL_ESIMD_KERNEL{
+          gdnRecurFp16(qkvzState, baState, (fp16*)aLogW, (fp16*)dtBias, acceptedTokens, ssmStateIdx, lastRecurState, outState,
+            nTokens, headQk, headV, headDim, qkvzStride, ssm_stride0, idx);
+        });
+      };
+
+    submit_kernel(kernel, device, "gdn_eagle forward");
+    break;
+  default:
+    break;
+  }
+}
+
+inline void dumpDeviceMem(sycl::queue& debugDumpQueue, void* deviceMem, size_t sizeDump, std::stringstream& fileDirectory) {
+  uint8_t* sysMem = (uint8_t*)malloc(sizeDump);
+  debugDumpQueue.wait();
+  debugDumpQueue.memcpy(sysMem, deviceMem, sizeDump).wait();
+  std::ofstream outFile;
+  fileDirectory << "." << sizeDump << ".dat";
+  outFile.open(fileDirectory.str().c_str(), std::ios::binary);
+  outFile.write((char*)sysMem, sizeDump);
+  outFile.close();
+  free(sysMem);
+}
+
+// ── Kernel 3: page attention kernel ───────────────────────────────
+// Templated on storage dtype T (fp16 or bf16). The kernel class tags (paPhase*)
+// must be distinct per T so SYCL doesn't coalesce the two instantiations.
+template <typename T>
+class paPhase1ForwardT;
+template <typename T>
+class paPhase2ForwardT;
+template <typename T>
+class paPhase3ForwardT;
+
+template <typename T>
+void page_attention_forward_kernel(
+  uint8_t* qState,
+  uint8_t* kCache,
+  uint8_t* vCache,
+  uint32_t* pageTable,
+  uint32_t* kvSeqLens,
+  uint8_t* out,
+  float* pState,
+  float* pGroupMax,
+  float* pGlobalMax,
+  uint32_t* pPollP,
+  float* pTempOut,
+  float* pGlobalSoftmaxSum,
+  uint32_t batches,
+  uint32_t nTokens,
+  uint32_t headQk,
+  uint32_t headV,
+  uint32_t headDim,
+  uint32_t kvCacheStride1,
+  uint32_t pageTableBatchStride,
+  uint32_t pageTableSizeLog2,
+  uint32_t pStride,
+  uint32_t maxStride,
+  uint32_t maxKvSeqLen,
+  uint32_t gqaRatio,
+  const torch::Device& device) {
+  uint32_t groupH, groupV, groupD;
+  uint32_t flag = maxKvSeqLen > 1024 ? 0 : 1;
+  uint32_t gqaGroups = gqaRatio / 4;
+  // Phase1: each work group of 4 threads handles 4 q-heads sharing one kv-head
+  // Total groups in dim0 = headV * gqaGroups (one group per 4-q-head chunk)
+  groupH = headV * gqaGroups;
+  groupV = (maxKvSeqLen + 63) / 64;
+  groupD = batches;
+  sycl::range<3> globalPaPhase1(groupH * 4, groupV, groupD);
+  sycl::range<3> localPaPhase1(4, 1, 1);
+  sycl::nd_range<3> rangePaPhase1(globalPaPhase1, localPaPhase1);
+
+  groupH = headDim / 16 * (maxKvSeqLen + 1023) / 1024;
+  groupV = headV * gqaGroups;
+  groupD = batches;
+  sycl::range<3> globalPaPhase2(groupH * 2, groupV, groupD);
+  sycl::range<3> localPaPhase2(2, 1, 1);
+  sycl::nd_range<3> rangePaPhase2(globalPaPhase2, localPaPhase2);
+
+  groupH = headDim / 16;
+  groupV = headQk;
+  groupD = batches;
+  sycl::range<3> globalPaPhase3(groupH, groupV, groupD);
+  sycl::range<3> localPaPhase3(1, 1, 1);
+  sycl::nd_range<3> rangePaPhase3(globalPaPhase3, localPaPhase3);
+
+  std::function<void(sycl::handler&)> kernelPhase1;
+  std::function<void(sycl::handler&)> kernelPhase2;
+  std::function<void(sycl::handler&)> kernelPhase3;
+
+  kernelPhase1 = [&](sycl::handler& cgh) {
+    cgh.parallel_for<paPhase1ForwardT<T>>(
+      rangePaPhase1, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
+        sdpaDecodeGqa4Phase1<T>(qState, kCache, (uint8_t*)pState, pGroupMax, pGlobalMax, pPollP, pageTable, kvSeqLens,
+          batches, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, gqaRatio, idx);
+      });
+    };
+
+  kernelPhase2 = [&](sycl::handler& cgh) {
+    cgh.parallel_for<paPhase2ForwardT<T>>(
+      rangePaPhase2, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
+        sdpaDecodeGqa4Phase2<T>((uint8_t*)pState, pGroupMax, vCache, pGlobalMax, pTempOut, pGlobalSoftmaxSum, out, pageTable, kvSeqLens,
+          batches, kvCacheStride1, pageTableBatchStride, pageTableSizeLog2, pStride, maxStride, headV, maxKvSeqLen, flag, gqaRatio, idx);
+      });
+    };
+
+  kernelPhase3 = [&](sycl::handler& cgh) {
+    cgh.parallel_for<paPhase3ForwardT<T>>(
+      rangePaPhase3, [=](sycl::nd_item<3> idx) SYCL_ESIMD_KERNEL{
+        sdpaDecodeGqa4Phase3<T>(pTempOut, pGlobalSoftmaxSum, out, kvSeqLens,
+          batches, headV, maxKvSeqLen, gqaRatio, idx);
+      });
+    };
+
+  submit_kernel(kernelPhase1, device, "page_attn_ph1 forward");
+  submit_kernel(kernelPhase2, device, "page_attn_ph2 forward");
+  if (flag == 0) {
+    submit_kernel(kernelPhase3, device, "page_attn_ph3 forward");
+  }
+}
+
+
+torch::Tensor gdn_eagle(
+    torch::Tensor& qkvz,
+    torch::Tensor& z_out,
+    torch::Tensor conv_w,
+    const std::optional<torch::Tensor>& conv_b,
+    torch::Tensor& conv_state,
+    torch::Tensor accepted_tokens,
+    torch::Tensor ba,
+    torch::Tensor a_log,
+    torch::Tensor dt_bias,
+    torch::Tensor& state_in,
+    torch::Tensor ssm_state_idx,
+    torch::Tensor norm_w,
+    int64_t max_query_len
+) {
+    TORCH_CHECK(ssm_state_idx.dim() == 2);
+    TORCH_CHECK(qkvz.scalar_type() == torch::kBFloat16 || qkvz.scalar_type() == torch::kHalf);
+    int64_t conv_stride0 = conv_state.stride(0);
+
+    int64_t ssm_stride0 = state_in.stride(0);
+    int64_t ba_stride0 = ba.stride(0);
+    int64_t ssm_state_idx_stride0 = ssm_state_idx.stride(0);
+    uint32_t cacheIdx;
+    uint32_t* dumpTemp = nullptr;
+    uint32_t totalDims = state_in.dim();
+    uint32_t qkvzDims = qkvz.dim();
+    TORCH_CHECK(totalDims >= 3);
+    TORCH_CHECK(qkvzDims >= 2);
+
+    uint32_t hiddenDim = qkvz.size(qkvzDims - 1);
+    uint32_t qkvzStride = qkvz.stride(qkvzDims - 2);
+    uint32_t headDim = state_in.size(totalDims - 1);
+    uint32_t headV = state_in.size(totalDims - 3);
+    uint32_t batches = ssm_state_idx.size(0);
+    uint32_t nTokens = qkvz.size(qkvzDims - 2);
+    uint32_t headQk = headV >> 1;
+    TORCH_CHECK(hiddenDim == (headQk * 2 + headV * 2) * headDim);
+    TORCH_CHECK(headDim == 128);
+    TORCH_CHECK(nTokens <= 4);
+
+    torch::Tensor gdn_out = torch::empty({batches * nTokens, headV, headDim},
+        torch::device(qkvz.device()).dtype(qkvz.scalar_type()));
+
+    conv1d_forward_kernel(
+        (uint8_t*)qkvz.data_ptr(),
+        (uint8_t*)z_out.data_ptr(),
+        (uint8_t*)conv_w.data_ptr(),
+        conv_b.has_value() ? (uint8_t*)conv_b->data_ptr() : nullptr,
+        (uint8_t*)conv_state.data_ptr(),
+        (uint32_t*)ssm_state_idx.data_ptr(),
+        (uint32_t*)accepted_tokens.data_ptr(),
+        qkvz.scalar_type(),
+        batches, nTokens, headQk, headV, headDim, qkvzStride, (uint32_t)conv_stride0,
+        qkvz.device());
+
+    gdn_eagle_forward_kernel(
+        (uint8_t*)qkvz.data_ptr(),
+        (uint8_t*)ba.data_ptr(),
+        (uint8_t*)a_log.data_ptr(),
+        (uint8_t*)dt_bias.data_ptr(),
+        (uint32_t*)accepted_tokens.data_ptr(),
+        (uint32_t*)ssm_state_idx.data_ptr(),
+        (uint8_t*)state_in.data_ptr(),
+        (uint8_t*)gdn_out.data_ptr(),
+        qkvz.scalar_type(),
+        batches, nTokens, headQk, headV, headDim, qkvzStride, (uint32_t)ssm_stride0,
+        qkvz.device());
+
+    return gdn_out;
+}
+
+void page_attn_decode(
+  torch::Tensor query,
+  torch::Tensor key_cache,
+  torch::Tensor value_cache,
+  torch::Tensor block_table,
+  torch::Tensor seq_lens,
+  torch::Tensor& out,
+  int64_t max_query_len,
+  int64_t max_seq_len,
+  std::optional<torch::Tensor> temp_p_opt = std::nullopt
+) {
+  TORCH_CHECK(block_table.dim() == 2);
+  TORCH_CHECK(seq_lens.dim() == 1);
+  TORCH_CHECK(key_cache.dim() == 4,
+              "key_cache must be [num_pages, page_size, num_kv_heads, head_dim]");
+  TORCH_CHECK(value_cache.dim() == 4,
+              "value_cache must be [num_pages, page_size, num_kv_heads, head_dim]");
+  TORCH_CHECK(key_cache.sizes() == value_cache.sizes(),
+              "key_cache and value_cache must have identical shape");
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0),
+              "key_cache and value_cache must have identical page stride");
+  TORCH_CHECK(query.dim() == 3, "query must be [batches, num_q_heads, head_dim]");
+  TORCH_CHECK(query.scalar_type() == torch::kHalf || query.scalar_type() == torch::kBFloat16,
+              "query must be fp16 or bf16");
+  TORCH_CHECK(key_cache.scalar_type() == query.scalar_type(),
+              "key_cache dtype must match query dtype");
+  TORCH_CHECK(value_cache.scalar_type() == query.scalar_type(),
+              "value_cache dtype must match query dtype");
+  TORCH_CHECK(out.scalar_type() == query.scalar_type(),
+              "out dtype must match query dtype");
+
+  // Page stride = stride(0) when K/V are separate [num_pages, page_size, H, D]
+  // tensors. This replaces the old merged [2, N, P, H, D] layout's stride(1).
+  uint32_t kvCacheStride1 = key_cache.stride(0);
+  uint32_t totalDimsKv = key_cache.dim();
+
+  uint32_t headDim = key_cache.size(totalDimsKv - 1);
+  uint32_t headV = key_cache.size(totalDimsKv - 2);
+  uint32_t pageSize = key_cache.size(totalDimsKv - 3);
+  uint32_t batches = seq_lens.size(0);
+  // Derive headQk from query tensor shape instead of hardcoding gqaRatio=4
+  uint32_t headQk = query.size(1);
+  TORCH_CHECK(headV > 0, "num_kv_heads must be positive");
+  uint32_t gqaRatio = headQk / headV;
+  TORCH_CHECK(gqaRatio * headV == headQk, "num_q_heads must be a multiple of num_kv_heads");
+  TORCH_CHECK(gqaRatio >= 4 && gqaRatio % 4 == 0, "gqaRatio must be a multiple of 4, got ", gqaRatio);
+  uint32_t maxSeqLen = max_seq_len;
+  uint32_t hiddenDimP = ((maxSeqLen + 63) / 64) * 64;
+  uint32_t hiddenDimPMax = ((maxSeqLen + 63) / 64);
+  uint32_t reduceCount = ((maxSeqLen + 1023) / 1024);
+  uint32_t nTokens = 1;
+  uint32_t pageTableSizeLog2 = getHighestBit(pageSize);
+  uint32_t pageTableBatchStride = block_table.stride(0);
+
+  TORCH_CHECK(headDim == 256);
+  TORCH_CHECK(max_query_len == 1);
+  TORCH_CHECK(isPowerOf2(pageSize));
+  TORCH_CHECK(pageTableSizeLog2 >= 6);
+  TORCH_CHECK(pageTableSizeLog2 <= 10);
+
+  size_t szP = batches * headQk * hiddenDimP;
+  size_t szGroupMax = batches * headQk * hiddenDimPMax;
+  size_t szGlobalMax = batches * gqaRatio * headV;
+  size_t szGlobalPollP = batches * gqaRatio * headV;
+  size_t szOutTemp = batches * reduceCount * headDim * headQk;
+  size_t szGlobalSoftmaxSum = batches * reduceCount * headQk;
+  size_t totalSize = szP + szGroupMax + szGlobalMax + szGlobalPollP + szOutTemp + szGlobalSoftmaxSum;
+
+  // If caller passes a pre-allocated temp_p (for XPUGraph capture/replay
+  // stability), reuse it and zero it in-place; otherwise allocate fresh.
+  torch::Tensor temp_p;
+  if (temp_p_opt.has_value()) {
+    temp_p = temp_p_opt.value();
+    TORCH_CHECK(temp_p.numel() >= static_cast<long>(totalSize),
+                "temp_p buffer too small: ", temp_p.numel(), " < ", totalSize);
+    TORCH_CHECK(temp_p.scalar_type() == torch::kFloat32,
+                "temp_p must be float32");
+    TORCH_CHECK(temp_p.device() == key_cache.device(),
+                "temp_p must be on the same device as key_cache");
+    temp_p.zero_();
+  } else {
+    temp_p = torch::zeros({ static_cast<long>(totalSize) },
+      torch::device(key_cache.device()).dtype(torch::kFloat32));
+  }
+
+  float* pState = (float*)temp_p.data_ptr();
+  float* pGroupMax = pState + szP;
+  float* pGlobalMax = pGroupMax + szGroupMax;
+  uint32_t* pPollP = (uint32_t*)pGlobalMax + szGlobalMax;
+  float* pOutTemp = (float*)pPollP + szGlobalPollP;
+  float* pGloablSoftmaxSum = (float*)pOutTemp + szOutTemp;
+  sycl::queue& queue = c10::xpu::getCurrentXPUStream(key_cache.device().index()).queue();
+
+  auto launch = [&](auto dtypeTag) {
+    using T = decltype(dtypeTag);
+    page_attention_forward_kernel<T>(
+      (uint8_t*)query.data_ptr(),
+      (uint8_t*)key_cache.data_ptr(),
+      (uint8_t*)value_cache.data_ptr(),
+      (uint32_t*)block_table.data_ptr(),
+      (uint32_t*)seq_lens.data_ptr(),
+      (uint8_t*)out.data_ptr(),
+      pState,
+      pGroupMax,
+      pGlobalMax,
+      pPollP,
+      pOutTemp,
+      pGloablSoftmaxSum,
+      batches,
+      nTokens,
+      headQk,
+      headV,
+      headDim,
+      kvCacheStride1,
+      pageTableBatchStride,
+      pageTableSizeLog2,
+      hiddenDimP,
+      hiddenDimPMax,
+      maxSeqLen,
+      gqaRatio,
+      key_cache.device()
+    );
+  };
+  if (query.scalar_type() == torch::kHalf) {
+    launch(fp16{});
+  } else {
+    launch(bf16{});
+  }
+}
+
+// ── chunk_gated_delta_rule_extend: GDN prefill extend kernel ────────────────
+//
+// Per-token outer loop executed inside the kernel (grid = H_v × n_seqs,
+// threads_per_head = 16).  See extend.kernels.fp16.h for math.
+//
+// Shapes (all contiguous):
+//   q, k          : [T_total, H_k, K]           same dtype (fp16 or bf16)
+//   v             : [T_total, H_v, V]
+//   g             : [T_total, H_v]              fp32 (log-space decay)
+//   beta          : [T_total, H_v]              fp32 (post-sigmoid, from fused_gdn_gating)
+//   initial_state : [n_seqs, H_v, V, K]         fp32 (matches mamba_ssm_dtype), IN/OUT
+//   cu_seqlens    : [n_seqs + 1]                int32
+//   out (return)  : [T_total, H_v, V]           same dtype as q
+//
+// Constraints:
+//   H_v % H_k == 0    (dense-GDN: ==1; Qwen3.5-4B: ==2)
+//   K == V == 128
+//
+// Returns:
+//   (out, last_state)  — last_state aliases initial_state (mutated in place)
+//                       and is returned as a convenience so the caller can
+//                       scatter ssm_states[cache_indices] = last_state.
+std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
+    torch::Tensor& q,
+    torch::Tensor& k,
+    torch::Tensor& v,
+    torch::Tensor& g,
+    torch::Tensor& beta,
+    torch::Tensor& initial_state,
+    torch::Tensor& cu_seqlens,
+    double scale)
+{
+  TORCH_CHECK(q.scalar_type() == torch::kHalf || q.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(k.scalar_type() == q.scalar_type());
+  TORCH_CHECK(v.scalar_type() == q.scalar_type());
+  TORCH_CHECK(g.scalar_type() == torch::kFloat32,
+              "g must be fp32 (log-space decay)");
+  TORCH_CHECK(beta.scalar_type() == torch::kFloat32,
+              "beta must be fp32 (post-sigmoid); matches fused_gdn_gating output");
+  TORCH_CHECK(initial_state.scalar_type() == torch::kFloat32,
+              "initial_state must be fp32 (matches mamba_ssm_dtype=float32)");
+  TORCH_CHECK(cu_seqlens.scalar_type() == torch::kInt32);
+
+  // q: [1?, T_total, H_k, K] — the caller passes an extra leading batch dim
+  // of size 1 (see gdn_triton.py::extend, matches CUDA contract). Squeeze it.
+  TORCH_CHECK(q.dim() == 4 && q.size(0) == 1, "q must be [1, T_total, H_k, K]");
+  TORCH_CHECK(k.dim() == 4 && k.size(0) == 1);
+  TORCH_CHECK(v.dim() == 4 && v.size(0) == 1);
+  TORCH_CHECK(g.dim() == 3 && g.size(0) == 1);
+  TORCH_CHECK(beta.dim() == 3 && beta.size(0) == 1);
+
+  const int64_t T_total = q.size(1);
+  const int64_t H_k = q.size(2);
+  const int64_t K = q.size(3);
+  const int64_t H_v = v.size(2);
+  const int64_t V = v.size(3);
+
+  TORCH_CHECK(H_v % H_k == 0,
+              "GDN extend kernel requires H_v % H_k == 0; got H_k=", H_k, " H_v=", H_v);
+  TORCH_CHECK(K == 128 && V == 128, "Only head_dim=128 supported; got K=", K, " V=", V);
+  TORCH_CHECK(initial_state.dim() == 4);
+  TORCH_CHECK(initial_state.size(1) == H_v && initial_state.size(2) == V && initial_state.size(3) == K);
+
+  const int64_t n_seqs = cu_seqlens.size(0) - 1;
+  TORCH_CHECK(initial_state.size(0) == n_seqs, "initial_state.size(0) must equal n_seqs");
+
+  auto out = torch::empty({1, T_total, H_v, V}, q.options());
+
+  sycl::range<2> globalRange(H_v * 16, n_seqs);
+  sycl::range<2> localRange(16, 1);
+  sycl::nd_range<2> range(globalRange, localRange);
+  std::function<void(sycl::handler&)> kernel;
+
+  const uint32_t headQk = (uint32_t)H_k;
+  const uint32_t headV  = (uint32_t)H_v;
+  const uint32_t headDim = (uint32_t)K;
+  const float qScale = (float)scale;
+
+  uint8_t* qPtr = (uint8_t*)q.data_ptr();
+  uint8_t* kPtr = (uint8_t*)k.data_ptr();
+  uint8_t* vPtr = (uint8_t*)v.data_ptr();
+  uint8_t* gPtr = (uint8_t*)g.data_ptr();
+  uint8_t* bPtr = (uint8_t*)beta.data_ptr();
+  uint8_t* sPtr = (uint8_t*)initial_state.data_ptr();
+  uint8_t* oPtr = (uint8_t*)out.data_ptr();
+  uint32_t* cuPtr = (uint32_t*)cu_seqlens.data_ptr();
+
+  switch (q.scalar_type()) {
+    case torch::kHalf:
+      kernel = [=](sycl::handler& cgh) {
+        cgh.parallel_for<class chunkGdnExtendFp16>(
+          range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+            chunkGatedDeltaRuleExtendFp16(
+              qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
+              headQk, headV, headDim, qScale, ndi);
+          });
+      };
+      submit_kernel(kernel, q.device(), "chunk_gated_delta_rule_extend fp16");
+      break;
+    case torch::kBFloat16:
+      kernel = [=](sycl::handler& cgh) {
+        cgh.parallel_for<class chunkGdnExtendBf16>(
+          range, [=](sycl::nd_item<2> ndi) SYCL_ESIMD_KERNEL {
+            chunkGatedDeltaRuleExtendBf16(
+              qPtr, kPtr, vPtr, gPtr, bPtr, sPtr, oPtr, cuPtr,
+              headQk, headV, headDim, qScale, ndi);
+          });
+      };
+      submit_kernel(kernel, q.device(), "chunk_gated_delta_rule_extend bf16");
+      break;
+    default:
+      TORCH_CHECK(false, "unreachable dtype check");
+  }
+
+  return std::make_tuple(out, initial_state);
+}
+
+TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
+    m.def("gdn_eagle(Tensor! qkvz, Tensor! z_out, Tensor conv_w, Tensor? conv_b, Tensor! conv_state, Tensor accepted_tokens, Tensor ba, Tensor a_log, Tensor dt_bias, Tensor! state_in, Tensor ssm_state_idx, Tensor norm_w, int max_query_len) -> Tensor");
+    m.def("page_attn_decode(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, Tensor(a!)? temp_p=None) -> ()");
+    m.def("chunk_gated_delta_rule_extend(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor! initial_state, Tensor cu_seqlens, float scale) -> (Tensor, Tensor)");
+    // Contract: q/k/v/initial_state are fp16 or bf16 (all same); g and beta are fp32
+    // (both emitted by fused_gdn_gating). cu_seqlens is int32.
+}
+
+TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
+    m.impl("gdn_eagle", &gdn_eagle);
+    m.impl("page_attn_decode", &page_attn_decode);
+    m.impl("chunk_gated_delta_rule_extend", &chunk_gated_delta_rule_extend);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("gdn_eagle", &gdn_eagle, "gdn_eagle");
+    m.def("page_attn_decode", &page_attn_decode, "page_attn_decode");
+    m.def("chunk_gated_delta_rule_extend", &chunk_gated_delta_rule_extend, "chunk_gated_delta_rule_extend");
+}
