@@ -146,6 +146,32 @@ ext_modules.append(
 )
 ### Eagle kernels
 
+### Prefill DPAS SDPA (腿C #69) — ISOLATED .sycl unit with -doubleGRF, JIT spir64
+### (no AOT -device -> PTL-safe). The PTL-proven fp16 prefill attn (HD=256, FA-2),
+### replaces the NaN-ing cutlass-sycl flash fp16 prefill. doubleGRF only for THIS TU.
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_vllm.custom_esimd_kernels_prefill_dpas",
+        sources=[
+            "csrc/xpu/esimd_kernel_prefill_dpas.sycl",
+            "csrc/xpu/torch_extension_prefill_dpas.cc",
+        ],
+        include_dirs=[
+            root / "include",
+            root / "csrc",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-Xs", "-doubleGRF",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
+### Prefill DPAS SDPA
+
 ### MoE Batch kernels (Router, TopK, Up/Down, Accumulate) — FP8
 # [skip-ptl-moe-batch] ext_modules.append(
 # [skip-ptl-moe-batch]     SyclExtension(
