@@ -583,7 +583,594 @@ std::tuple<torch::Tensor, torch::Tensor> chunk_gated_delta_rule_extend(
   return std::make_tuple(out, initial_state);
 }
 
+// ===========================================================================
+// build_tree_kernel_efficient — SYCL port of sgl-kernel/csrc/speculative/
+// eagle_utils.cu :: build_tree_efficient (+ partial_packed bitpacking variant).
+// Builds the EAGLE/NEXTN draft tree (tree_mask / positions / retrive_index /
+// retrive_next_token / retrive_next_sibling). Pure integer/bool index logic;
+// 1:1 translation of the CUDA kernel: blockIdx.x -> group, threadIdx.x ->
+// local id, grid = bs, block = draft_token_num. 12-arg signature with
+// tree_mask_mode (FULL_MASK=0, QLEN_ONLY=1, QLEN_ONLY_BITPACKING=2), matching
+// upstream sgl_kernel + sglang eagle_utils.py.
+// ===========================================================================
+namespace {
+enum BTTreeMaskMode { BT_FULL_MASK = 0, BT_QLEN_ONLY = 1, BT_QLEN_ONLY_BITPACKING = 2 };
+
+struct BuildTreeEfficientFn {
+  int64_t* parent_list;
+  int64_t* selected_index;
+  int64_t* verified_seq_len;
+  bool* tree_mask;
+  int64_t* positions;
+  int64_t* retrive_index;
+  int64_t* retrive_next_token;
+  int64_t* retrive_next_sibling;
+  int topk;
+  int depth;
+  int draft_token_num;
+  int tree_mask_mode;
+  void operator()(sycl::nd_item<1> it) const {
+    int bid = it.get_group(0);
+    int tid = it.get_local_id(0);
+    if (tid >= draft_token_num) return;
+    int seq_tree_idx = draft_token_num * draft_token_num * bid;
+    for (int i = 0; i < bid; i++) seq_tree_idx += verified_seq_len[i] * draft_token_num;
+    int seq_len = verified_seq_len[bid];
+    int token_tree_idx;
+    if (tree_mask_mode == BT_FULL_MASK)
+      token_tree_idx = seq_tree_idx + (seq_len + draft_token_num) * tid + seq_len + 1;
+    else
+      token_tree_idx = draft_token_num * draft_token_num * bid + draft_token_num * tid + 1;
+    tree_mask[token_tree_idx - 1] = true;
+    for (int i = 0; i < draft_token_num - 1; i++) tree_mask[token_tree_idx + i] = false;
+    int position = 0;
+    if (tid == 0) {
+      positions[bid * draft_token_num] = seq_len;
+      int off = bid * draft_token_num;
+      for (int i = draft_token_num - 1; i > 0; --i) {
+        retrive_index[bid * draft_token_num + i] = off + i;
+        int parent_tb_idx = selected_index[bid * (draft_token_num - 1) + i - 1] / topk;
+        int parent_position = 0;
+        if (parent_tb_idx > 0) {
+          int parent_token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
+          for (; parent_position < draft_token_num; ++parent_position) {
+            if (selected_index[bid * (draft_token_num - 1) + parent_position] == parent_token_idx) {
+              ++parent_position;
+              break;
+            }
+          }
+        }
+        if (parent_position == draft_token_num) continue;
+        if (retrive_next_token[bid * draft_token_num + parent_position] == -1) {
+          retrive_next_token[bid * draft_token_num + parent_position] = i;
+        } else {
+          int origin = retrive_next_token[bid * draft_token_num + parent_position];
+          retrive_next_token[bid * draft_token_num + parent_position] = i;
+          retrive_next_sibling[bid * draft_token_num + i] = origin;
+        }
+      }
+      retrive_index[bid * draft_token_num] = bid * draft_token_num;
+    } else {
+      int cur_position = tid - 1;
+      while (true) {
+        position += 1;
+        tree_mask[token_tree_idx + cur_position] = true;
+        int parent_tb_idx = selected_index[bid * (draft_token_num - 1) + cur_position] / topk;
+        if (parent_tb_idx == 0) break;
+        int token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
+        for (cur_position = 0; cur_position < draft_token_num; ++cur_position)
+          if (selected_index[bid * (draft_token_num - 1) + cur_position] == token_idx) break;
+      }
+      positions[bid * draft_token_num + tid] = position + seq_len;
+    }
+  }
+};
+
+struct BuildTreeEfficientPackedFn {
+  int64_t* parent_list;
+  int64_t* selected_index;
+  int64_t* verified_seq_len;
+  uint8_t* tree_mask;
+  int64_t* positions;
+  int64_t* retrive_index;
+  int64_t* retrive_next_token;
+  int64_t* retrive_next_sibling;
+  int topk;
+  int depth;
+  int draft_token_num;
+  int num_bytes_per_item;
+  void operator()(sycl::nd_item<1> it) const {
+    int bid = it.get_group(0);
+    int tid = it.get_local_id(0);
+    if (tid >= draft_token_num) return;
+    int seq_len = verified_seq_len[bid];
+    int token_tree_idx = (bid * draft_token_num + tid) * num_bytes_per_item;
+    tree_mask[token_tree_idx] = 1;
+    int position = 0;
+    if (tid == 0) {
+      positions[bid * draft_token_num] = seq_len;
+      int off = bid * draft_token_num;
+      for (int i = draft_token_num - 1; i > 0; --i) {
+        retrive_index[bid * draft_token_num + i] = off + i;
+        int parent_tb_idx = selected_index[bid * (draft_token_num - 1) + i - 1] / topk;
+        int parent_position = 0;
+        if (parent_tb_idx > 0) {
+          int parent_token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
+          for (; parent_position < draft_token_num; ++parent_position) {
+            if (selected_index[bid * (draft_token_num - 1) + parent_position] == parent_token_idx) {
+              ++parent_position;
+              break;
+            }
+          }
+        }
+        if (parent_position == draft_token_num) continue;
+        if (retrive_next_token[bid * draft_token_num + parent_position] == -1) {
+          retrive_next_token[bid * draft_token_num + parent_position] = i;
+        } else {
+          int origin = retrive_next_token[bid * draft_token_num + parent_position];
+          retrive_next_token[bid * draft_token_num + parent_position] = i;
+          retrive_next_sibling[bid * draft_token_num + i] = origin;
+        }
+      }
+      retrive_index[bid * draft_token_num] = bid * draft_token_num;
+    } else {
+      int cur_position = tid - 1;
+      while (true) {
+        position += 1;
+        int byte_idx = (cur_position + 1) / 8;
+        int bit_idx = (cur_position + 1) % 8;
+        tree_mask[token_tree_idx + byte_idx] |= (1 << bit_idx);
+        int parent_tb_idx = selected_index[bid * (draft_token_num - 1) + cur_position] / topk;
+        if (parent_tb_idx == 0) break;
+        int token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
+        for (cur_position = 0; cur_position < draft_token_num; ++cur_position)
+          if (selected_index[bid * (draft_token_num - 1) + cur_position] == token_idx) break;
+      }
+      positions[bid * draft_token_num + tid] = position + seq_len;
+    }
+  }
+};
+}  // namespace
+
+void build_tree_kernel_efficient(
+    at::Tensor parent_list, at::Tensor selected_index, at::Tensor verified_seq_len,
+    at::Tensor tree_mask, at::Tensor positions, at::Tensor retrive_index,
+    at::Tensor retrive_next_token, at::Tensor retrive_next_sibling,
+    int64_t topk, int64_t depth, int64_t draft_token_num, int64_t tree_mask_mode) {
+  int bs = parent_list.size(0);
+  auto q = c10::xpu::getCurrentXPUStream().queue();
+  size_t local = static_cast<size_t>(draft_token_num);
+  size_t global = static_cast<size_t>(bs) * local;
+  if (tree_mask_mode == BT_QLEN_ONLY_BITPACKING) {
+    int nbpi = (draft_token_num > 16) ? 4 : (draft_token_num > 8 ? 2 : 1);
+    BuildTreeEfficientPackedFn k{
+        static_cast<int64_t*>(parent_list.data_ptr()),
+        static_cast<int64_t*>(selected_index.data_ptr()),
+        static_cast<int64_t*>(verified_seq_len.data_ptr()),
+        static_cast<uint8_t*>(tree_mask.data_ptr()),
+        static_cast<int64_t*>(positions.data_ptr()),
+        static_cast<int64_t*>(retrive_index.data_ptr()),
+        static_cast<int64_t*>(retrive_next_token.data_ptr()),
+        static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
+        (int)topk, (int)depth, (int)draft_token_num, nbpi};
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(global, local), k); });
+  } else {
+    BuildTreeEfficientFn k{
+        static_cast<int64_t*>(parent_list.data_ptr()),
+        static_cast<int64_t*>(selected_index.data_ptr()),
+        static_cast<int64_t*>(verified_seq_len.data_ptr()),
+        static_cast<bool*>(tree_mask.data_ptr()),
+        static_cast<int64_t*>(positions.data_ptr()),
+        static_cast<int64_t*>(retrive_index.data_ptr()),
+        static_cast<int64_t*>(retrive_next_token.data_ptr()),
+        static_cast<int64_t*>(retrive_next_sibling.data_ptr()),
+        (int)topk, (int)depth, (int)draft_token_num, (int)tree_mask_mode};
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(global, local), k); });
+  }
+}
+
+// ===========================================================================
+// verify_tree_greedy — SYCL port of sgl-kernel/csrc/speculative/eagle_utils.cu
+// :: VerifyTreeGreedy. Greedy (temperature=0) tree verification: walks each
+// request's draft tree, accepting the longest chain of draft tokens whose ids
+// match the target model's argmax prediction. One work-item per request
+// (CUDA grid=batch_size, block=1). Pure index logic, no shared mem / reduction.
+// dtype contract (matches CUDA + sglang eagle_info.verify greedy branch):
+//   predicts / accept_index / accept_token_num : int32  (mutable outputs)
+//   candidates / retrive_index / retrive_next_token / retrive_next_sibling /
+//   target_predict                              : int64
+// ===========================================================================
+namespace {
+struct VerifyTreeGreedyFn {
+  int32_t* predicts;          // [tot_num_draft_tokens]   (mutable)
+  int32_t* accept_index;      // [bs, num_spec_step]      (mutable)
+  int32_t* accept_token_num;  // [bs]                     (mutable)
+  const int64_t* candidates;          // [bs, num_draft_tokens]
+  const int64_t* retrive_index;       // [bs, num_draft_tokens]
+  const int64_t* retrive_next_token;  // [bs, num_draft_tokens]
+  const int64_t* retrive_next_sibling;// [bs, num_draft_tokens]
+  const int64_t* target_predict;      // [bs, num_draft_tokens]
+  int num_speculative_tokens;
+  int num_draft_tokens;
+  void operator()(sycl::nd_item<1> it) const {
+    int bx = it.get_group(0);
+    int64_t last_accepted_retrive_idx = retrive_index[bx * num_draft_tokens];
+    accept_index[bx * num_speculative_tokens] = (int32_t)last_accepted_retrive_idx;
+    int num_accepted_tokens = 0;
+    int64_t cur_index = 0;
+    for (int j = 1; j < num_speculative_tokens; ++j) {
+      cur_index = retrive_next_token[bx * num_draft_tokens + cur_index];
+      while (cur_index != -1) {
+        int64_t draft_index = retrive_index[bx * num_draft_tokens + cur_index];
+        int64_t draft_token_id = candidates[bx * num_draft_tokens + cur_index];
+        int64_t target_token_id = target_predict[last_accepted_retrive_idx];
+        if (draft_token_id == target_token_id) {
+          predicts[last_accepted_retrive_idx] = (int32_t)target_token_id;
+          ++num_accepted_tokens;
+          accept_index[bx * num_speculative_tokens + num_accepted_tokens] = (int32_t)draft_index;
+          last_accepted_retrive_idx = draft_index;
+          break;
+        } else {
+          cur_index = retrive_next_sibling[bx * num_draft_tokens + cur_index];
+        }
+      }
+      if (cur_index == -1) break;
+    }
+    accept_token_num[bx] = num_accepted_tokens;
+    predicts[last_accepted_retrive_idx] = (int32_t)target_predict[last_accepted_retrive_idx];
+  }
+};
+}  // namespace
+
+void verify_tree_greedy(
+    at::Tensor predicts, at::Tensor accept_index, at::Tensor accept_token_num,
+    at::Tensor candidates, at::Tensor retrive_index, at::Tensor retrive_next_token,
+    at::Tensor retrive_next_sibling, at::Tensor target_predict) {
+  TORCH_CHECK(predicts.scalar_type() == at::kInt, "predicts must be int32");
+  TORCH_CHECK(accept_index.scalar_type() == at::kInt, "accept_index must be int32");
+  TORCH_CHECK(accept_token_num.scalar_type() == at::kInt, "accept_token_num must be int32");
+  TORCH_CHECK(candidates.scalar_type() == at::kLong, "candidates must be int64");
+  TORCH_CHECK(retrive_index.scalar_type() == at::kLong, "retrive_index must be int64");
+  TORCH_CHECK(retrive_next_token.scalar_type() == at::kLong, "retrive_next_token must be int64");
+  TORCH_CHECK(retrive_next_sibling.scalar_type() == at::kLong, "retrive_next_sibling must be int64");
+  TORCH_CHECK(target_predict.scalar_type() == at::kLong, "target_predict must be int64");
+  int batch_size = candidates.size(0);
+  int num_spec_step = accept_index.size(1);
+  int num_draft_tokens = candidates.size(1);
+  auto q = c10::xpu::getCurrentXPUStream().queue();
+  VerifyTreeGreedyFn k{
+      static_cast<int32_t*>(predicts.data_ptr()),
+      static_cast<int32_t*>(accept_index.data_ptr()),
+      static_cast<int32_t*>(accept_token_num.data_ptr()),
+      static_cast<const int64_t*>(candidates.data_ptr()),
+      static_cast<const int64_t*>(retrive_index.data_ptr()),
+      static_cast<const int64_t*>(retrive_next_token.data_ptr()),
+      static_cast<const int64_t*>(retrive_next_sibling.data_ptr()),
+      static_cast<const int64_t*>(target_predict.data_ptr()),
+      num_spec_step, num_draft_tokens};
+  // One work-item per request (CUDA grid=bs, block=1).
+  q.submit([&](sycl::handler& h) {
+    h.parallel_for(sycl::nd_range<1>(static_cast<size_t>(batch_size), 1), k);
+  });
+}
+
+// ── causal_conv1d_verify: SYCL depthwise causal conv1d for the VERIFY step ───
+//
+// Replaces the triton causal_conv1d_update (which is numerically broken on
+// triton-XPU, same as the GDN recurrence). topk=1 linear chain: per request,
+// per channel c, per step t (0..N-1):
+//   window = concat(conv_state[slot,c,:], x[n,c,0..t])[-W:]
+//   out[n,c,t] = silu(bias[c] + sum_w conv_w[c,w]*window[w])
+// and caches the post-step (W-1)-wide window into intermediate_conv_window
+// [inter_slot, step, c, W-1] so the mamba verify-update can roll it back.
+// disable_state_update: the main conv_state pool is NOT mutated (scatter does it).
+//
+// Shapes:
+//   x            : [bs, conv_dim, N]   (mixed_qkv_reshaped, fp16/bf16)
+//   conv_w       : [conv_dim, W]       (fp16/bf16)
+//   conv_bias    : [conv_dim] or null
+//   conv_state   : [slots, conv_dim, W-1]  (fp16/bf16, READ-only)
+//   inter_conv   : [islots, N, conv_dim, W-1]  (WRITTEN per step)
+//   out          : [bs, conv_dim, N]   same dtype as x
+//   cache_indices: [bs] int32 (conv_state slot)   inter_indices: [bs] int32
+// Grid: (bs, conv_dim) — one work-item per (request, channel); loops N steps.
+namespace {
+template <typename T>
+struct CausalConv1dVerifyFn {
+  const T* x;            // [bs, conv_dim, N]
+  const T* conv_w;       // [conv_dim, W]
+  const T* conv_bias;    // [conv_dim] or null
+  const T* conv_state;   // [slots, conv_dim, W-1]
+  T* inter_conv;         // [islots, N, conv_dim, W-1]
+  T* out;                // [bs, conv_dim, N]
+  const int* cache_indices;
+  const int* inter_indices;
+  int conv_dim;
+  int N;
+  int W;          // conv_kernel_size
+  int act;        // 1 = silu/swish
+  int cs_stride0; // conv_state.stride(0) = conv_dim*(W-1)
+  int ic_stride0; // inter_conv.stride(0) = N*conv_dim*(W-1)
+  void operator()(sycl::item<2> it) const {
+    int n = it.get_id(0);   // request
+    int c = it.get_id(1);   // channel
+    if (c >= conv_dim) return;
+    int Wm1 = W - 1;
+    const T* cs = conv_state + (int64_t)cache_indices[n] * cs_stride0 + (int64_t)c * Wm1;
+    const T* xc = x + ((int64_t)n * conv_dim + c) * N;
+    T* oc = out + ((int64_t)n * conv_dim + c) * N;
+    const T* wc = conv_w + (int64_t)c * W;
+    float bias = (conv_bias != nullptr) ? (float)conv_bias[c] : 0.0f;
+    T* icbase = inter_conv + (int64_t)inter_indices[n] * ic_stride0;
+
+    // rolling window of the last W values (init = conv_state's W-1 + first x).
+    // We keep a local window of size W: win[0..W-2] = history, win[W-1] = current.
+    float win[8];  // W<=8 (conv_kernel typically 4); guard below
+    // load history (W-1 values) from conv_state
+    for (int i = 0; i < Wm1; ++i) win[i] = (float)cs[i];
+
+    for (int t = 0; t < N; ++t) {
+      // shift: the current token's value goes to win[W-1]; window for this step
+      // is win[0..W-1] where win[W-1]=x[t], win[0..W-2]=last W-1 inputs.
+      float xt = (float)xc[t];
+      // build the W-wide window: [win(history), xt]
+      float acc = bias;
+      for (int w = 0; w < Wm1; ++w) acc += win[w] * (float)wc[w];
+      acc += xt * (float)wc[Wm1];
+      if (act == 1) acc = acc / (1.0f + sycl::exp(-acc));  // silu
+      oc[t] = (T)acc;
+      // advance window: drop oldest, append xt
+      for (int w = 0; w < Wm1 - 1; ++w) win[w] = win[w + 1];
+      if (Wm1 > 0) win[Wm1 - 1] = xt;
+      // cache the post-step (W-1)-window into inter_conv[inter_slot, t, c, :]
+      T* ic = icbase + ((int64_t)t * conv_dim + c) * Wm1;
+      for (int w = 0; w < Wm1; ++w) ic[w] = (T)win[w];
+    }
+  }
+};
+}  // namespace
+
+void causal_conv1d_verify(
+    torch::Tensor& out, torch::Tensor& x, torch::Tensor& conv_w,
+    const std::optional<torch::Tensor>& conv_bias, torch::Tensor& conv_state,
+    torch::Tensor& inter_conv, torch::Tensor& cache_indices,
+    torch::Tensor& inter_indices, int64_t activation) {
+  TORCH_CHECK(x.scalar_type() == torch::kHalf || x.scalar_type() == torch::kBFloat16);
+  const int bs = x.size(0), conv_dim = x.size(1), N = x.size(2);
+  const int W = conv_w.size(1);
+  TORCH_CHECK(W <= 8, "conv width <= 8");
+  auto qd = c10::xpu::getCurrentXPUStream().queue();
+  int cs_stride0 = conv_state.stride(0);
+  int ic_stride0 = inter_conv.stride(0);
+  const void* biasp = conv_bias.has_value() ? conv_bias->data_ptr() : nullptr;
+  // Basic-range parallel_for (no explicit work-group) — channels are
+  // independent, no sub-group reductions needed for depthwise conv.
+  if (x.scalar_type() == torch::kHalf) {
+    CausalConv1dVerifyFn<fp16> kf{
+        (const fp16*)x.data_ptr(), (const fp16*)conv_w.data_ptr(),
+        (const fp16*)biasp, (const fp16*)conv_state.data_ptr(),
+        (fp16*)inter_conv.data_ptr(), (fp16*)out.data_ptr(),
+        (const int*)cache_indices.data_ptr(), (const int*)inter_indices.data_ptr(),
+        conv_dim, N, W, (int)activation, cs_stride0, ic_stride0};
+    qd.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<2>(bs, conv_dim), kf); });
+  } else {
+    CausalConv1dVerifyFn<bf16> kf{
+        (const bf16*)x.data_ptr(), (const bf16*)conv_w.data_ptr(),
+        (const bf16*)biasp, (const bf16*)conv_state.data_ptr(),
+        (bf16*)inter_conv.data_ptr(), (bf16*)out.data_ptr(),
+        (const int*)cache_indices.data_ptr(), (const int*)inter_indices.data_ptr(),
+        conv_dim, N, W, (int)activation, cs_stride0, ic_stride0};
+    qd.submit([&](sycl::handler& h) { h.parallel_for(sycl::range<2>(bs, conv_dim), kf); });
+  }
+}
+
+// ── gdn_target_verify: SYCL GDN recurrence for the speculative VERIFY step ───
+//
+// Faithful port of sgl-kernel-xpu/src/gdn_attn/gated_delta_rule.hpp (the SAME
+// recurrence the DECODE fast-path uses, which is numerically correct), PLUS
+// the two verify-only behaviours the triton target_verify provides:
+//   (1) cache the SSM state AFTER EACH of the N draft tokens into
+//       intermediate_states_buffer[cache_idx, step, hv, V, K], so
+//       update_mamba_state_after_mtp_verify can scatter the accepted-step
+//       state back into the main pool.
+//   (2) disable_state_update: do NOT commit the final state to the main ssm
+//       pool (the scatter does that from the intermediate buffer).
+// topk=1 (linear chain) only: tokens are processed sequentially per request,
+// which IS the correct chain verify (no retrieve_parent tree walk needed).
+//
+// Gating is computed IN-KERNEL from a,b (g = exp(-exp(A_log)*softplus(a+dt_bias)),
+// beta = sigmoid(b)) — identical to the decode kernel, NOT the triton path.
+//
+// Shapes (match the gdn_backend target_verify call):
+//   q,k          : [1, T_total, H_k, K]   (fp16/bf16)   T_total = bs*draft_tok
+//   v            : [1, T_total, H_v, V]
+//   a,b          : [T_total, H_v]         (fp16/bf16; promoted to fp32 in-kernel)
+//   A_log,dt_bias: [H_v]                  (fp32)
+//   ssm_state    : [cache_slots, H_v, V, K]  fp32 (READ for initial; NOT written)
+//   intermediate : [cache_slots(+1?), cache_steps, H_v, V, K] fp32 (WRITTEN per step)
+//   query_start_loc : [bs+1] int32   cache_indices : [bs] int32
+//   inter_state_indices : [bs] int32 (slot into intermediate buffer)
+//   out          : [1, T_total, H_v, V]  same dtype as q
+namespace {
+static constexpr int GDN_SG = 32;            // sub_group_size
+static constexpr int GDN_GROUP = 256;
+static constexpr int GDN_SG_PER_GROUP = GDN_GROUP / GDN_SG;  // 8
+static constexpr int GDN_VPSG = 4;           // v_dim_per_sg
+static constexpr int GDN_VPG = GDN_VPSG * GDN_SG_PER_GROUP;  // 32
+static constexpr float GDN_EPS = 1e-6f;
+
+template <typename T, int KB>  // KB = k_bucket_size = head_k_dim / 32
+struct GdnTargetVerifyFn {
+  T* out;
+  const T* q;
+  const T* k;
+  const T* v;
+  const T* a;
+  const T* b;
+  const float* A_log;
+  const float* dt_bias;
+  const float* ssm_state;      // [slots,Hv,V,K] fp32, READ-only
+  float* inter;                // [slots, cache_steps, Hv, V, K] fp32, WRITTEN
+  const int ssm_stride0;
+  const int inter_stride0;     // = cache_steps*Hv*V*K
+  const int* query_start_loc;
+  const int* cache_indices;
+  const int* inter_indices;
+  const int num_k_heads;
+  const int head_k_dim;
+  const int num_v_heads;
+  const int head_v_dim;
+  const int cache_steps;
+
+  static inline float act_sigmoid(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
+  static inline float act_softplus(float x, float beta = 1.0f, float thr = 20.0f) {
+    return (beta * x < thr) ? sycl::log(1.0f + sycl::exp(beta * x)) / beta : x;
+  }
+
+  [[sycl::reqd_sub_group_size(GDN_SG)]] void operator()(sycl::nd_item<3> item) const {
+    int batch_id = item.get_group(0);
+    int hv = item.get_group(1);
+    int v_bucket = item.get_group(2);
+    auto sg = item.get_sub_group();
+    int sg_id = sg.get_group_id();
+    int sg_lid = sg.get_local_id();
+    int kv_ratio = num_v_heads / num_k_heads;
+    int hvd = v_bucket * GDN_VPG + sg_id * GDN_VPSG;  // head_v_dim base for this sg
+    if (hvd >= head_v_dim) return;
+
+    const float scale = 1.0f / sycl::sqrt(float(head_k_dim));
+    float A_log_l = -sycl::exp(A_log[hv]);
+    float dt_l = dt_bias[hv];
+
+    float st[GDN_VPSG * KB];
+    float ql[KB], kl[KB], vl[GDN_VPSG];
+
+    const float* ssm_ptr = ssm_state + (int64_t)cache_indices[batch_id] * ssm_stride0;
+    // load initial state (verify ALWAYS has an initial state = post-prefill)
+    for (int j = 0; j < GDN_VPSG; ++j)
+      for (int i = 0; i < KB; ++i)
+        st[j * KB + i] = ssm_ptr[hv * head_k_dim * head_v_dim +
+                                 (KB * sg_lid + i) + (hvd + j) * head_k_dim];
+
+    int s0 = query_start_loc[batch_id];
+    int s1 = query_start_loc[batch_id + 1];
+    int inter_base = inter_indices[batch_id] * inter_stride0;  // into `inter`
+    int step = 0;
+    for (int t = s0; t < s1; ++t, ++step) {
+      float beta = act_sigmoid((float)b[t * num_v_heads + hv]);
+      float a_l = (float)a[t * num_v_heads + hv] + dt_l;
+      float g = sycl::exp(A_log_l * act_softplus(a_l));
+
+      float qs = 0.0f, ks = 0.0f;
+      for (int i = 0; i < KB; ++i) {
+        ql[i] = (float)q[t * num_k_heads * head_k_dim + (hv / kv_ratio) * head_k_dim + (KB * sg_lid + i)];
+        kl[i] = (float)k[t * num_k_heads * head_k_dim + (hv / kv_ratio) * head_k_dim + (KB * sg_lid + i)];
+        qs += ql[i] * ql[i];
+        ks += kl[i] * kl[i];
+      }
+      qs = sycl::reduce_over_group(sg, qs, sycl::plus<>()) + GDN_EPS;
+      ks = sycl::reduce_over_group(sg, ks, sycl::plus<>()) + GDN_EPS;
+      for (int i = 0; i < KB; ++i) {
+        ql[i] = ql[i] / sycl::sqrt(qs) * scale;
+        kl[i] = kl[i] / sycl::sqrt(ks);
+      }
+
+      float kv_mem[GDN_VPSG];
+      for (int i = 0; i < GDN_VPSG; ++i) kv_mem[i] = 0.0f;
+      for (int j = 0; j < GDN_VPSG; ++j)
+        for (int i = 0; i < KB; ++i) {
+          st[j * KB + i] *= g;
+          kv_mem[j] += st[j * KB + i] * kl[i];
+        }
+      for (int i = 0; i < GDN_VPSG; ++i)
+        kv_mem[i] = sycl::reduce_over_group(sg, kv_mem[i], sycl::plus<>());
+
+      for (int i = 0; i < GDN_VPSG; ++i)
+        vl[i] = (float)v[t * num_v_heads * head_v_dim + hv * head_v_dim + hvd + i];
+      float delta[GDN_VPSG];
+      for (int i = 0; i < GDN_VPSG; ++i) delta[i] = (vl[i] - kv_mem[i]) * beta;
+
+      float res[GDN_VPSG];
+      for (int i = 0; i < GDN_VPSG; ++i) res[i] = 0.0f;
+      for (int j = 0; j < GDN_VPSG; ++j)
+        for (int i = 0; i < KB; ++i) {
+          st[j * KB + i] += kl[i] * delta[j];
+          res[j] += st[j * KB + i] * ql[i];
+        }
+      for (int i = 0; i < GDN_VPSG; ++i)
+        res[i] = sycl::reduce_over_group(sg, res[i], sycl::plus<>());
+
+      if (sg_lid == 0)
+        for (int i = 0; i < GDN_VPSG; ++i)
+          out[t * num_v_heads * head_v_dim + hv * head_v_dim + hvd + i] = (T)res[i];
+
+      // (1) cache the post-token state into the intermediate buffer at `step`.
+      if (step < cache_steps) {
+        float* ip = inter + inter_base + step * num_v_heads * head_v_dim * head_k_dim;
+        for (int j = 0; j < GDN_VPSG; ++j)
+          for (int i = 0; i < KB; ++i)
+            ip[hv * head_k_dim * head_v_dim + (KB * sg_lid + i) + (hvd + j) * head_k_dim] =
+                st[j * KB + i];
+      }
+    }
+    // (2) disable_state_update: do NOT write st back to ssm_state.
+  }
+};
+}  // namespace
+
+void gdn_target_verify(
+    torch::Tensor& out, torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
+    torch::Tensor& a, torch::Tensor& b, torch::Tensor& A_log, torch::Tensor& dt_bias,
+    torch::Tensor& ssm_state, torch::Tensor& intermediate,
+    torch::Tensor& query_start_loc, torch::Tensor& cache_indices,
+    torch::Tensor& inter_indices, int64_t cache_steps) {
+  TORCH_CHECK(q.scalar_type() == torch::kHalf || q.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(A_log.scalar_type() == torch::kFloat32 && dt_bias.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(ssm_state.scalar_type() == torch::kFloat32 && intermediate.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(q.dim() == 4 && q.size(0) == 1, "q must be [1,T,Hk,K]");
+  const int T = q.size(1), Hk = q.size(2), K = q.size(3);
+  const int Hv = v.size(2), V = v.size(3);
+  TORCH_CHECK(K == 128 && V == 128, "only head_dim 128");
+  TORCH_CHECK(K % GDN_SG == 0);
+  const int KB = K / GDN_SG;  // 4
+  const int bs = query_start_loc.size(0) - 1;
+  const int num_v_bucket = (V + GDN_VPG - 1) / GDN_VPG;
+
+  auto qd = c10::xpu::getCurrentXPUStream().queue();
+  sycl::range<3> local(1, 1, GDN_GROUP);
+  sycl::range<3> global(bs, Hv, num_v_bucket);
+  sycl::nd_range<3> range(global * local, local);
+
+  int ssm_stride0 = ssm_state.stride(0);
+  int inter_stride0 = cache_steps * Hv * V * K;
+
+#define GDNV_LAUNCH(T_, KB_)                                                      \
+  do {                                                                           \
+    GdnTargetVerifyFn<T_, KB_> kf{                                               \
+        (T_*)out.data_ptr(), (const T_*)q.data_ptr(), (const T_*)k.data_ptr(),   \
+        (const T_*)v.data_ptr(), (const T_*)a.data_ptr(), (const T_*)b.data_ptr(),\
+        (const float*)A_log.data_ptr(), (const float*)dt_bias.data_ptr(),        \
+        (const float*)ssm_state.data_ptr(), (float*)intermediate.data_ptr(),     \
+        ssm_stride0, inter_stride0,                                              \
+        (const int*)query_start_loc.data_ptr(), (const int*)cache_indices.data_ptr(),\
+        (const int*)inter_indices.data_ptr(),                                    \
+        Hk, K, Hv, V, (int)cache_steps};                                         \
+    qd.submit([&](sycl::handler& h) { h.parallel_for(range, kf); });             \
+  } while (0)
+
+  if (q.scalar_type() == torch::kHalf) {
+    TORCH_CHECK(KB == 4, "KB must be 4 for K=128"); GDNV_LAUNCH(fp16, 4);
+  } else {
+    TORCH_CHECK(KB == 4, "KB must be 4 for K=128"); GDNV_LAUNCH(bf16, 4);
+  }
+#undef GDNV_LAUNCH
+}
+
 TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
+    m.def("build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> ()");
+    m.def("gdn_target_verify(Tensor! out, Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor ssm_state, Tensor! intermediate, Tensor query_start_loc, Tensor cache_indices, Tensor inter_indices, int cache_steps) -> ()");
+    m.def("causal_conv1d_verify(Tensor! out, Tensor x, Tensor conv_w, Tensor? conv_bias, Tensor conv_state, Tensor! inter_conv, Tensor cache_indices, Tensor inter_indices, int activation) -> ()");
+    m.def("verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, Tensor target_predict) -> ()");
     m.def("gdn_eagle(Tensor! qkvz, Tensor! z_out, Tensor conv_w, Tensor? conv_b, Tensor! conv_state, Tensor accepted_tokens, Tensor ba, Tensor a_log, Tensor dt_bias, Tensor! state_in, Tensor ssm_state_idx, Tensor norm_w, int max_query_len) -> Tensor");
     m.def("page_attn_decode(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, Tensor(a!)? temp_p=None) -> ()");
     m.def("chunk_gated_delta_rule_extend(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor! initial_state, Tensor cu_seqlens, float scale) -> (Tensor, Tensor)");
@@ -595,10 +1182,18 @@ TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
     m.impl("gdn_eagle", &gdn_eagle);
     m.impl("page_attn_decode", &page_attn_decode);
     m.impl("chunk_gated_delta_rule_extend", &chunk_gated_delta_rule_extend);
+    m.impl("build_tree_kernel_efficient", &build_tree_kernel_efficient);
+    m.impl("verify_tree_greedy", &verify_tree_greedy);
+    m.impl("gdn_target_verify", &gdn_target_verify);
+    m.impl("causal_conv1d_verify", &causal_conv1d_verify);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gdn_eagle", &gdn_eagle, "gdn_eagle");
     m.def("page_attn_decode", &page_attn_decode, "page_attn_decode");
     m.def("chunk_gated_delta_rule_extend", &chunk_gated_delta_rule_extend, "chunk_gated_delta_rule_extend");
+    m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient, "build_tree_kernel_efficient");
+    m.def("verify_tree_greedy", &verify_tree_greedy, "verify_tree_greedy");
+    m.def("gdn_target_verify", &gdn_target_verify, "gdn_target_verify");
+    m.def("causal_conv1d_verify", &causal_conv1d_verify, "causal_conv1d_verify");
 }
