@@ -212,6 +212,20 @@ def esimd_gemv_q6_k(
     return _ops.esimd_gemv_q6_k(input, ql, qh, weight_scale, output)
 
 
+def esimd_gemv_q6_k_m(
+    input: torch.Tensor, ql: torch.Tensor, qh: torch.Tensor,
+    weight_scale: torch.Tensor, output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled GGUF q6_K GEMV (small M, e.g. MTP verify M<=16). Same PACKED
+    layout as esimd_gemv_q6_k, but reads the Q6_K weights ONCE per row-tile and
+    multiplies against all M activation rows (M accumulators) — vs the M>1 dense
+    path that dequants Q6_K to a 2.5x-bigger fp16 table + generic GEMM.
+
+    input [M,K] fp16 (row-major); output [M,N] fp16. N=ql.size(0), K=ql.size(1)*2.
+    """
+    return _ops.esimd_gemv_q6_k_m(input, ql, qh, weight_scale, output)
+
+
 def esimd_moe_up_q4k(
     x, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn, sel, inter,
     n_tokens, hidden, intermediate, top_k,

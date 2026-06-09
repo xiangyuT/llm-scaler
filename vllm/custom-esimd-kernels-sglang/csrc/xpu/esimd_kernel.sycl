@@ -265,6 +265,27 @@ at::Tensor esimd_gemv_q6_k(
     return output;
 }
 
+// M-tiled q6_K GEMV (small M, MTP verify). input [M,K], output [M,N]. Reads the
+// Q6_K weights ONCE per row-tile (vs the M>1 dense path that dequants to a
+// 2.5x-bigger fp16 table). M = input.size(0).
+at::Tensor esimd_gemv_q6_k_m(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor output) {
+    int64_t M = input.size(0);
+    int64_t N = ql.size(0);
+    int64_t K = ql.size(1) * 2;
+    EXTRACT_PTR(p_in, input);
+    auto p_ql = reinterpret_cast<uint8_t*>(ql.data_ptr());
+    auto p_qh = reinterpret_cast<uint8_t*>(qh.data_ptr());
+    EXTRACT_PTR(p_sc, weight_scale); EXTRACT_PTR(p_out, output);
+    auto& dpcpp_queue = get_device_queue(input);
+    q6_k_gemv_M_host(reinterpret_cast<const fp16*>(p_in), p_ql, p_qh,
+                     reinterpret_cast<const fp16*>(p_sc),
+                     reinterpret_cast<fp16*>(p_out),
+                     (uint32_t)M, (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
 #include "esimd_kernels/moe_kquant_GEMV.h"
 
 // Fused GGUF k-quant MoE up/gate stage (Q4_K gate + Q4_K up -> silu*up).

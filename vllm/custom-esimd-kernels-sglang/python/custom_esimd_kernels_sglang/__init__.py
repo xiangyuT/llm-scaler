@@ -80,6 +80,7 @@ _EXPORTS = [
     "esimd_gemv_q4_k",
     "esimd_gemv_q5_k",
     "esimd_gemv_q6_k",
+    "esimd_gemv_q6_k_m",
     "esimd_moe_up_q4k",
     "esimd_moe_down_q5k",
     "esimd_moe_down_q6k",

@@ -249,6 +249,11 @@ at::Tensor esimd_gemv_q6_k(
     at::Tensor input, at::Tensor ql, at::Tensor qh,
     at::Tensor weight_scale, at::Tensor output);
 
+// M-tiled q6_K GEMV (small M, MTP verify): input [M,K], output [M,N].
+at::Tensor esimd_gemv_q6_k_m(
+    at::Tensor input, at::Tensor ql, at::Tensor qh,
+    at::Tensor weight_scale, at::Tensor output);
+
 // Fused GGUF k-quant MoE up/gate (Q4_K) -> silu*up -> inter[n_routed,inter].
 at::Tensor esimd_moe_up_q4k(
     at::Tensor x, at::Tensor gate_ql, at::Tensor gate_sc, at::Tensor gate_mn,

@@ -1166,9 +1166,314 @@ void gdn_target_verify(
 #undef GDNV_LAUNCH
 }
 
+// ── gdn_fused_verify: FUSED conv + recurrence for the speculative VERIFY step ─
+//
+// ONE launch/layer (vs the per-token gdn_attention replay's ~4/layer): takes the
+// RAW post-repack interleaved projection (mixed_qkvz) directly and does, per
+// (batch, v-head), the width-W causal depthwise conv (with gdn_attention's
+// internal channel reorder + history from conv_state) THEN the gated_delta_rule
+// recurrence over all draft tokens — emitting per-step ssm + conv-window
+// intermediates for the mamba rollback. Layout verified in torch vs gdn_attention
+// (tools/gdn_verify_fused_ref.py, rel 3.6e-4). All-ESIMD, no sgl-kernel dep.
+//
+// Grid = (bs, Hv, num_v_bucket), wg=256, sg=32 — SAME as gdn_target_verify. Each
+// sub-group owns GDN_VPSG v-dims of v-head `hv`; the k-head is hv/kv_ratio. The
+// conv for this head's q/k (K dims) and v (V dims) is computed inline by the
+// sub-group lanes (each lane owns KB k-dims; v-dims owned per-sg as in recurrence).
+//
+// raw interleaved layout (per k-head block of qkvz_dim = 2*K + 2*ratio*V):
+//   q @ kh*qkvz_dim + d           (d in [0,K))
+//   k @ kh*qkvz_dim + K + d        (d in [0,K))
+//   v @ kh*qkvz_dim + 2K + (rv*V + d)  (rv in [0,ratio), d in [0,V))   v-head = kh*ratio+rv
+// conv_weights rows are reordered [all_q(Hk*K) | all_k(Hk*K) | all_v(Hk*ratio*V)]:
+//   q row = kh*K + d ; k row = Hk*K + kh*K + d ; v row = Hk*2K + kh*ratio*V + rv*V + d
+// conv_state cols use the SAME reordered index. b/a are per-k-head interleaved
+// [b(ratio)|a(ratio)] in mixed_ba (stride 2*ratio per k-head).
+namespace {
+template <typename T, int KB>
+struct GdnFusedVerifyFn {
+  T* out;                    // [1, T, Hv, V]  core_attn_out
+  T* zout;                   // [1, T, Hv, V]  gate (reordered raw z-block)
+  const T* qkvz;             // [T, Hk*qkvz_dim] raw interleaved
+  const T* ba;               // [T, Hk*2*ratio] raw interleaved
+  const T* conv_w;           // [conv_dim, W] reordered rows
+  const T* conv_b;           // [conv_dim] or null
+  const T* conv_state;       // [slots, conv_dim, W-1] (reordered cols)
+  const float* A_log;        // [Hv]
+  const float* dt_bias;      // [Hv]
+  const float* ssm_state;    // [slots, Hv, V, K] fp32 READ-only
+  float* inter_ssm;          // [islots, cache_steps, Hv, V, K] fp32 WRITTEN
+  T* inter_conv;             // [islots, cache_steps, conv_dim, W-1] WRITTEN
+  const int* query_start_loc;
+  const int* cache_indices;
+  const int* inter_indices;
+  int Hk, K, Hv, V, ratio, W, conv_dim, qkvz_dim, allq, allk;
+  int act, cache_steps;
+  int ssm_stride0, cs_stride0, issm_stride0, ic_stride0;
+
+  static inline float act_sigmoid(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
+  static inline float act_softplus(float x, float beta = 1.0f, float thr = 20.0f) {
+    return (beta * x < thr) ? sycl::log(1.0f + sycl::exp(beta * x)) / beta : x;
+  }
+  // reordered conv row / state col for q,k channel d of k-head kh
+  inline int row_q(int kh, int d) const { return kh * K + d; }
+  inline int row_k(int kh, int d) const { return allq + kh * K + d; }
+  inline int row_v(int kh, int rv, int d) const { return allk + (kh * ratio + rv) * V + d; }
+  // raw qkvz column for q,k,v channel
+  inline int raw_q(int kh, int d) const { return kh * qkvz_dim + d; }
+  inline int raw_k(int kh, int d) const { return kh * qkvz_dim + K + d; }
+  inline int raw_v(int kh, int rv, int d) const { return kh * qkvz_dim + 2 * K + rv * V + d; }
+  // z-block (gate) follows the v-block in the per-k-head interleaved layout;
+  // it is passed through (NOT conv'd), matching causal_conv1d.hpp's z reorder.
+  inline int raw_z(int kh, int rv, int d) const { return kh * qkvz_dim + 2 * K + ratio * V + rv * V + d; }
+
+  // width-W causal conv for a single channel at token t, given reordered row r
+  // and raw column rawc. history = conv_state[slot, r, :W-1]; inputs from qkvz[*, rawc].
+  inline float conv_one(int slot, int r, int rawc, int t, int s0) const {
+    int Wm1 = W - 1;
+    const T* cs = conv_state + (int64_t)slot * cs_stride0 + (int64_t)r * Wm1;
+    const T* wc = conv_w + (int64_t)r * W;
+    float acc = (conv_b != nullptr) ? (float)conv_b[r] : 0.0f;
+    // window positions correspond to absolute tokens [t-(W-1) .. t]; tokens < s0
+    // come from conv_state history (its last W-1 entries align to t=s0-(W-1)..s0-1).
+    for (int w = 0; w < W; ++w) {
+      int tok = t - (Wm1 - w);            // absolute token feeding tap w
+      float xv;
+      if (tok >= s0) {
+        xv = (float)qkvz[(int64_t)tok * (Hk * qkvz_dim) + rawc];
+      } else {
+        int hidx = (Wm1) + (tok - s0);    // history index in [0,W-1): tok=s0-1 -> W-2
+        xv = (float)cs[hidx];
+      }
+      acc += xv * (float)wc[w];
+    }
+    if (act == 1) acc = acc / (1.0f + sycl::exp(-acc));  // silu
+    return acc;
+  }
+
+  [[sycl::reqd_sub_group_size(GDN_SG)]] void operator()(sycl::nd_item<3> item) const {
+    int batch_id = item.get_group(0);
+    int hv = item.get_group(1);
+    int v_bucket = item.get_group(2);
+    auto sg = item.get_sub_group();
+    int sg_id = sg.get_group_id();
+    int sg_lid = sg.get_local_id();
+    int kh = hv / ratio;
+    int rv = hv % ratio;
+    int hvd = v_bucket * GDN_VPG + sg_id * GDN_VPSG;
+    if (hvd >= V) return;
+
+    const float scale = 1.0f / sycl::sqrt(float(K));
+    float A_log_l = -sycl::exp(A_log[hv]);
+    float dt_l = dt_bias[hv];
+
+    float st[GDN_VPSG * KB];
+    float ql[KB], kl[KB], vl[GDN_VPSG];
+
+    int slot = cache_indices[batch_id];
+    const float* ssm_ptr = ssm_state + (int64_t)slot * ssm_stride0;
+    for (int j = 0; j < GDN_VPSG; ++j)
+      for (int i = 0; i < KB; ++i)
+        st[j * KB + i] = ssm_ptr[hv * K * V + (KB * sg_lid + i) + (hvd + j) * K];
+
+    int s0 = query_start_loc[batch_id];
+    int s1 = query_start_loc[batch_id + 1];
+    int inter_base_ssm = inter_indices[batch_id] * issm_stride0;
+    int step = 0;
+    for (int t = s0; t < s1; ++t, ++step) {
+      // ---- gating from RAW interleaved b/a (per-k-head [b(ratio)|a(ratio)]) ----
+      // b[hv] = ba[t, kh*2ratio + rv]; a[hv] = ba[t, kh*2ratio + ratio + rv]
+      int ba_base = (int)((int64_t)t * (Hk * 2 * ratio) + kh * 2 * ratio);
+      float beta = act_sigmoid((float)ba[ba_base + rv]);
+      float a_l = (float)ba[ba_base + ratio + rv] + dt_l;
+      float g = sycl::exp(A_log_l * act_softplus(a_l));
+
+      // ---- conv q/k (this lane owns KB k-dims) + l2norm ----
+      float qs = 0.0f, ks = 0.0f;
+      for (int i = 0; i < KB; ++i) {
+        int d = KB * sg_lid + i;
+        ql[i] = conv_one(slot, row_q(kh, d), raw_q(kh, d), t, s0);
+        kl[i] = conv_one(slot, row_k(kh, d), raw_k(kh, d), t, s0);
+        qs += ql[i] * ql[i];
+        ks += kl[i] * kl[i];
+      }
+      qs = sycl::reduce_over_group(sg, qs, sycl::plus<>()) + GDN_EPS;
+      ks = sycl::reduce_over_group(sg, ks, sycl::plus<>()) + GDN_EPS;
+      for (int i = 0; i < KB; ++i) {
+        ql[i] = ql[i] / sycl::sqrt(qs) * scale;
+        kl[i] = kl[i] / sycl::sqrt(ks);
+      }
+
+      // ---- conv v (this sg owns GDN_VPSG v-dims) ----
+      for (int i = 0; i < GDN_VPSG; ++i)
+        vl[i] = conv_one(slot, row_v(kh, rv, hvd + i), raw_v(kh, rv, hvd + i), t, s0);
+
+      // ---- recurrence (delta rule) ----
+      float kv_mem[GDN_VPSG];
+      for (int i = 0; i < GDN_VPSG; ++i) kv_mem[i] = 0.0f;
+      for (int j = 0; j < GDN_VPSG; ++j)
+        for (int i = 0; i < KB; ++i) {
+          st[j * KB + i] *= g;
+          kv_mem[j] += st[j * KB + i] * kl[i];
+        }
+      for (int i = 0; i < GDN_VPSG; ++i)
+        kv_mem[i] = sycl::reduce_over_group(sg, kv_mem[i], sycl::plus<>());
+
+      float delta[GDN_VPSG];
+      for (int i = 0; i < GDN_VPSG; ++i) delta[i] = (vl[i] - kv_mem[i]) * beta;
+
+      float res[GDN_VPSG];
+      for (int i = 0; i < GDN_VPSG; ++i) res[i] = 0.0f;
+      for (int j = 0; j < GDN_VPSG; ++j)
+        for (int i = 0; i < KB; ++i) {
+          st[j * KB + i] += kl[i] * delta[j];
+          res[j] += st[j * KB + i] * ql[i];
+        }
+      for (int i = 0; i < GDN_VPSG; ++i)
+        res[i] = sycl::reduce_over_group(sg, res[i], sycl::plus<>());
+
+      if (sg_lid == 0)
+        for (int i = 0; i < GDN_VPSG; ++i) {
+          out[t * Hv * V + hv * V + hvd + i] = (T)res[i];
+          // z gate: raw z-block passthrough (no conv), reordered to [T,Hv,V]
+          zout[t * Hv * V + hv * V + hvd + i] =
+              qkvz[(int64_t)t * (Hk * qkvz_dim) + raw_z(kh, rv, hvd + i)];
+        }
+
+      // ---- cache per-step ssm intermediate (post-token state) ----
+      if (step < cache_steps) {
+        float* ip = inter_ssm + inter_base_ssm + step * Hv * V * K;
+        for (int j = 0; j < GDN_VPSG; ++j)
+          for (int i = 0; i < KB; ++i)
+            ip[hv * K * V + (KB * sg_lid + i) + (hvd + j) * K] = st[j * KB + i];
+      }
+    }
+  }
+};
+}  // namespace
+
+// inter_conv is written by a SEPARATE light pass (one item per (batch, step,
+// channel)) so the conv-window cache matches the triton [islot, step, conv_dim,
+// W-1] layout without serializing the recurrence kernel. The recurrence kernel
+// above already recomputes conv internally; this pass materializes the windows
+// the mamba rollback scatters. It mirrors the window the recurrence consumed.
+namespace {
+template <typename T>
+struct GdnFusedConvWindowFn {
+  const T* qkvz;
+  const T* conv_state;
+  T* inter_conv;             // [islots, cache_steps, conv_dim, W-1]
+  const int* query_start_loc;
+  const int* cache_indices;
+  const int* inter_indices;
+  int Hk, K, Hv, V, ratio, W, conv_dim, qkvz_dim, allq, allk;
+  int cache_steps, cs_stride0, ic_stride0;
+  // reordered row -> raw qkvz column (inverse of the reorder map)
+  inline int raw_of_row(int r) const {
+    if (r < allq) { int kh = r / K, d = r % K; return kh * qkvz_dim + d; }
+    if (r < allk) { int rr = r - allq; int kh = rr / K, d = rr % K; return kh * qkvz_dim + K + d; }
+    int rr = r - allk; int vh = rr / V, d = rr % V; int kh = vh / ratio, rv = vh % ratio;
+    return kh * qkvz_dim + 2 * K + rv * V + d;
+  }
+  void operator()(sycl::item<3> it) const {
+    int n = it.get_id(0);       // request
+    int step = it.get_id(1);    // draft token index
+    int r = it.get_id(2);       // reordered channel/row
+    if (r >= conv_dim || step >= cache_steps) return;
+    int Wm1 = W - 1;
+    int s0 = query_start_loc[n];
+    int s1 = query_start_loc[n + 1];
+    int Tn = s1 - s0;
+    if (step >= Tn) return;
+    int slot = cache_indices[n];
+    int rawc = raw_of_row(r);
+    const T* cs = conv_state + (int64_t)slot * cs_stride0 + (int64_t)r * Wm1;
+    // window AFTER consuming token (s0+step) = inputs at absolute tokens
+    // [s0+step-(W-2) .. s0+step], i.e. the last W-1 inputs feeding the NEXT tap.
+    T* ic = inter_conv + (int64_t)inter_indices[n] * ic_stride0 +
+            ((int64_t)step * conv_dim + r) * Wm1;
+    int tcur = s0 + step;
+    for (int w = 0; w < Wm1; ++w) {
+      int tok = tcur - (Wm1 - 1 - w);   // w=Wm1-1 -> tok=tcur (newest)
+      float xv;
+      if (tok >= s0) xv = (float)qkvz[(int64_t)tok * (Hk * qkvz_dim) + rawc];
+      else xv = (float)cs[(Wm1) + (tok - s0)];
+      ic[w] = (T)xv;
+    }
+  }
+};
+}  // namespace
+
+void gdn_fused_verify(
+    torch::Tensor& out, torch::Tensor& zout, torch::Tensor& qkvz, torch::Tensor& ba,
+    torch::Tensor& conv_w, const std::optional<torch::Tensor>& conv_bias,
+    torch::Tensor& conv_state, torch::Tensor& A_log, torch::Tensor& dt_bias,
+    torch::Tensor& ssm_state, torch::Tensor& inter_ssm, torch::Tensor& inter_conv,
+    torch::Tensor& query_start_loc, torch::Tensor& cache_indices,
+    torch::Tensor& inter_indices, int64_t num_k_heads, int64_t num_v_heads,
+    int64_t head_k_dim, int64_t head_v_dim, int64_t activation, int64_t cache_steps) {
+  TORCH_CHECK(qkvz.scalar_type() == torch::kHalf || qkvz.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(A_log.scalar_type() == torch::kFloat32 && dt_bias.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(ssm_state.scalar_type() == torch::kFloat32 && inter_ssm.scalar_type() == torch::kFloat32);
+  const int Hk = num_k_heads, K = head_k_dim, Hv = num_v_heads, V = head_v_dim;
+  const int ratio = Hv / Hk;
+  const int W = conv_w.size(1);
+  const int conv_dim = conv_w.size(0);
+  const int qkvz_dim = 2 * K + 2 * ratio * V;
+  const int allq = Hk * K, allk = allq + Hk * K;
+  TORCH_CHECK(K == 128 && V == 128, "only head_dim 128");
+  TORCH_CHECK(K % GDN_SG == 0);
+  const int KB = K / GDN_SG;  // 4
+  const int bs = query_start_loc.size(0) - 1;
+  const int num_v_bucket = (V + GDN_VPG - 1) / GDN_VPG;
+
+  auto qd = c10::xpu::getCurrentXPUStream().queue();
+  const void* biasp = conv_bias.has_value() ? conv_bias->data_ptr() : nullptr;
+  int ssm_stride0 = ssm_state.stride(0);
+  int cs_stride0 = conv_state.stride(0);
+  int issm_stride0 = cache_steps * Hv * V * K;
+  int ic_stride0 = inter_conv.stride(0);
+
+  sycl::range<3> local(1, 1, GDN_GROUP);
+  sycl::range<3> global(bs, Hv, num_v_bucket);
+  sycl::nd_range<3> range(global * local, local);
+
+#define GDNFV_LAUNCH(T_)                                                          \
+  do {                                                                           \
+    GdnFusedVerifyFn<T_, 4> kf{                                                  \
+        (T_*)out.data_ptr(), (T_*)zout.data_ptr(),                               \
+        (const T_*)qkvz.data_ptr(), (const T_*)ba.data_ptr(),                    \
+        (const T_*)conv_w.data_ptr(), (const T_*)biasp,                          \
+        (const T_*)conv_state.data_ptr(),                                        \
+        (const float*)A_log.data_ptr(), (const float*)dt_bias.data_ptr(),        \
+        (const float*)ssm_state.data_ptr(), (float*)inter_ssm.data_ptr(),        \
+        (T_*)inter_conv.data_ptr(),                                              \
+        (const int*)query_start_loc.data_ptr(), (const int*)cache_indices.data_ptr(),\
+        (const int*)inter_indices.data_ptr(),                                    \
+        Hk, K, Hv, V, ratio, W, conv_dim, qkvz_dim, allq, allk,                  \
+        (int)activation, (int)cache_steps,                                       \
+        ssm_stride0, cs_stride0, issm_stride0, ic_stride0};                      \
+    qd.submit([&](sycl::handler& h) { h.parallel_for(range, kf); });             \
+    GdnFusedConvWindowFn<T_> cw{                                                 \
+        (const T_*)qkvz.data_ptr(), (const T_*)conv_state.data_ptr(),            \
+        (T_*)inter_conv.data_ptr(),                                              \
+        (const int*)query_start_loc.data_ptr(), (const int*)cache_indices.data_ptr(),\
+        (const int*)inter_indices.data_ptr(),                                    \
+        Hk, K, Hv, V, ratio, W, conv_dim, qkvz_dim, allq, allk,                  \
+        (int)cache_steps, cs_stride0, ic_stride0};                              \
+    qd.submit([&](sycl::handler& h) {                                            \
+      h.parallel_for(sycl::range<3>(bs, cache_steps, conv_dim), cw); });         \
+  } while (0)
+
+  if (qkvz.scalar_type() == torch::kHalf) GDNFV_LAUNCH(fp16);
+  else GDNFV_LAUNCH(bf16);
+#undef GDNFV_LAUNCH
+}
+
 TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> ()");
     m.def("gdn_target_verify(Tensor! out, Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor ssm_state, Tensor! intermediate, Tensor query_start_loc, Tensor cache_indices, Tensor inter_indices, int cache_steps) -> ()");
+    m.def("gdn_fused_verify(Tensor! out, Tensor! zout, Tensor qkvz, Tensor ba, Tensor conv_w, Tensor? conv_bias, Tensor conv_state, Tensor A_log, Tensor dt_bias, Tensor ssm_state, Tensor! inter_ssm, Tensor! inter_conv, Tensor query_start_loc, Tensor cache_indices, Tensor inter_indices, int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, int activation, int cache_steps) -> ()");
     m.def("causal_conv1d_verify(Tensor! out, Tensor x, Tensor conv_w, Tensor? conv_bias, Tensor conv_state, Tensor! inter_conv, Tensor cache_indices, Tensor inter_indices, int activation) -> ()");
     m.def("verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, Tensor target_predict) -> ()");
     m.def("gdn_eagle(Tensor! qkvz, Tensor! z_out, Tensor conv_w, Tensor? conv_b, Tensor! conv_state, Tensor accepted_tokens, Tensor ba, Tensor a_log, Tensor dt_bias, Tensor! state_in, Tensor ssm_state_idx, Tensor norm_w, int max_query_len) -> Tensor");
@@ -1185,6 +1490,7 @@ TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
     m.impl("build_tree_kernel_efficient", &build_tree_kernel_efficient);
     m.impl("verify_tree_greedy", &verify_tree_greedy);
     m.impl("gdn_target_verify", &gdn_target_verify);
+    m.impl("gdn_fused_verify", &gdn_fused_verify);
     m.impl("causal_conv1d_verify", &causal_conv1d_verify);
 }
 
@@ -1195,5 +1501,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient, "build_tree_kernel_efficient");
     m.def("verify_tree_greedy", &verify_tree_greedy, "verify_tree_greedy");
     m.def("gdn_target_verify", &gdn_target_verify, "gdn_target_verify");
+    m.def("gdn_fused_verify", &gdn_fused_verify, "gdn_fused_verify");
     m.def("causal_conv1d_verify", &causal_conv1d_verify, "causal_conv1d_verify");
 }

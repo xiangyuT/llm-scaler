@@ -73,6 +73,11 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
         "Tensor weight_scale, Tensor output) -> Tensor");
   m.impl("esimd_gemv_q6_k", torch::kXPU, &esimd_gemv_q6_k);
 
+  // M-tiled q6_K GEMV (small M, MTP verify): input [M,K], output [M,N].
+  m.def("esimd_gemv_q6_k_m(Tensor input, Tensor ql, Tensor qh, "
+        "Tensor weight_scale, Tensor output) -> Tensor");
+  m.impl("esimd_gemv_q6_k_m", torch::kXPU, &esimd_gemv_q6_k_m);
+
   // Fused GGUF k-quant MoE up/gate (Q4_K) -> silu*up.
   m.def("esimd_moe_up_q4k(Tensor x, Tensor gate_ql, Tensor gate_sc, "
         "Tensor gate_mn, Tensor up_ql, Tensor up_sc, Tensor up_mn, Tensor sel, "
