@@ -230,6 +230,11 @@ at::Tensor esimd_gemv_q8_0(
     at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
     at::Tensor output);
 
+// M-tiled q8_0 dense GEMV (small M, MTP verify): input [M,K], output [M,N].
+at::Tensor esimd_gemv_q8_0_m(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output);
+
 // GGUF q4_K GEMV: group_size=32 interleaved nibble, asymmetric.
 // weight [N,K/2] u8, scale + min [N,K/32] fp16 (host-precomputed from 6-bit
 // sub-fields). dequant w = scale*nibble - min.

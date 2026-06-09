@@ -192,6 +192,27 @@ at::Tensor esimd_gemv_q8_0(
     return output;
 }
 
+// M-tiled q8_0 dense GEMV (small M, MTP verify). input [M,K], output [M,N].
+// Reads the int8 q8_0 weights ONCE per row-tile across the M rows (vs the M>1
+// oneDNN jit:gemm path that CACHE-MISSes / JIT-recompiles per (M,K,N) shape —
+// the #87 trace hog). M = input.size(0). weight [N,K] int8, scale [N,K/32].
+at::Tensor esimd_gemv_q8_0_m(
+    at::Tensor input, at::Tensor weight, at::Tensor weight_scale,
+    at::Tensor output) {
+    int64_t M = input.size(0);
+    int64_t N = weight.size(0);
+    int64_t K = weight.size(1);  // int8: 1 byte/elem
+    EXTRACT_PTR(p_in, input); EXTRACT_PTR(p_sc, weight_scale);
+    EXTRACT_PTR(p_out, output);
+    auto p_w = reinterpret_cast<int8_t*>(weight.data_ptr());
+    auto& dpcpp_queue = get_device_queue(input);
+    q8_0_gemv_M_host(reinterpret_cast<const fp16*>(p_in), p_w,
+                     reinterpret_cast<const fp16*>(p_sc),
+                     reinterpret_cast<fp16*>(p_out),
+                     (uint32_t)M, (uint32_t)N, (uint32_t)K, dpcpp_queue);
+    return output;
+}
+
 // ---- GGUF q4_K GEMV: group-32 interleaved, asymmetric (scale + min) ----
 
 #include "esimd_kernels/q4_k_GEMV.h"

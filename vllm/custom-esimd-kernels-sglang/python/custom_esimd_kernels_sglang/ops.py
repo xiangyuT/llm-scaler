@@ -157,6 +157,24 @@ def esimd_gemv_q8_0(
     return _ops.esimd_gemv_q8_0(input, weight, weight_scale, output)
 
 
+def esimd_gemv_q8_0_m(
+    input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """M-tiled q8_0 dense GEMV (small M, e.g. MTP verify M=2..16).
+
+    Same q8_0 dequant as esimd_gemv_q8_0 (w = d * int8), but reads the int8
+    weights ONCE per row-tile and reuses across the M activation rows — avoids
+    the M>1 oneDNN jit:gemm cache-miss/recompile. Requires K % 256 == 0.
+
+    input:        [M, K]      fp16
+    weight:       [N, K]      int8
+    weight_scale: [N, K/32]   fp16
+    output:       [M, N]      fp16 — pre-allocated
+    """
+    return _ops.esimd_gemv_q8_0_m(input, weight, weight_scale, output)
+
+
 def esimd_gemv_q4_k(
     input: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     weight_min: torch.Tensor, output: torch.Tensor,

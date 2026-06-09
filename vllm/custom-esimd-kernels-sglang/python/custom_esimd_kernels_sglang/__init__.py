@@ -77,6 +77,7 @@ _EXPORTS = [
     "esimd_gemv_int4_fused2",
     "esimd_gemv_q4_0",
     "esimd_gemv_q8_0",
+    "esimd_gemv_q8_0_m",
     "esimd_gemv_q4_k",
     "esimd_gemv_q5_k",
     "esimd_gemv_q6_k",

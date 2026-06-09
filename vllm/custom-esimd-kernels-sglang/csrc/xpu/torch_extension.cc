@@ -57,6 +57,11 @@ TORCH_LIBRARY(custom_esimd_kernels_sglang, m) {
         "Tensor output) -> Tensor");
   m.impl("esimd_gemv_q8_0", torch::kXPU, &esimd_gemv_q8_0);
 
+  // M-tiled q8_0 dense GEMV (small M, MTP verify): input [M,K], output [M,N].
+  m.def("esimd_gemv_q8_0_m(Tensor input, Tensor weight, Tensor weight_scale, "
+        "Tensor output) -> Tensor");
+  m.impl("esimd_gemv_q8_0_m", torch::kXPU, &esimd_gemv_q8_0_m);
+
   // GGUF q4_K GEMV: group_size=32 interleaved, asymmetric (scale + min).
   // weight [N, K/2] u8, scale + min [N, K/32] fp16. dequant w = scale*nib - min.
   m.def("esimd_gemv_q4_k(Tensor input, Tensor weight, Tensor weight_scale, "

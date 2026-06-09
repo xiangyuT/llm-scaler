@@ -112,3 +112,109 @@ inline void q8_0_gemv_host(
     else              { LAUNCH_Q8_0(1) }
 #undef LAUNCH_Q8_0
 }
+
+// ===================================================================
+// Small-M (M in 2..16) Q8_0 dense GEMV — weights-read-once across M rows.
+//
+// For the MTP target-verify forward the dense attn projections (qkv/o_proj,
+// Q8_0) run at M = draft_token_num (2..4). The M==1 GEMV would relaunch per
+// row, and the M>1 path was routing to oneDNN jit:gemm:any which CACHE-MISSes
+// and JIT-recompiles for EACH new (M,K,N) shape (the #87 trace hog, 23% XPU).
+// This kernel mirrors q6_k_GEMV.h's M-tiled design: one weight row per
+// work-item, dequant the int8 tile ONCE per K-block, reuse across all M
+// activation rows. grid = N/ROWS WGs (N is large for dense proj, plenty).
+//
+//   input  [M, K]    fp16
+//   weight [N, K]    int8   (signed q8_0 quants, contiguous per row)
+//   scale  [N, K/32] fp16   (per-32-block d)
+//   output [M, N]    fp16
+// dequant: w[n,k] = scale[n,k/32] * (float)qs[n,k]  (same as M=1 kernel)
+
+static constexpr int Q8_0_M_VL   = 256;  // elems/iter (8 q8_0 blocks); K%256==0 for 2048/4096
+static constexpr int Q8_0_M_ROWS = 4;    // weight rows per work-group
+
+template <int M>
+struct Q8_0_gemv_M_kernel {
+    const fp16*   input;   // [M, K]
+    const int8_t* weight;  // [N, K]
+    const fp16*   scale;   // [N, K/32]
+    fp16*         output;  // [M, N]
+    int N, K;
+
+    void operator()(sycl::nd_item<1> ndi) const SYCL_ESIMD_KERNEL {
+        const int row = (int)ndi.get_group(0) * Q8_0_M_ROWS + (int)ndi.get_local_id(0);
+        if (row >= N) return;
+        constexpr int VL    = Q8_0_M_VL;
+        constexpr int VL_GS = VL / Q8_0_GROUP;   // scales per tile (8)
+        const int K_ITERS  = K / VL;
+        const int W_STRIDE = K;                  // int8 per row
+        const int SC_STRIDE = K / Q8_0_GROUP;
+
+        simd<float, 8> acc[M];
+        #pragma unroll
+        for (int m = 0; m < M; m++) acc[m] = 0.0f;
+        int ai = 0;
+
+        for (int iter = 0; iter < K_ITERS; iter++) {
+            const int k = iter * VL;
+            // --- load + dequant the weight tile ONCE ---
+            simd<int8_t, VL> raw = block_load<int8_t, VL>(
+                weight + (size_t)row * W_STRIDE + k);
+            simd<fp16, VL_GS> sc_h = block_load<fp16, VL_GS>(
+                scale + (size_t)row * SC_STRIDE + k / Q8_0_GROUP);
+            simd<float, VL_GS> sc_f = sc_h;
+            simd<float, VL> weight_f = convert<float>(raw);
+            #pragma unroll
+            for (int sb = 0; sb < VL_GS; sb++) {
+                weight_f.template select<Q8_0_GROUP, 1>(sb * Q8_0_GROUP) =
+                    weight_f.template select<Q8_0_GROUP, 1>(sb * Q8_0_GROUP) * sc_f[sb];
+            }
+            // --- reuse weight_f across all M activation rows ---
+            #pragma unroll
+            for (int m = 0; m < M; m++) {
+                simd<fp16, VL> act = block_load<fp16, VL>(input + (size_t)m * K + k);
+                simd<float, VL> prod = weight_f * simd<float, VL>(act);
+                acc[m][ai] += reduce<float>(prod, std::plus<>());
+            }
+            ai = (ai + 1) & 7;
+        }
+        #pragma unroll
+        for (int m = 0; m < M; m++)
+            output[(size_t)m * N + row] = (fp16)reduce<float>(acc[m], std::plus<>());
+    }
+};
+
+template <int M>
+inline void q8_0_gemv_M_launch(
+    const fp16* input, const int8_t* weight, const fp16* scale, fp16* output,
+    uint32_t N, uint32_t K, sycl::queue& q) {
+    const int NWG = ((int)N + Q8_0_M_ROWS - 1) / Q8_0_M_ROWS;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>((size_t)NWG * Q8_0_M_ROWS, Q8_0_M_ROWS),
+            Q8_0_gemv_M_kernel<M>{input, weight, scale, output, (int)N, (int)K});
+    });
+}
+
+// Dispatch arbitrary M onto fixed-M kernels by tiling in {4,2,1} chunks; each
+// tile reads the weights once for its M rows. M==1 -> the K_SPLIT GEMV. The MTP
+// verify M = draft_token_num (typically <=4), so {4,2} covers the hot case; >4
+// just re-tiles (weights re-read per tile, still far cheaper than oneDNN JIT).
+// NO <8> tile: the AOT gen compiler (-device ptl-u) fails to lower the <8>
+// instantiation (large live simd<float,VL> set); {4,2} link fine and cover
+// draft_token_num. Requires K % Q8_0_M_VL (256) == 0 (dense proj K=2048/4096);
+// caller falls back to oneDNN otherwise.
+inline void q8_0_gemv_M_host(
+    const fp16* input, const int8_t* weight, const fp16* scale, fp16* output,
+    uint32_t M, uint32_t N, uint32_t K, sycl::queue& q) {
+    if (M == 1) { q8_0_gemv_host(input, weight, scale, output, N, K, q); return; }
+    uint32_t m0 = 0;
+    while (m0 < M) {
+        uint32_t r = M - m0;
+        const fp16* in = input + (size_t)m0 * K;
+        fp16* out = output + (size_t)m0 * N;
+        if      (r >= 4) { q8_0_gemv_M_launch<4>(in, weight, scale, out, N, K, q); m0 += 4; }
+        else if (r >= 2) { q8_0_gemv_M_launch<2>(in, weight, scale, out, N, K, q); m0 += 2; }
+        else             { q8_0_gemv_M_launch<1>(in, weight, scale, out, N, K, q); m0 += 1; }
+    }
+}
