@@ -405,9 +405,10 @@ void page_attn_decode(
   size_t totalSize = szP + szGroupMax + szGlobalMax + szGlobalPollP + szOutTemp + szGlobalSoftmaxSum;
 
   // If caller passes a pre-allocated temp_p (for XPUGraph capture/replay
-  // stability), reuse it and zero it in-place; otherwise allocate fresh.
+  // stability), reuse it; otherwise allocate fresh (already zeroed).
   torch::Tensor temp_p;
-  if (temp_p_opt.has_value()) {
+  bool preallocated = temp_p_opt.has_value();
+  if (preallocated) {
     temp_p = temp_p_opt.value();
     TORCH_CHECK(temp_p.numel() >= static_cast<long>(totalSize),
                 "temp_p buffer too small: ", temp_p.numel(), " < ", totalSize);
@@ -415,7 +416,6 @@ void page_attn_decode(
                 "temp_p must be float32");
     TORCH_CHECK(temp_p.device() == key_cache.device(),
                 "temp_p must be on the same device as key_cache");
-    temp_p.zero_();
   } else {
     temp_p = torch::zeros({ static_cast<long>(totalSize) },
       torch::device(key_cache.device()).dtype(torch::kFloat32));
@@ -427,6 +427,21 @@ void page_attn_decode(
   uint32_t* pPollP = (uint32_t*)pGlobalMax + szGlobalMax;
   float* pOutTemp = (float*)pPollP + szGlobalPollP;
   float* pGloablSoftmaxSum = (float*)pOutTemp + szOutTemp;
+
+  // PERF (#117): only [pGlobalMax .. pPollP) needs pre-zeroing each call — pGlobalMax
+  // is read-as-compare by the first-arrival fcmpxchg (page.attn.h:215, writes only if
+  // ==0) and pPollP is the atomic arrival counter (must start at 0). All other regions
+  // (pState/pGroupMax/pOutTemp/pGloablSoftmaxSum) are write-before-read WITHIN the
+  // actual kvSeqLen bounds (Phase2 gates `< kvSeqLen`, Phase3 masks to
+  // effectiveReduceCount) so their worst-case tail is never read. The old
+  // temp_p.zero_() zeroed the ENTIRE ~max_context_len-sized buffer (~21MB @ ctx 64k,
+  // 300us/call, the #108 trace's 82ms Fill<float>); this zeroes ~512 bytes instead.
+  // pGlobalMax and pPollP are contiguous (offsets above), so one narrow zero covers both.
+  if (preallocated) {
+    size_t zoff = szP + szGroupMax;                  // start of pGlobalMax
+    size_t zlen = szGlobalMax + szGlobalPollP;        // pGlobalMax + pPollP
+    temp_p.narrow(0, static_cast<long>(zoff), static_cast<long>(zlen)).zero_();
+  }
   sycl::queue& queue = c10::xpu::getCurrentXPUStream(key_cache.device().index()).queue();
 
   auto launch = [&](auto dtypeTag) {
