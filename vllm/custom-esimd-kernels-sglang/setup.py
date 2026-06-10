@@ -1,4 +1,5 @@
 import sys
+import os
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -145,6 +146,34 @@ ext_modules.append(
     )
 )
 ### Eagle kernels
+
+### Grouped GGUF MoE GGEMV (Q4_K up + Q5_K/Q6_K down, doubleGRF DPAS).
+# Used by sglang gguf.py for GGUF MoE prefill + MTP-verify (small-M N=16 occupancy
+# tile). DPAS REQUIRES AOT for the actual GPU — JIT'ing DPAS on PTL is unreliable —
+# so this ext is AOT to OMNI_XPU_DEVICE (default ptl-u Xe3) with -doubleGRF, unlike
+# the JIT eagle_ops above. Ported from cc_workspace POC moe_q4k_prefill_poc.
+_MOE_GROUPED_DEV = os.environ.get("OMNI_XPU_DEVICE", "ptl-u")
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_sglang.moe_grouped_gguf_xpu",
+        sources=[
+            "csrc/moe_grouped/moe_grouped_entry.sycl",
+        ],
+        include_dirs=[
+            root / "csrc" / "moe_grouped",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "sycl": ["-fsycl", "-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     "-fsycl-targets=spir64_gen",
+                     "-Xs", f"-device {_MOE_GROUPED_DEV} -options -doubleGRF",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
+### Grouped GGUF MoE GGEMV
 
 ### MoE Batch kernels (Router, TopK, Up/Down, Accumulate) — FP8
 # [skip-ptl-moe-batch] ext_modules.append(
