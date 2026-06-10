@@ -49,7 +49,11 @@ at::Tensor moe_up_q4k_ggemv_entry(
         reinterpret_cast<fp16*>(gate_buf.data_ptr()),
         chunks_ptr, num_chunks, (int)hidden_size, (int)intermediate_size,
         tok_ids_ptr);
-    queue.wait();
+    // NOTE (#102): NO queue.wait() — it (a) breaks XPU-graph capture ("wait cannot
+    // be called for a queue which is recording to a command graph") and (b) needlessly
+    // host-blocks in eager (the kernel writes gate_buf on the current XPU stream; the
+    // downstream silu/GGEMV run on the SAME stream, so ordering already holds). torch
+    // syncs at the framework boundary.
     return gate_buf;
 }
 
@@ -73,7 +77,8 @@ at::Tensor moe_down_q5k_ggemv_entry(
         reinterpret_cast<const fp16*>(w_min.data_ptr()),
         reinterpret_cast<fp16*>(expert_output.data_ptr()),
         chunks_ptr, num_chunks, (int)intermediate_size, (int)hidden_size);
-    queue.wait();
+    // NOTE (#102): NO queue.wait() — breaks graph capture + needless host-block. Same
+    // stream as caller => ordering holds. (q5k down GGEMV.)
     return expert_output;
 }
 
@@ -95,7 +100,8 @@ at::Tensor moe_down_q6k_ggemv_entry(
         reinterpret_cast<const fp16*>(w_scale.data_ptr()),
         reinterpret_cast<fp16*>(expert_output.data_ptr()),
         chunks_ptr, num_chunks, (int)intermediate_size, (int)hidden_size);
-    queue.wait();
+    // NOTE (#102): NO queue.wait() — breaks graph capture + needless host-block. Same
+    // stream as caller => ordering holds. (q6k down GGEMV.)
     return expert_output;
 }
 
