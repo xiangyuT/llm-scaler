@@ -1485,7 +1485,250 @@ void gdn_fused_verify(
 #undef GDNFV_LAUNCH
 }
 
+// ===========================================================================
+// Spec-decode index/cache-bookkeeping kernels — SYCL ports of the triton
+// kernels in sglang/srt/speculative/spec_utils.py + eagle_info.py. These are
+// per-request (CUDA grid=batch_size, block=1) index/copy ops with no shared
+// mem or reduction beyond a serial prefix-sum over the (tiny) batch. Ported to
+// SYCL because triton-on-XPU is unreliable/unpredictable (not a perf decision).
+//
+// dtype contract (sglang, verified at call sites):
+//   req_to_token : int32          out_cache_loc / seq_lens / req_pool_indices /
+//   extend_lens / source/target_cache_loc / accept_length* / positions /
+//   verified_id / new_verified_id / to_free_* / tgt_cache_loc : int64
+// (req_to_token stores get an int64->int32 narrowing cast, matching triton.)
+//
+// SCOPE NOTE: assign_draft_cache_locs here implements the topk==1 || page_size==1
+// branch (Part 1 copy) — the only branch the XPU topk=1 path takes. The
+// page_size>1 && topk>1 duplication branch (Parts 2-3) is NOT ported; the python
+// wrapper falls back to triton for that config.
+// ===========================================================================
+namespace {
+
+// --- assign_draft_cache_locs (Part 1, topk==1 || page_size==1) ---
+// per req pid: copy copy_len = topk*num_steps int64 indices from
+// out_cache_loc[pid*copy_len :] into req_to_token[req_pool_indices[pid]][seq_lens[pid]:].
+struct AssignDraftCacheLocsP1Fn {
+  const int64_t* req_pool_indices;
+  int32_t* req_to_token;            // mutable, int32
+  const int64_t* seq_lens;
+  const int64_t* out_cache_loc;
+  int64_t pool_len;
+  int copy_len;                     // topk * num_steps
+  void operator()(sycl::nd_item<1> it) const {
+    int pid = it.get_group(0);
+    const int64_t* src = out_cache_loc + (int64_t)pid * copy_len;
+    int32_t* dst = req_to_token + req_pool_indices[pid] * pool_len + seq_lens[pid];
+    for (int i = 0; i < copy_len; ++i) dst[i] = (int32_t)src[i];
+  }
+};
+
+// --- create_extend_after_decode_spec_info ---
+// per req pid: with cum = sum(accept_lens[0..pid-1]),
+//   positions[cum + k] = seq_lens[pid] - accept_len + k   for k in [0,accept_len)
+//   new_verified_id[pid] = verified_id[cum + accept_len - 1]
+// dtypes (sglang eagle_info.py prepare_extend_after_decode): verified_id
+// (=batch.input_ids=prior self.verified_id) int32, seq_lens int64, accept_lens
+// int32, positions int64, new_verified_id int32.
+struct CreateExtendAfterDecodeFn {
+  const int32_t* verified_id;  // int32 (spec verified_id, NOT the int64 token ids)
+  const int64_t* seq_lens;
+  const int32_t* accept_lens;
+  int64_t* positions;          // mutable
+  int32_t* new_verified_id;    // mutable, int32
+  int bs;
+  void operator()(sycl::nd_item<1> it) const {
+    int pid = it.get_group(0);
+    int64_t seq_length = seq_lens[pid];
+    int accept_length = accept_lens[pid];
+    int64_t cum = 0;
+    for (int j = 0; j < pid; ++j) cum += accept_lens[j];
+    for (int k = 0; k < accept_length; ++k)
+      positions[cum + k] = seq_length - accept_length + k;
+    new_verified_id[pid] = verified_id[cum + accept_length - 1];
+  }
+};
+
+// --- align_evict_mask_to_page_size (topk==1 evict) ---
+// per req bid: count trues in evict_mask[bid] row (len num_draft_tokens),
+// then clear (set False) the entries in [start, start+page_size) that align the
+// kept-prefix to a page boundary. evict_mask is bool (1 byte).
+struct AlignEvictMaskFn {
+  const int64_t* seq_lens;
+  bool* evict_mask;             // mutable, [bs, num_draft_tokens]
+  int page_size;
+  int num_draft_tokens;
+  void operator()(sycl::nd_item<1> it) const {
+    int bid = it.get_group(0);
+    int64_t seq_len = seq_lens[bid];
+    bool* row = evict_mask + (int64_t)bid * num_draft_tokens;
+    int num_trues = 0;
+    for (int t = 0; t < num_draft_tokens; ++t) num_trues += row[t] ? 1 : 0;
+    int num_false = num_draft_tokens - num_trues;
+    long start = ((long)seq_len + num_false - 1) / page_size * page_size - (long)seq_len;
+    long lo = start > 0 ? start : 0;
+    long hi = start + page_size;
+    if (hi > num_draft_tokens) hi = num_draft_tokens;
+    for (long i = lo; i < hi; ++i) row[i] = false;
+  }
+};
+
+// --- get_target_cache_loc ---
+// per req bid: tgt part — gather out_cache_loc[bid][0..accept+1) to
+//   tgt_cache_loc[sum(accept[0..bid-1]) + bid :]; free part — gather the tail
+//   out_cache_loc[bid][nvt - free_cur ..] to to_free_slots[sum(free[0..bid-1]):].
+// dtypes: tgt_cache_loc/to_free_slots/out_cache_loc int64, accept_length int32,
+// to_free_num_slots int64.
+struct GetTargetCacheLocFn {
+  int64_t* tgt_cache_loc;        // mutable
+  int64_t* to_free_slots;        // mutable
+  const int32_t* accept_length;
+  const int64_t* to_free_num_slots;
+  const int64_t* out_cache_loc;
+  int num_verify_tokens;
+  void operator()(sycl::nd_item<1> it) const {
+    int bid = it.get_group(0);
+    int64_t acc_cum = 0;
+    for (int j = 0; j < bid; ++j) acc_cum += accept_length[j];
+    int64_t tgt_start = acc_cum + bid;
+    int64_t copy_len = (int64_t)accept_length[bid] + 1;
+    const int64_t* row = out_cache_loc + (int64_t)bid * num_verify_tokens;
+    for (int64_t i = 0; i < copy_len; ++i) tgt_cache_loc[tgt_start + i] = row[i];
+    int64_t free_cum = 0;
+    for (int j = 0; j < bid; ++j) free_cum += to_free_num_slots[j];
+    int64_t free_cur = to_free_num_slots[bid];
+    int64_t oc_start = num_verify_tokens - free_cur;
+    for (int64_t i = 0; i < free_cur; ++i)
+      to_free_slots[free_cum + i] = row[oc_start + i];
+  }
+};
+
+// --- filter_finished_cache_loc_kernel ---
+// per req bid: compact tgt_cache_loc rows by accept_length_filter. Reads from
+// old_start = sum(accept_length[0..bid-1]) + bid, writes to
+// new_start = sum(accept_length_filter[0..bid-1]); copy copy_len =
+// accept_length_filter[bid] entries (out_cache_loc[old_start:] -> tgt[new_start:]).
+// dtypes: out_cache_loc/tgt_cache_loc int64, accept_length/accept_length_filter int32.
+struct FilterFinishedCacheLocFn {
+  const int64_t* out_cache_loc;
+  int64_t* tgt_cache_loc;        // mutable
+  const int32_t* accept_length;
+  const int32_t* accept_length_filter;
+  void operator()(sycl::nd_item<1> it) const {
+    int bid = it.get_group(0);
+    int64_t old_start = bid;
+    for (int j = 0; j < bid; ++j) old_start += accept_length[j];
+    int64_t new_start = 0;
+    for (int j = 0; j < bid; ++j) new_start += accept_length_filter[j];
+    int64_t copy_len = accept_length_filter[bid];
+    for (int64_t i = 0; i < copy_len; ++i)
+      tgt_cache_loc[new_start + i] = out_cache_loc[old_start + i];
+  }
+};
+
+}  // namespace
+
+template <typename K>
+static inline void _eagle_launch_per_req(sycl::queue& q, int bs, K k) {
+  if (bs <= 0) return;
+  q.submit([&](sycl::handler& h) {
+    h.parallel_for(sycl::nd_range<1>(static_cast<size_t>(bs), 1), k);
+  });
+}
+
+void assign_draft_cache_locs_p1(
+    at::Tensor req_pool_indices, at::Tensor req_to_token, at::Tensor seq_lens,
+    at::Tensor out_cache_loc, int64_t topk, int64_t num_steps) {
+  TORCH_CHECK(req_to_token.scalar_type() == at::kInt, "req_to_token must be int32");
+  TORCH_CHECK(req_pool_indices.scalar_type() == at::kLong, "req_pool_indices int64");
+  TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "seq_lens int64");
+  TORCH_CHECK(out_cache_loc.scalar_type() == at::kLong, "out_cache_loc int64");
+  int bs = req_pool_indices.size(0);
+  auto q = c10::xpu::getCurrentXPUStream().queue();
+  AssignDraftCacheLocsP1Fn k{
+      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+      static_cast<int32_t*>(req_to_token.data_ptr()),
+      static_cast<const int64_t*>(seq_lens.data_ptr()),
+      static_cast<const int64_t*>(out_cache_loc.data_ptr()),
+      req_to_token.size(1), (int)(topk * num_steps)};
+  _eagle_launch_per_req(q, bs, k);
+}
+
+void create_extend_after_decode_spec_info_xpu(
+    at::Tensor verified_id, at::Tensor seq_lens, at::Tensor accept_lens,
+    at::Tensor positions, at::Tensor new_verified_id) {
+  TORCH_CHECK(verified_id.scalar_type() == at::kInt, "verified_id int32");
+  TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "seq_lens int64");
+  TORCH_CHECK(accept_lens.scalar_type() == at::kInt, "accept_lens int32");
+  TORCH_CHECK(positions.scalar_type() == at::kLong, "positions int64");
+  TORCH_CHECK(new_verified_id.scalar_type() == at::kInt, "new_verified_id int32");
+  int bs = seq_lens.size(0);
+  auto q = c10::xpu::getCurrentXPUStream().queue();
+  CreateExtendAfterDecodeFn k{
+      static_cast<const int32_t*>(verified_id.data_ptr()),
+      static_cast<const int64_t*>(seq_lens.data_ptr()),
+      static_cast<const int32_t*>(accept_lens.data_ptr()),
+      static_cast<int64_t*>(positions.data_ptr()),
+      static_cast<int32_t*>(new_verified_id.data_ptr()), bs};
+  _eagle_launch_per_req(q, bs, k);
+}
+
+void align_evict_mask_to_page_size_xpu(
+    at::Tensor seq_lens, at::Tensor evict_mask, int64_t page_size,
+    int64_t num_draft_tokens) {
+  TORCH_CHECK(seq_lens.scalar_type() == at::kLong, "seq_lens int64");
+  TORCH_CHECK(evict_mask.scalar_type() == at::kBool, "evict_mask bool");
+  int bs = seq_lens.size(0);
+  auto q = c10::xpu::getCurrentXPUStream().queue();
+  AlignEvictMaskFn k{
+      static_cast<const int64_t*>(seq_lens.data_ptr()),
+      static_cast<bool*>(evict_mask.data_ptr()),
+      (int)page_size, (int)num_draft_tokens};
+  _eagle_launch_per_req(q, bs, k);
+}
+
+void get_target_cache_loc_xpu(
+    at::Tensor tgt_cache_loc, at::Tensor to_free_slots, at::Tensor accept_length,
+    at::Tensor to_free_num_slots, at::Tensor out_cache_loc,
+    int64_t num_verify_tokens) {
+  TORCH_CHECK(tgt_cache_loc.scalar_type() == at::kLong, "tgt_cache_loc int64");
+  TORCH_CHECK(out_cache_loc.scalar_type() == at::kLong, "out_cache_loc int64");
+  TORCH_CHECK(accept_length.scalar_type() == at::kInt, "accept_length int32");
+  int bs = accept_length.size(0);
+  auto q = c10::xpu::getCurrentXPUStream().queue();
+  GetTargetCacheLocFn k{
+      static_cast<int64_t*>(tgt_cache_loc.data_ptr()),
+      static_cast<int64_t*>(to_free_slots.data_ptr()),
+      static_cast<const int32_t*>(accept_length.data_ptr()),
+      static_cast<const int64_t*>(to_free_num_slots.data_ptr()),
+      static_cast<const int64_t*>(out_cache_loc.data_ptr()),
+      (int)num_verify_tokens};
+  _eagle_launch_per_req(q, bs, k);
+}
+
+void filter_finished_cache_loc_xpu(
+    at::Tensor out_cache_loc, at::Tensor tgt_cache_loc, at::Tensor accept_length,
+    at::Tensor accept_length_filter) {
+  TORCH_CHECK(out_cache_loc.scalar_type() == at::kLong, "out_cache_loc int64");
+  TORCH_CHECK(tgt_cache_loc.scalar_type() == at::kLong, "tgt_cache_loc int64");
+  TORCH_CHECK(accept_length.scalar_type() == at::kInt, "accept_length int32");
+  TORCH_CHECK(accept_length_filter.scalar_type() == at::kInt, "accept_length_filter int32");
+  int bs = accept_length.size(0);
+  auto q = c10::xpu::getCurrentXPUStream().queue();
+  FilterFinishedCacheLocFn k{
+      static_cast<const int64_t*>(out_cache_loc.data_ptr()),
+      static_cast<int64_t*>(tgt_cache_loc.data_ptr()),
+      static_cast<const int32_t*>(accept_length.data_ptr()),
+      static_cast<const int32_t*>(accept_length_filter.data_ptr())};
+  _eagle_launch_per_req(q, bs, k);
+}
+
 TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
+    m.def("assign_draft_cache_locs_p1(Tensor req_pool_indices, Tensor! req_to_token, Tensor seq_lens, Tensor out_cache_loc, int topk, int num_steps) -> ()");
+    m.def("create_extend_after_decode_spec_info_xpu(Tensor verified_id, Tensor seq_lens, Tensor accept_lens, Tensor! positions, Tensor! new_verified_id) -> ()");
+    m.def("align_evict_mask_to_page_size_xpu(Tensor seq_lens, Tensor! evict_mask, int page_size, int num_draft_tokens) -> ()");
+    m.def("get_target_cache_loc_xpu(Tensor! tgt_cache_loc, Tensor! to_free_slots, Tensor accept_length, Tensor to_free_num_slots, Tensor out_cache_loc, int num_verify_tokens) -> ()");
+    m.def("filter_finished_cache_loc_xpu(Tensor out_cache_loc, Tensor! tgt_cache_loc, Tensor accept_length, Tensor accept_length_filter) -> ()");
     m.def("build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> ()");
     m.def("gdn_target_verify(Tensor! out, Tensor q, Tensor k, Tensor v, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, Tensor ssm_state, Tensor! intermediate, Tensor query_start_loc, Tensor cache_indices, Tensor inter_indices, int cache_steps) -> ()");
     m.def("gdn_fused_verify(Tensor! out, Tensor! zout, Tensor qkvz, Tensor ba, Tensor conv_w, Tensor? conv_bias, Tensor conv_state, Tensor A_log, Tensor dt_bias, Tensor ssm_state, Tensor! inter_ssm, Tensor! inter_conv, Tensor query_start_loc, Tensor cache_indices, Tensor inter_indices, int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, int activation, int cache_steps) -> ()");
@@ -1499,6 +1742,11 @@ TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
 }
 
 TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
+    m.impl("assign_draft_cache_locs_p1", &assign_draft_cache_locs_p1);
+    m.impl("create_extend_after_decode_spec_info_xpu", &create_extend_after_decode_spec_info_xpu);
+    m.impl("align_evict_mask_to_page_size_xpu", &align_evict_mask_to_page_size_xpu);
+    m.impl("get_target_cache_loc_xpu", &get_target_cache_loc_xpu);
+    m.impl("filter_finished_cache_loc_xpu", &filter_finished_cache_loc_xpu);
     m.impl("gdn_eagle", &gdn_eagle);
     m.impl("page_attn_decode", &page_attn_decode);
     m.impl("chunk_gated_delta_rule_extend", &chunk_gated_delta_rule_extend);
@@ -1510,6 +1758,11 @@ TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("assign_draft_cache_locs_p1", &assign_draft_cache_locs_p1, "assign_draft_cache_locs_p1");
+    m.def("create_extend_after_decode_spec_info_xpu", &create_extend_after_decode_spec_info_xpu, "create_extend_after_decode_spec_info_xpu");
+    m.def("align_evict_mask_to_page_size_xpu", &align_evict_mask_to_page_size_xpu, "align_evict_mask_to_page_size_xpu");
+    m.def("get_target_cache_loc_xpu", &get_target_cache_loc_xpu, "get_target_cache_loc_xpu");
+    m.def("filter_finished_cache_loc_xpu", &filter_finished_cache_loc_xpu, "filter_finished_cache_loc_xpu");
     m.def("gdn_eagle", &gdn_eagle, "gdn_eagle");
     m.def("page_attn_decode", &page_attn_decode, "page_attn_decode");
     m.def("chunk_gated_delta_rule_extend", &chunk_gated_delta_rule_extend, "chunk_gated_delta_rule_extend");
