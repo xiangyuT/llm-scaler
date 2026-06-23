@@ -57,26 +57,26 @@ ext_modules.append(
 ### for lgrf esimd kernels
 
 ### MoE auxiliary kernels — no DPAS, standard compilation
-# [skip-ptl-moe-aux] ext_modules.append(
-# [skip-ptl-moe-aux]     SyclExtension(
-# [skip-ptl-moe-aux]         name="custom_esimd_kernels_sglang.custom_esimd_kernels_moe",
-# [skip-ptl-moe-aux]         sources=[
-# [skip-ptl-moe-aux]             "csrc/xpu/esimd_kernel_moe.sycl",
-# [skip-ptl-moe-aux]             "csrc/xpu/torch_extension_moe.cc",
-# [skip-ptl-moe-aux]         ],
-# [skip-ptl-moe-aux]         include_dirs=[
-# [skip-ptl-moe-aux]             root / "include",
-# [skip-ptl-moe-aux]             root / "csrc",
-# [skip-ptl-moe-aux]         ],
-# [skip-ptl-moe-aux]         extra_compile_args={
-# [skip-ptl-moe-aux]             "cxx": ["-O3", "-std=c++17"],
-# [skip-ptl-moe-aux]             "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
-# [skip-ptl-moe-aux]                      f"-I{torch_include}"],
-# [skip-ptl-moe-aux]         },
-# [skip-ptl-moe-aux]         extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
-# [skip-ptl-moe-aux]         py_limited_api=False,
-# [skip-ptl-moe-aux]     )
-# [skip-ptl-moe-aux] )
+ext_modules.append(
+    SyclExtension(
+        name="custom_esimd_kernels_sglang.custom_esimd_kernels_moe",
+        sources=[
+            "csrc/xpu/esimd_kernel_moe.sycl",
+            "csrc/xpu/torch_extension_moe.cc",
+        ],
+        include_dirs=[
+            root / "include",
+            root / "csrc",
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "sycl": ["-ffast-math", "-fsycl-device-code-split=per_kernel",
+                     f"-I{torch_include}"],
+        },
+        extra_link_args=["-Wl,-rpath,$ORIGIN/../../torch/lib"],
+        py_limited_api=False,
+    )
+)
 ### MoE auxiliary kernels
 
 ### FP8 GEMM (M>1) — uses DPAS, compile with JIT only (no AOT to avoid device mismatch)
