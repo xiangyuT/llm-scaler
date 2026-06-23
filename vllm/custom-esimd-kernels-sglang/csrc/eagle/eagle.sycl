@@ -1626,6 +1626,44 @@ struct FilterFinishedCacheLocFn {
   }
 };
 
+// --- mamba_state_scatter ---
+// MTP mamba-state rollback: for each request r with step_idx[r] >= 0 (and in-bounds),
+//   dst[:, dst_idx[r], :] = src[:, r, step_idx[r], :]   over ALL layers + full state.
+// Replaces the torch advanced-index (gathered=src[:,vr,vs]; dst[:,vd]=gathered) which
+// MATERIALIZES the gather on a [L,spec,draft,*state] fp32 tensor (3 round-trips). This
+// is a single masked copy: one work-item per (r, layer, elem). Equivalent to the CUDA
+// triton _fused_mamba_state_scatter_with_mask_kernel; mask/bounds checked in-kernel
+// (no host .any()/.tolist()). dst[L, cache, E]; src[L, R, S, E] (E = prod(state_shape)).
+template <typename T>
+struct MambaStateScatterFn {
+  T* dst;                       // [L, dst_req_size, E]
+  const T* src;                 // [L, src_req_size, src_step_size, E]
+  const int32_t* dst_idx;       // [R]
+  const int32_t* step_idx;      // [R]
+  int64_t L, R, E;
+  int64_t dst_req_size, src_req_size, src_step_size;
+  int64_t dst_layer_stride, src_layer_stride;  // elems per layer
+  void operator()(sycl::nd_item<1> it) const {
+    int64_t gid = it.get_global_id(0);
+    int64_t total = R * L * E;
+    if (gid >= total) return;
+    int64_t e = gid % E;
+    int64_t tmp = gid / E;
+    int64_t l = tmp % L;
+    int64_t r = tmp / L;
+    int s = step_idx[r];
+    if (s < 0) return;                       // masked-out request
+    int d = dst_idx[r];
+    if (d < 0 || d >= dst_req_size) return;  // bounds (mirror triton)
+    if (r >= src_req_size || s >= src_step_size) return;
+    // src[l, r, s, e]
+    int64_t src_off = l * src_layer_stride + (r * src_step_size + (int64_t)s) * E + e;
+    // dst[l, d, e]
+    int64_t dst_off = l * dst_layer_stride + (int64_t)d * E + e;
+    dst[dst_off] = src[src_off];
+  }
+};
+
 }  // namespace
 
 template <typename K>
@@ -1723,6 +1761,49 @@ void filter_finished_cache_loc_xpu(
   _eagle_launch_per_req(q, bs, k);
 }
 
+void mamba_state_scatter(
+    at::Tensor dst, at::Tensor src, at::Tensor dst_indices, at::Tensor step_indices) {
+  // dst [L, cache, *state]; src [L, R(spec), S(draft), *state]; idx [R] int32.
+  TORCH_CHECK(dst_indices.scalar_type() == at::kInt, "dst_indices int32");
+  TORCH_CHECK(step_indices.scalar_type() == at::kInt, "step_indices int32");
+  TORCH_CHECK(dst.scalar_type() == src.scalar_type(), "dst/src dtype mismatch");
+  TORCH_CHECK(dst.dim() >= 2 && src.dim() >= 3, "rank: dst>=2, src>=3");
+  TORCH_CHECK(dst.is_contiguous() && src.is_contiguous(), "dst/src must be contiguous");
+  int64_t L = dst.size(0);
+  int64_t dst_req_size = dst.size(1);
+  int64_t src_req_size = src.size(1);
+  int64_t src_step_size = src.size(2);
+  int64_t R = step_indices.size(0);
+  // E = prod(trailing state dims) — dst trailing == src trailing (skip L,req[,step]).
+  int64_t E = 1;
+  for (int i = 2; i < dst.dim(); ++i) E *= dst.size(i);
+  int64_t dst_layer_stride = dst_req_size * E;
+  int64_t src_layer_stride = src_req_size * src_step_size * E;
+  int64_t total = R * L * E;
+  if (total <= 0) return;
+  auto q = c10::xpu::getCurrentXPUStream().queue();
+  const int WG = 256;
+  size_t global = ((size_t)(total + WG - 1) / WG) * WG;
+  const int32_t* dip = static_cast<const int32_t*>(dst_indices.data_ptr());
+  const int32_t* sip = static_cast<const int32_t*>(step_indices.data_ptr());
+#define MSS_LAUNCH(T_)                                                            \
+  do {                                                                           \
+    MambaStateScatterFn<T_> k{                                                   \
+        static_cast<T_*>(dst.data_ptr()), static_cast<const T_*>(src.data_ptr()),\
+        dip, sip, L, R, E, dst_req_size, src_req_size, src_step_size,            \
+        dst_layer_stride, src_layer_stride};                                     \
+    q.submit([&](sycl::handler& h) {                                             \
+      h.parallel_for(sycl::nd_range<1>(global, WG), k);                          \
+    });                                                                          \
+  } while (0)
+  auto st = dst.scalar_type();
+  if (st == at::kFloat) MSS_LAUNCH(float);
+  else if (st == at::kHalf) MSS_LAUNCH(sycl::half);
+  else if (st == at::kBFloat16) MSS_LAUNCH(uint16_t);  // bitwise copy; no math
+  else TORCH_CHECK(false, "mamba_state_scatter: unsupported dtype");
+#undef MSS_LAUNCH
+}
+
 TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("assign_draft_cache_locs_p1(Tensor req_pool_indices, Tensor! req_to_token, Tensor seq_lens, Tensor out_cache_loc, int topk, int num_steps) -> ()");
     m.def("create_extend_after_decode_spec_info_xpu(Tensor verified_id, Tensor seq_lens, Tensor accept_lens, Tensor! positions, Tensor! new_verified_id) -> ()");
@@ -1737,6 +1818,7 @@ TORCH_LIBRARY_FRAGMENT(eagle_ops, m) {
     m.def("gdn_eagle(Tensor! qkvz, Tensor! z_out, Tensor conv_w, Tensor? conv_b, Tensor! conv_state, Tensor accepted_tokens, Tensor ba, Tensor a_log, Tensor dt_bias, Tensor! state_in, Tensor ssm_state_idx, Tensor norm_w, int max_query_len) -> Tensor");
     m.def("page_attn_decode(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor seq_lens, Tensor! out, int max_query_len, int max_seq_len, Tensor(a!)? temp_p=None) -> ()");
     m.def("chunk_gated_delta_rule_extend(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, Tensor! initial_state, Tensor cu_seqlens, float scale) -> (Tensor, Tensor)");
+    m.def("mamba_state_scatter(Tensor! dst, Tensor src, Tensor dst_indices, Tensor step_indices) -> ()");
     // Contract: q/k/v/initial_state are fp16 or bf16 (all same); g and beta are fp32
     // (both emitted by fused_gdn_gating). cu_seqlens is int32.
 }
@@ -1755,6 +1837,7 @@ TORCH_LIBRARY_IMPL(eagle_ops, XPU, m) {
     m.impl("gdn_target_verify", &gdn_target_verify);
     m.impl("gdn_fused_verify", &gdn_fused_verify);
     m.impl("causal_conv1d_verify", &causal_conv1d_verify);
+    m.impl("mamba_state_scatter", &mamba_state_scatter);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1771,4 +1854,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gdn_target_verify", &gdn_target_verify, "gdn_target_verify");
     m.def("gdn_fused_verify", &gdn_fused_verify, "gdn_fused_verify");
     m.def("causal_conv1d_verify", &causal_conv1d_verify, "causal_conv1d_verify");
+    m.def("mamba_state_scatter", &mamba_state_scatter, "mamba_state_scatter");
 }
