@@ -59,20 +59,23 @@ def test_kitchen_rope_pair_allows_different_query_key_shapes():
     torch.testing.assert_close(k_out, _adjacent_reference(k, freqs), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("freqs_dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("split_half", [False, True])
-def test_kitchen_rope_pair_same_shape(freqs_dtype, split_half):
+def test_kitchen_rope_pair_same_shape(dtype, freqs_dtype, split_half):
     if not torch.xpu.is_available():
         pytest.skip("XPU is unavailable")
-    q = torch.randn(2, 3, 17, 64, device="xpu", dtype=torch.bfloat16)
+    q = torch.randn(2, 3, 17, 64, device="xpu", dtype=dtype)
     k = torch.randn_like(q)
     freqs = torch.randn(2, 1, 17, 32, 2, 2, device="xpu", dtype=freqs_dtype)
     if split_half:
         q_out, k_out = rotary.apply_kitchen_rope_split_half(q, k, freqs)
-        q_expected, k_expected = _split_reference(q, freqs), _split_reference(k, freqs)
+        q_expected = rotary.apply_kitchen_rope_split_half1(q, freqs)
+        k_expected = rotary.apply_kitchen_rope_split_half1(k, freqs)
     else:
         q_out, k_out = rotary.apply_kitchen_rope(q, k, freqs)
-        q_expected, k_expected = _adjacent_reference(q, freqs), _adjacent_reference(k, freqs)
+        q_expected = rotary.apply_kitchen_rope1(q, freqs)
+        k_expected = rotary.apply_kitchen_rope1(k, freqs)
     torch.testing.assert_close(q_out, q_expected, rtol=0, atol=0)
     torch.testing.assert_close(k_out, k_expected, rtol=0, atol=0)
 

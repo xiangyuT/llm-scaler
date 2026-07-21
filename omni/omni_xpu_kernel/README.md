@@ -502,6 +502,9 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
   attention policies.
 - Batched GGUF dequantization dispatches each input allocation directly to
   avoid packed-input concatenation.
+- Same-shape Kitchen RoPE pairs share index calculation and frequency loads
+  with a BMG-tuned work-group size of 32. Different Q/K shapes retain the
+  established dispatch.
 - The PTL-specific oneDNN workaround described below is guarded by runtime
   architecture and does not change the BMG path.
 
@@ -515,8 +518,9 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
   used as a chunk of the `N=12288` FP8 workflow shape. The implementation uses
   an `N=2048` chunk only on `intel_gpu_ptl_h`; BF16 and non-PTL paths retain the
   existing chunk selection.
-- Same-shape Kitchen RoPE pairs share index calculation and frequency loads on
-  PTL-H. Different Q/K shapes and BMG retain the established dispatch.
+- Same-shape Kitchen RoPE pairs share index calculation and frequency loads
+  with a PTL-H-tuned work-group size of 128. Different Q/K shapes retain the
+  established dispatch.
 - Deterministic BF16/FP16 ConvRot weight quantization with group size 64 or 256
   uses a fused radix-4 transform and rowwise quantization path on PTL-H.
   Stochastic and unsupported shapes retain the composed implementation.
