@@ -59,7 +59,7 @@ static void fused_smooth_convert_kernel(
 #if defined(OMNI_XPU_ARCH_PTL_H)
 #define OMNI_SVDQ_SMOOTH_DIV_ELEMENTS_PER_WI 256
 #elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_SVDQ_SMOOTH_DIV_ELEMENTS_PER_WI 32
+#define OMNI_SVDQ_SMOOTH_DIV_ELEMENTS_PER_WI 256
 #else
 #error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
 #endif
