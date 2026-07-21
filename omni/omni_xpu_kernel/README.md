@@ -520,12 +520,12 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
 - Deterministic BF16/FP16 ConvRot weight quantization with group size 64 or 256
   uses a fused radix-4 transform and rowwise quantization path on PTL-H.
   Stochastic and unsupported shapes retain the composed implementation.
-- BF16 per-tensor FP8 quantization and stochastic FP8 rounding encode the final
-  FP8 bytes directly on PTL-H; stochastic rounding also folds supported input
-  conversion into that kernel. Other quantization input types and BMG retain
-  the validated PyTorch cast path.
+- BF16 per-tensor FP8 quantization encodes final FP8 bytes directly on PTL-H.
+  Stochastic FP8 rounding does the same on PTL-H and BMG, and also folds
+  supported input conversion into that kernel. Other quantization input types
+  retain the validated PyTorch cast path.
 - Batched GGUF dequantization dispatches each input allocation directly on
-  PTL-H to avoid packed-input concatenation.
+  PTL-H and BMG to avoid packed-input concatenation.
 
 The PTL-H configuration validated on 2026-07-20 was:
 

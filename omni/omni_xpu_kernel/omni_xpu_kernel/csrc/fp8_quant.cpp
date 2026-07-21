@@ -27,6 +27,14 @@ namespace {
 #endif
 #endif
 
+#ifndef OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM
+#if defined(OMNI_XPU_ARCH_BMG)
+#define OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM 6
+#else
+#define OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM 8
+#endif
+#endif
+
 double fp8_max(torch::ScalarType dtype) {
     if (dtype == torch::kFloat8_e4m3fn) return 448.0;
     if (dtype == torch::kFloat8_e5m2) return 57344.0;
@@ -256,13 +264,22 @@ torch::Tensor quantize_per_tensor_fused(
     return prepared.to(out_dtype);
 }
 
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
 template<int ExponentBits, int MantissaBits, int ExponentBias>
 uint8_t encode_exact_fp16(fp16 value) {
     const uint16_t bits = sycl::bit_cast<uint16_t>(value);
     const uint8_t sign = static_cast<uint8_t>((bits >> 8) & 0x80);
     const uint16_t magnitude = bits & uint16_t(0x7fff);
-    if (magnitude == 0) return 0;
+    if (magnitude == 0) {
+#if defined(OMNI_XPU_ARCH_BMG)
+        // BMG's native FP16-to-FP8 cast preserves the sign when a negative
+        // nonzero stochastic result underflows to zero. Exact -0 input is
+        // canonicalized earlier to +0 by the torch.sign contract.
+        return sign;
+#else
+        return 0;
+#endif
+    }
     if (magnitude >= uint16_t(0x7c00)) {
         if (magnitude > uint16_t(0x7c00)) return sign | uint8_t(0x7f);
         if constexpr (ExponentBits == 4) {
@@ -329,11 +346,10 @@ torch::Tensor stochastic_rounding_fused(
         converted = input.to(torch::kHalf);
         input_ptr = reinterpret_cast<const InputT*>(converted.data_ptr());
     }
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
     // The stochastic result is already exactly representable in the selected
-    // FP8 format. Encode it directly on PTL-H to avoid a temporary FP16 tensor
-    // and the separate PyTorch cast kernel. Keep the established two-stage
-    // path on BMG until this code path has been validated there.
+    // FP8 format. Encode it directly on supported Intel GPU architectures to
+    // avoid a temporary FP16 tensor and the separate PyTorch cast kernel.
     auto output = torch::empty(input.sizes(), input.options().dtype(out_dtype));
     using OutputT = uint8_t;
 #else
@@ -342,7 +358,7 @@ torch::Tensor stochastic_rounding_fused(
 #endif
     const int64_t numel = input.numel();
     if (numel == 0) {
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
         return output;
 #else
         return rounded.to(out_dtype);
@@ -350,7 +366,7 @@ torch::Tensor stochastic_rounding_fused(
     }
 
     const auto* rng_ptr = rng.data_ptr<uint8_t>();
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
     auto* out_ptr = reinterpret_cast<OutputT*>(output.data_ptr());
 #else
     auto* out_ptr = reinterpret_cast<OutputT*>(rounded.data_ptr<at::Half>());
@@ -361,7 +377,8 @@ torch::Tensor stochastic_rounding_fused(
     const fp16 denorm_base = static_cast<fp16>(std::exp2(-ExponentBias + 1));
     const fp16 limit_h = static_cast<fp16>(limit);
 
-    constexpr int ElementsPerWorkItem = 8;
+    constexpr int ElementsPerWorkItem =
+        OMNI_FP8_STOCHASTIC_ELEMENTS_PER_WORK_ITEM;
     const int64_t work_items =
         (numel + ElementsPerWorkItem - 1) / ElementsPerWorkItem;
     auto cgf = [&](sycl::handler& handle) {
@@ -488,7 +505,7 @@ torch::Tensor stochastic_rounding_fused(
         });
     };
     utils::submit_kernel(cgf, input.device(), "fp8_stochastic_rounding_fused");
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
     return output;
 #else
     return rounded.to(out_dtype);
@@ -552,7 +569,7 @@ torch::Tensor stochastic_rounding(
     }                                                                    \
     return stochastic_rounding_fused<InputT, true, 5, 2, 15>(            \
         input, rng, out_dtype, limit)
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
     if (input.scalar_type() == torch::kFloat) {
         DISPATCH_STOCHASTIC(float);
     }
@@ -563,8 +580,7 @@ torch::Tensor stochastic_rounding(
         DISPATCH_STOCHASTIC(fp16);
     }
 #endif
-    // BMG and uncommon PTL-H input dtypes retain the established
-    // materialized-FP16 input path.
+    // Uncommon input dtypes retain the established materialized-FP16 path.
     if (out_dtype == torch::kFloat8_e4m3fn) {
         return stochastic_rounding_fused<fp16, false, 4, 3, 7>(
             input, rng, out_dtype, limit);
