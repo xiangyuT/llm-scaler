@@ -99,9 +99,8 @@ def dequantize_batch(
     """
     Batch dequantize multiple tensors with platform-selected dispatch.
 
-    BMG groups tensors by format and uses one concatenated launch per format.
-    PTL-H launches directly from each original allocation because avoiding the
-    packed-input concatenation is faster on that platform.
+    BMG and PTL-H launch directly from each original allocation because
+    avoiding packed-input concatenation is faster on both platforms.
 
     Args:
         inputs: List of uint8 tensors (quantized data on XPU)

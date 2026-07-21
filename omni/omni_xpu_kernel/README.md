@@ -500,6 +500,8 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
 - `bmg` remains the default AOT target.
 - LGRF `ConfigBMG` and CUTE `ConfigBMG` are the currently performance-tuned
   attention policies.
+- Batched GGUF dequantization dispatches each input allocation directly to
+  avoid packed-input concatenation.
 - The PTL-specific oneDNN workaround described below is guarded by runtime
   architecture and does not change the BMG path.
 
@@ -523,7 +525,7 @@ still be selected explicitly by setting both `ONEDNN_INCLUDE` and
   conversion into that kernel. Other quantization input types and BMG retain
   the validated PyTorch cast path.
 - Batched GGUF dequantization dispatches each input allocation directly on
-  PTL-H to avoid packed-input concatenation. BMG retains grouped concatenation.
+  PTL-H to avoid packed-input concatenation.
 
 The PTL-H configuration validated on 2026-07-20 was:
 
