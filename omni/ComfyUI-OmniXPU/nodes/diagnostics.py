@@ -70,7 +70,7 @@ class OmniXPUStatus:
             except Exception:
                 pass
 
-        # Fused INT8 FFN routing stats
+        # Shared INT8 FFN/QKV routing stats
         int8_ffn = sys.modules.get(f"{_PKG}.patches.patch_int8_ffn")
         if int8_ffn and hasattr(int8_ffn, "get_stats"):
             try:
@@ -78,8 +78,8 @@ class OmniXPUStatus:
                 if stats["routed"] or stats["fallback"]:
                     lines.append("")
                     lines.append(
-                        "  INT8 FFN calls: "
-                        f"fused={stats['routed']} fallback={stats['fallback']}"
+                        "  INT8 shared routes: "
+                        f"routed={stats['routed']} fallback={stats['fallback']}"
                     )
                     for reason, count in sorted(
                         stats["reasons"].items(), key=lambda item: -item[1]

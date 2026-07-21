@@ -19,7 +19,7 @@ Requires `omni_xpu_kernel` installed. Without it the node loads silently with no
 | ESIMD LayerNorm/RMSNorm | `LayerNorm.forward` / `RMSNorm.forward` / `rms_norm()` |
 | FP8 GEMM | `fp8_linear` / `mixed_precision_ops` |
 | INT8 Linear | `comfy_kitchen::int8_linear` (oneDNN s8 GEMM) |
-| Fused INT8 SwiGLU FFN | Eligible Lumina/Z-Image `FeedForward` blocks |
+| Shared INT8 projections | Eligible Lumina/Z-Image/OmniGen2/Boogu FFN and QKV blocks |
 | FP8 Negative Zero Fix | `manual_stochastic_round_to_float8` |
 | Interpolate Fix | `F.interpolate` |
 | Median Fix | `torch.median` / `torch.nanmedian` (XPU dim-reduction) |
@@ -36,7 +36,7 @@ OMNIXPU_NORM=0              # Disable ESIMD LayerNorm/RMSNorm only
 OMNIXPU_KREA2_RMSNORM=0     # Disable the Krea2-specific local RMSNorm hook only
 OMNIXPU_FP8_GEMM=0          # Disable FP8 GEMM only
 OMNIXPU_INT8=0              # Disable all INT8 routes
-OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN only
+OMNIXPU_INT8_FFN=0          # Disable shared Lumina/OmniGen2/Boogu INT8 routes
 OMNIXPU_FP8_NEG_ZERO_FIX=0  # Disable FP8 negative zero fix only
 OMNIXPU_INTERPOLATE_FIX=0   # Disable interpolate workaround only
 OMNIXPU_MEDIAN_FIX=0        # Disable median workaround only
@@ -83,6 +83,12 @@ including Z-Image INT8 ConvRot, it writes one fused floating SwiGLU result,
 reuses the existing XMX ConvRot, quantizes it, and feeds the result to the
 prequantized projection. This avoids the separate floating SiLU temporary
 without replacing the faster XMX rotation with a slower custom transform.
+
+OmniGen2 and Boogu use a second, exact route. Their split Q/K/V projections
+share one ConvRot and rowwise activation quantization before three
+prequantized GEMMs. Their `linear_1`/`linear_3` FFN pair shares the same input
+work while retaining the original in-place SwiGLU result before `linear_2`.
+Boogu's dual image/instruction attention shares each stream independently.
 
 The route is selected only for resident `TensorWiseINT8Layout` XPU weights
 with matching dtypes and supported ConvRot settings. LoRA or other weight
@@ -146,7 +152,7 @@ When loaded successfully, ComfyUI logs:
 [OmniXPU] attention: applied
 [OmniXPU] INT8: registered XPU impl for comfy_kitchen::int8_linear
 [OmniXPU] int8: applied
-[OmniXPU] INT8 FFN: routed eligible Lumina FeedForward through fused kernels
+[OmniXPU] INT8: routed eligible Lumina FFN and 3 OmniGen2 paths
 [OmniXPU] int8_ffn: applied
 ```
 
