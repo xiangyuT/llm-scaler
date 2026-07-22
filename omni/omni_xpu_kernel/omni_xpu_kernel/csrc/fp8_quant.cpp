@@ -271,10 +271,11 @@ uint8_t encode_exact_fp16(fp16 value) {
     const uint8_t sign = static_cast<uint8_t>((bits >> 8) & 0x80);
     const uint16_t magnitude = bits & uint16_t(0x7fff);
     if (magnitude == 0) {
-#if defined(OMNI_XPU_ARCH_BMG)
-        // BMG's native FP16-to-FP8 cast preserves the sign when a negative
-        // nonzero stochastic result underflows to zero. Exact -0 input is
-        // canonicalized earlier to +0 by the torch.sign contract.
+#if defined(OMNI_XPU_ARCH_BMG) && (TORCH_VERSION_MAJOR == 2) && \
+    (TORCH_VERSION_MINOR < 11)
+        // Torch 2.10's BMG cast preserves the sign when a negative nonzero
+        // stochastic result underflows to zero. Torch 2.11+ canonicalizes the
+        // same result to +0, so match the installed Torch conversion contract.
         return sign;
 #else
         return 0;
