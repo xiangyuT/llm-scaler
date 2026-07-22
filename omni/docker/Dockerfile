@@ -69,6 +69,7 @@ SHELL ["bash", "-c"]
 # maintained as part of the OMIX devel base image.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
         ca-certificates curl ffmpeg git patch \
@@ -376,6 +377,7 @@ SHELL ["bash", "-c"]
 # is intentionally not reinstalled from a separate apt repository.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources && \
     apt-get update -y && \
     apt-get install -y --no-install-recommends --fix-missing \
         ca-certificates curl ffmpeg git patch \
