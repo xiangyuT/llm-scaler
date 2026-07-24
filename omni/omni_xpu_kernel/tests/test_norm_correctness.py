@@ -93,9 +93,9 @@ class TestRMSNormCorrectness:
             norm.rms_norm(weight, input)
 
     @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
-    @pytest.mark.parametrize("rows", [1024, 1920])
+    @pytest.mark.parametrize("rows", [960, 4095, 4096, 122880])
     def test_rms_norm_h128_bf16_correctness(self, rows):
-        """Cover the PTL-H bulk-row H128 specialization and generic fallback."""
+        """Cover the PTL-H BF16 route and generic fallback on other targets."""
         from omni_xpu_kernel import norm
 
         torch.manual_seed(rows)
@@ -112,9 +112,9 @@ class TestRMSNormCorrectness:
         torch.testing.assert_close(output_esimd, output_ref, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
-    @pytest.mark.parametrize("rows", [1024, 50304])
+    @pytest.mark.parametrize("rows", [1023, 4095, 4096, 50304, 201216])
     def test_rms_norm_h128_fp32_correctness(self, rows):
-        """Cover the PTL-H FP32 H128 route used by Krea2 Q/K normalization."""
+        """Cover validated target FP32 H128 routes used by Krea2 Q/K normalization."""
         from omni_xpu_kernel import norm
 
         torch.manual_seed(128 + rows)
