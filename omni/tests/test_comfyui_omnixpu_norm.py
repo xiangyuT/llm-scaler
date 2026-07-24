@@ -63,7 +63,7 @@ class _FakeTensor:
         return self
 
 
-def test_h120_requires_ptl_capability(monkeypatch):
+def test_h120_requires_native_capability(monkeypatch):
     patch = _load_patch(monkeypatch)
     patch._omni_norm = object()
     value = _FakeTensor(120)
@@ -74,6 +74,14 @@ def test_h120_requires_ptl_capability(monkeypatch):
     patch._allow_h120_rms = True
     assert patch._rms_input_2d(value) is value
     assert value.reshaped_to == (-1, 120)
+
+
+def test_h120_targets_are_explicit(monkeypatch):
+    patch = _load_patch(monkeypatch)
+
+    assert patch._target_supports_h120("ptl-h")
+    assert patch._target_supports_h120("bmg")
+    assert not patch._target_supports_h120("unknown")
 
 
 def test_existing_multiple_of_32_route_is_unchanged(monkeypatch):

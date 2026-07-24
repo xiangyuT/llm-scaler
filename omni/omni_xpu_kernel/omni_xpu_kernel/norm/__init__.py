@@ -50,7 +50,8 @@ def rms_norm(
     Note:
         - Input must be 2D tensor [batch_size, hidden_size]
         - hidden_size must be <= 8192 and divisible by 32, except that a
-          PTL-H binary may additionally advertise native FP16 H120 support
+          validated PTL-H or BMG binary may additionally advertise native
+          FP16 H120 support
         - Supports fp32, fp16, bf16
     """
     return _get_native().rms_norm(weight, input, eps)

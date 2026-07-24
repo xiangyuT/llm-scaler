@@ -21,6 +21,10 @@ _allow_noncontiguous_rms = False
 _allow_h120_rms = False
 
 
+def _target_supports_h120(target):
+    return target in {"ptl-h", "bmg"}
+
+
 def _can_use_omni(x):
     if _omni_norm is None or not x.is_xpu:
         return False
@@ -106,7 +110,7 @@ def apply():
         )
         supports_h120 = getattr(_omni_norm, "supports_h120_fp16", None)
         _allow_h120_rms = (
-            target == "ptl-h"
+            _target_supports_h120(target)
             and callable(supports_h120)
             and supports_h120()
             and os.environ.get("OMNIXPU_H120_RMSNORM", "1") != "0"

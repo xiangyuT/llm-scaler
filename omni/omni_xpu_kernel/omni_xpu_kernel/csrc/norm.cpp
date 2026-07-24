@@ -19,28 +19,14 @@ using namespace sycl::ext::intel::esimd;
 namespace omni_xpu {
 namespace norm {
 
-#if defined(OMNI_XPU_ARCH_PTL_H)
-// Z-Image and Krea2 attention projections normalize large batches of
-// contiguous H128 Q/K rows. The generic H128 kernel assigns four work-items
-// to every row, reserves its maximum 8K-element SLM cache, and crosses a
-// work-group barrier. For sufficiently many short rows, one PTL-H work-item
-// per row is faster: it retains the 128 inputs in GRF and only uses four SLM
-// floats. Z-Image reaches this route as BF16; Krea2 uses FP32 to preserve its
-// model-defined accumulation semantics.
-struct RmsNormH128PTLConfig {
-    static constexpr int HiddenSize = 128;
-    static constexpr int BlockSize = 32;
-    static constexpr int Blocks = HiddenSize / BlockSize;
-    static constexpr int MinimumRows = 1024;
-    static constexpr int PartialBytes =
-        ((Blocks * static_cast<int>(sizeof(float)) + 15) / 16) * 16;
-};
-
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
 // Boogu Image uses FP16 Q/K heads with D=120. This hidden size cannot enter
 // the generic power-of-two block dispatch. One ESIMD work-item per row keeps
 // the complete head in GRF, performs a 7x16 + 8 reduction, and removes the
-// multi-kernel PyTorch RMSNorm decomposition.
-struct RmsNormH120FP16PTLConfig {
+// multi-kernel PyTorch RMSNorm decomposition. PTL-H and BMG independently
+// validated the same one-WI geometry; keep distinct kernel identities so
+// platform-specific traces and AOT images remain unambiguous.
+struct RmsNormH120FP16Config {
     static constexpr int HiddenSize = 120;
     static constexpr int WideBlockSize = 16;
     static constexpr int WideBlocks = 7;
@@ -48,28 +34,13 @@ struct RmsNormH120FP16PTLConfig {
     static constexpr int TailOffset = WideBlockSize * WideBlocks;
 };
 
+#if defined(OMNI_XPU_ARCH_PTL_H)
 class RmsNormH120FP16PTLKernel;
-class RmsNormH128PTLKernel;
-class RmsNormH128FP32PTLKernel;
+#else
+class RmsNormH120FP16BMGKernel;
+#endif
 
-// Z-Image applies a second RMSNorm immediately before a BF16 gate multiply
-// and BF16 residual add. At its H3840 workflow shapes, keeping all three
-// operations in one kernel removes two materialized intermediates while
-// preserving the two reduced-precision boundaries explicitly.
-struct RmsNormGateResidualH3840PTLConfig {
-    static constexpr int HiddenSize = 3840;
-    static constexpr int BlockSize = 64;
-    static constexpr int GroupSize = 32;
-    static constexpr int Blocks = HiddenSize / BlockSize;
-    static constexpr int InputBytes = HiddenSize * sizeof(bf16);
-    static constexpr int PartialBytes =
-        ((GroupSize * static_cast<int>(sizeof(float)) + 15) / 16) * 16;
-    static constexpr int SlmBytes = InputBytes + PartialBytes;
-};
-
-class RmsNormGateResidualH3840PTLKernel;
-
-void rms_norm_h120_fp16_ptl_kernel(
+void rms_norm_h120_fp16_kernel(
     const void* weight_ptr,
     const void* input_ptr,
     void* output_ptr,
@@ -77,13 +48,17 @@ void rms_norm_h120_fp16_ptl_kernel(
     const int input_size,
     const at::Device& device
 ) {
-    using Config = RmsNormH120FP16PTLConfig;
+    using Config = RmsNormH120FP16Config;
     const fp16* weight = static_cast<const fp16*>(weight_ptr);
     const fp16* input = static_cast<const fp16*>(input_ptr);
     fp16* output = static_cast<fp16*>(output_ptr);
 
     auto cgf = [&](sycl::handler& handle) {
+#if defined(OMNI_XPU_ARCH_PTL_H)
         handle.parallel_for<RmsNormH120FP16PTLKernel>(
+#else
+        handle.parallel_for<RmsNormH120FP16BMGKernel>(
+#endif
             sycl::range<1>(input_size),
             [=](sycl::item<1> item) SYCL_ESIMD_KERNEL {
                 const int row = item.get_id(0);
@@ -144,8 +119,50 @@ void rms_norm_h120_fp16_ptl_kernel(
                         tail_values * scale * tail_weights));
             });
     };
+#if defined(OMNI_XPU_ARCH_PTL_H)
     utils::submit_kernel(cgf, device, "rms_norm_h120_fp16_ptl");
+#else
+    utils::submit_kernel(cgf, device, "rms_norm_h120_fp16_bmg");
+#endif
 }
+#endif
+
+#if defined(OMNI_XPU_ARCH_PTL_H)
+// Z-Image and Krea2 attention projections normalize large batches of
+// contiguous H128 Q/K rows. The generic H128 kernel assigns four work-items
+// to every row, reserves its maximum 8K-element SLM cache, and crosses a
+// work-group barrier. For sufficiently many short rows, one PTL-H work-item
+// per row is faster: it retains the 128 inputs in GRF and only uses four SLM
+// floats. Z-Image reaches this route as BF16; Krea2 uses FP32 to preserve its
+// model-defined accumulation semantics.
+struct RmsNormH128PTLConfig {
+    static constexpr int HiddenSize = 128;
+    static constexpr int BlockSize = 32;
+    static constexpr int Blocks = HiddenSize / BlockSize;
+    static constexpr int MinimumRows = 1024;
+    static constexpr int PartialBytes =
+        ((Blocks * static_cast<int>(sizeof(float)) + 15) / 16) * 16;
+};
+
+class RmsNormH128PTLKernel;
+class RmsNormH128FP32PTLKernel;
+
+// Z-Image applies a second RMSNorm immediately before a BF16 gate multiply
+// and BF16 residual add. At its H3840 workflow shapes, keeping all three
+// operations in one kernel removes two materialized intermediates while
+// preserving the two reduced-precision boundaries explicitly.
+struct RmsNormGateResidualH3840PTLConfig {
+    static constexpr int HiddenSize = 3840;
+    static constexpr int BlockSize = 64;
+    static constexpr int GroupSize = 32;
+    static constexpr int Blocks = HiddenSize / BlockSize;
+    static constexpr int InputBytes = HiddenSize * sizeof(bf16);
+    static constexpr int PartialBytes =
+        ((GroupSize * static_cast<int>(sizeof(float)) + 15) / 16) * 16;
+    static constexpr int SlmBytes = InputBytes + PartialBytes;
+};
+
+class RmsNormGateResidualH3840PTLKernel;
 
 void rms_norm_h128_ptl_kernel(
     const void* weight_ptr,
@@ -784,10 +801,10 @@ torch::Tensor rms_norm(
     int64_t input_size = input.size(0);
     int64_t hidden_size = input.size(1);
 
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
     const bool supported_hidden_size =
         hidden_size % 32 == 0 ||
-        (hidden_size == RmsNormH120FP16PTLConfig::HiddenSize &&
+        (hidden_size == RmsNormH120FP16Config::HiddenSize &&
          input.scalar_type() == ST::Half);
 #else
     const bool supported_hidden_size = hidden_size % 32 == 0;
@@ -795,19 +812,21 @@ torch::Tensor rms_norm(
     TORCH_CHECK(
         hidden_size > 0 && hidden_size <= 8192 && supported_hidden_size,
         "hidden_size must be nonzero, <=8192, and divisible by 32"
-        " (PTL-H additionally supports FP16 hidden_size=120)");
+        " (PTL-H and BMG additionally support FP16 hidden_size=120)");
 
     auto output = torch::empty({input_size, hidden_size},
         torch::device(input.device()).dtype(input.dtype()));
 
-#if defined(OMNI_XPU_ARCH_PTL_H)
-    if (hidden_size == RmsNormH120FP16PTLConfig::HiddenSize &&
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+    if (hidden_size == RmsNormH120FP16Config::HiddenSize &&
         input.scalar_type() == ST::Half) {
-        rms_norm_h120_fp16_ptl_kernel(
+        rms_norm_h120_fp16_kernel(
             weight.data_ptr(), input.data_ptr(), output.data_ptr(),
             static_cast<float>(eps), input_size, input.device());
         return output;
     }
+#endif
+#if defined(OMNI_XPU_ARCH_PTL_H)
     if (hidden_size == RmsNormH128PTLConfig::HiddenSize &&
         input_size >= RmsNormH128PTLConfig::MinimumRows) {
         if (input.scalar_type() == ST::BFloat16) {

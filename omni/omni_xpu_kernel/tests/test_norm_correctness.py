@@ -57,11 +57,11 @@ class TestRMSNormCorrectness:
     @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
     @pytest.mark.parametrize("rows", [763, 3052, 29435, 117740])
     def test_rms_norm_h120_fp16_correctness(self, rows):
-        """Cover the PTL-H H120 route used by Boogu Q/K normalization."""
+        """Cover the target-validated H120 route used by Boogu Q/K normalization."""
         from omni_xpu_kernel import norm
 
         if not norm.supports_h120_fp16():
-            pytest.skip("loaded binary does not contain the PTL-H H120 route")
+            pytest.skip("loaded binary does not contain a validated H120 route")
 
         torch.manual_seed(120 + rows)
         eps = 1e-5
@@ -84,7 +84,7 @@ class TestRMSNormCorrectness:
         from omni_xpu_kernel import norm
 
         if norm.supports_h120_fp16():
-            pytest.skip("FP16 H120 is supported by the loaded PTL-H binary")
+            pytest.skip("FP16 H120 is supported by the loaded target binary")
 
         input = torch.randn(1, 120, device="xpu", dtype=torch.float16)
         weight = torch.randn(120, device="xpu", dtype=torch.float16)

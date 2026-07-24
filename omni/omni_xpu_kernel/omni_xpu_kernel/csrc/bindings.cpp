@@ -151,7 +151,7 @@ PYBIND11_MODULE(_C, m) {
     // Normalization
     auto norm = m.def_submodule("norm", "Normalization kernels");
 
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
     norm.attr("__h120_fp16__") = true;
 #else
     norm.attr("__h120_fp16__") = false;
