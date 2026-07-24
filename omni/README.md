@@ -111,6 +111,7 @@ Use ComfyUI's Template Browser for maintained upstream workflows.
 
 - [Image build and acceptance](docs/IMAGE_BUILD.md)
 - [ComfyUI usage](docs/COMFYUI.md)
+- [Windows Intel XPU ComfyUI Portable deployment](docs/WINDOWS_PORTABLE.md)
 - [Omni XPU kernel](omni_xpu_kernel/README.md)
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md)
 - [Standalone examples](standalone_examples/)
