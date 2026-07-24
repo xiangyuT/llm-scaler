@@ -46,7 +46,7 @@ XPU_ARCH_MACRO = XPU_ARCH_MACROS[BUILD_XPU_TARGET]
 
 
 def get_core_aot_compile_args(xpu_target):
-    """Return the target-specific flags shared by every Linux core build."""
+    """Return the target-specific flags shared by every core AOT build."""
     if xpu_target not in XPU_ARCH_MACROS:
         supported = ", ".join(XPU_ARCH_MACROS)
         raise RuntimeError(
@@ -225,14 +225,32 @@ def get_onednn_paths():
     candidates.append((pip_include, pip_lib, "pip"))
 
     if IS_WINDOWS:
-        candidates.extend(
-            (Path(root) / "include", Path(root) / "lib", "oneAPI")
-            for root in (
-                "/opt/intel/oneapi/dnnl/2025.1",
-                "/opt/intel/oneapi/dnnl/latest",
-                "/opt/intel/oneapi/2025.1",
-            )
+        oneapi_roots = []
+        for variable in ("DNNLROOT", "ONEDNNROOT"):
+            value = os.environ.get(variable)
+            if value:
+                oneapi_roots.append(Path(value))
+
+        program_roots = (
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
         )
+        for program_root in program_roots:
+            dnnl_root = program_root / "Intel" / "oneAPI" / "dnnl"
+            oneapi_roots.extend(
+                [
+                    dnnl_root / "latest",
+                    dnnl_root / "2025.3",
+                ]
+            )
+
+        seen_roots = set()
+        for root in oneapi_roots:
+            normalized = os.path.normcase(os.path.abspath(root))
+            if normalized in seen_roots:
+                continue
+            seen_roots.add(normalized)
+            candidates.append((root / "include", root / "lib", "oneAPI"))
 
     for include_dir, lib_dir, source in candidates:
         header = include_dir / "oneapi" / "dnnl" / "dnnl.hpp"
@@ -385,6 +403,10 @@ class ICPXBuildExt(build_ext):
                     "-fsycl-targets=spir64_gen",
                     "-Xs", f"-device {BUILD_XPU_TARGET} -options -doubleGRF",
                     "/O2", "/DNDEBUG",
+                    "/EHsc",
+                    "/std:c++17",
+                    "/DNOMINMAX",
+                    "/DWIN32_LEAN_AND_MEAN",
                     "-DBUILD_ESIMD_KERNEL_LIB",
                     f"/D{XPU_ARCH_MACRO}=1",
                     "/LD",  # Create DLL
@@ -395,9 +417,15 @@ class ICPXBuildExt(build_ext):
                 cmd += [str(s) for s in sources]
             else:
                 cmd += [
+                    "-fsycl-targets=spir64_gen",
+                    "-Xsycl-target-backend",
+                    f"-device {BUILD_XPU_TARGET}",
                     "-fsycl-esimd-force-stateless-mem",
                     "/O2", "/DNDEBUG",
                     f"/D{XPU_ARCH_MACRO}=1",
+                    "/DOMNI_XPU_CORE_AOT=1",
+                    "/DNOMINMAX",
+                    "/DWIN32_LEAN_AND_MEAN",
                     "/EHsc",  # Enable C++ exception handling
                     "/std:c++17",
                 ]
@@ -647,6 +675,7 @@ setup(
     install_requires=[
         f"torch=={BUILD_TORCH_VERSION}",
         "onednn==2025.3.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+        "onednn==2025.3.0; platform_system == 'Windows' and platform_machine == 'AMD64'",
     ],
     extras_require={
         "dev": [
@@ -664,6 +693,7 @@ setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "Programming Language :: C++",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
         "Operating System :: POSIX :: Linux",

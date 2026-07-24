@@ -18,6 +18,7 @@ Usage::
 
 import os
 import sys
+from pathlib import Path
 
 from ._version import __torch_version__, __version__, __xpu_target__
 
@@ -25,6 +26,67 @@ __author__ = "Intel"
 
 # Lazy loading of native extension
 _native_module = None
+_dll_dir_handles = []
+_dll_dir_paths = set()
+
+
+def _add_windows_dll_directory(path: Path) -> None:
+    """Register a DLL directory and keep its handle alive."""
+    if not path.is_dir():
+        return
+
+    resolved = path.resolve()
+    if resolved in _dll_dir_paths:
+        return
+
+    _dll_dir_handles.append(os.add_dll_directory(str(resolved)))
+    _dll_dir_paths.add(resolved)
+
+
+def _configure_windows_dll_search_paths() -> None:
+    """Register runtime locations used by Torch XPU, oneDNN, and oneAPI."""
+    if sys.platform != "win32":
+        return
+
+    python_roots = {
+        Path(sys.prefix),
+        Path(sys.executable).resolve().parent,
+    }
+    for python_root in python_roots:
+        _add_windows_dll_directory(python_root / "Library" / "bin")
+        _add_windows_dll_directory(python_root / "DLLs")
+
+    try:
+        import torch
+
+        _add_windows_dll_directory(Path(torch.__file__).resolve().parent / "lib")
+    except Exception:
+        pass
+
+    preferred_version = os.environ.get("OMNI_XPU_ONEAPI_VERSION")
+    program_roots = (
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
+    )
+    for program_root in program_roots:
+        oneapi_root = program_root / "Intel" / "oneAPI"
+        version_names = [preferred_version] if preferred_version else []
+        version_names.append("latest")
+        for version in version_names:
+            if not version:
+                continue
+            for relative in (
+                ("compiler", version, "bin"),
+                ("compiler", version, "bin", "compiler"),
+                ("compiler", version, "bin", "1033"),
+                ("dnnl", version, "bin"),
+                ("ocloc", version, "bin"),
+            ):
+                _add_windows_dll_directory(oneapi_root.joinpath(*relative))
+
+    for raw_path in os.environ.get("OMNI_XPU_DLL_DIRS", "").split(os.pathsep):
+        if raw_path:
+            _add_windows_dll_directory(Path(raw_path))
 
 def _load_extension():
     """Load the native C++ extension module."""
@@ -33,6 +95,7 @@ def _load_extension():
         return _native_module
     
     try:
+        _configure_windows_dll_search_paths()
         from omni_xpu_kernel import _C
         _native_module = _C
         return _native_module
