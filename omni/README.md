@@ -98,7 +98,8 @@ The focused image contains:
 - a pinned upstream ComfyUI checkout;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
 - `comfy-kitchen==0.2.18` from the XPU-enabled
-  [`comfy-kitchen-xpu` main merge](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/acdf65deace1b0ca3b436f45e560ed44f0c0d08f);
+  [`comfy-kitchen-xpu` main branch](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/fead43b4a48a5478e7518e10c0fb065cfb2ba8ac),
+  including the Windows Triton opt-in policy;
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
 - pinned ComfyUI Manager, VideoHelperSuite, Easy-Use, KJNodes, CacheDiT,
   GGUF-XPU, Nunchaku-XPU, and ControlNet auxiliary nodes.
