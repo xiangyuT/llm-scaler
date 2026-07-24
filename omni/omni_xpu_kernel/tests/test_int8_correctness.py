@@ -203,6 +203,8 @@ class TestQuantizeInt8Rowwise:
         ("shape", "dtype"),
         [
             ((1024, 10240), torch.bfloat16),
+            ((4096, 10240), torch.bfloat16),
+            ((4128, 10240), torch.bfloat16),
             ((4192, 6144), torch.bfloat16),
             ((4192, 16384), torch.bfloat16),
             ((4096, 3360), torch.float16),
@@ -211,8 +213,8 @@ class TestQuantizeInt8Rowwise:
             ((4205, 13568), torch.float16),
         ],
     )
-    def test_ptl_workflow_shapes(self, shape, dtype, seed):
-        """PTL-specialized workflow shapes match rowwise QDQ."""
+    def test_target_workflow_shapes(self, shape, dtype, seed):
+        """Target-specialized workflow shapes match rowwise QDQ."""
         from omni_xpu_kernel import int8
 
         native = int8._get_native()

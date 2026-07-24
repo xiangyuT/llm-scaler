@@ -228,6 +228,41 @@ struct RowwiseQuantizeBooguFFNDownPTLConfig {
 #endif
 
 #if defined(OMNI_XPU_ARCH_BMG)
+// BMG large-K BF16 routes use exact workflow shapes. Z-Image produces M=4096
+// and M=4128 K=10240 calls; Krea2 produces M=4192 at K=6144 and K=16384.
+// Process-isolated continuous benchmarks selected VEC8/SG20 for K=10240,
+// VEC8/SG12 for K=6144, and VEC8/SG32 for K=16384. K=6144 SG12 and SG20 were
+// effectively tied in the continuous benchmark; SG12 is the configuration
+// validated end to end. All selected configurations preserve byte-exact
+// Q/scale results.
+struct RowwiseQuantizeZImageBMGConfig {
+    static constexpr int Columns = 10240;
+    static constexpr int ImageRows = 4096;
+    static constexpr int JointRows = 4128;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 20;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 8;
+};
+
+struct RowwiseQuantizeKrea2BMGConfig {
+    static constexpr int Columns = 6144;
+    static constexpr int Rows = 4192;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 12;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 8;
+};
+
+struct RowwiseQuantizeKrea2FFNDownBMGConfig {
+    static constexpr int Columns = 16384;
+    static constexpr int Rows = 4192;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 32;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 8;
+};
+
 // BMG was tuned independently for the same Boogu Image Turbo 1024x1024 FP16
 // shapes. VEC16/SG20, which is the PTL-H winner, regresses BMG's K=3360 route.
 // A process-isolated BMG sweep selected VEC8/SG16 while preserving byte-exact
@@ -642,6 +677,33 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
                 reinterpret_cast<int8_t*>(output.data_ptr()),
                 scales.data_ptr<float>(), M, x.device());
         } else {
+#elif defined(OMNI_XPU_ARCH_BMG)
+        if ((M == RowwiseQuantizeZImageBMGConfig::ImageRows ||
+             M == RowwiseQuantizeZImageBMGConfig::JointRows) &&
+            K == RowwiseQuantizeZImageBMGConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                bf16, RowwiseQuantizeZImageBMGConfig>(
+                reinterpret_cast<const bf16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device(),
+                "quantize_int8_rowwise_large_bmg");
+        } else if (M == RowwiseQuantizeKrea2BMGConfig::Rows &&
+                   K == RowwiseQuantizeKrea2BMGConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                bf16, RowwiseQuantizeKrea2BMGConfig>(
+                reinterpret_cast<const bf16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device(),
+                "quantize_int8_rowwise_large_bmg");
+        } else if (M == RowwiseQuantizeKrea2FFNDownBMGConfig::Rows &&
+                   K == RowwiseQuantizeKrea2FFNDownBMGConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                bf16, RowwiseQuantizeKrea2FFNDownBMGConfig>(
+                reinterpret_cast<const bf16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device(),
+                "quantize_int8_rowwise_large_bmg");
+        } else {
 #endif
         quantize_int8_rowwise_kernel<bf16>(
             reinterpret_cast<const bf16*>(x.data_ptr()),
@@ -649,7 +711,7 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
             scales.data_ptr<float>(),
             M, K, x.device()
         );
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
         }
 #endif
     } else if (x.scalar_type() == torch::kHalf) {
