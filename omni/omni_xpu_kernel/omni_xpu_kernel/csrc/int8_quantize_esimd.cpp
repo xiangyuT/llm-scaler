@@ -159,12 +159,12 @@ void quantize_int8_rowwise_kernel(
     utils::submit_kernel(cgf, device, "quantize_int8_rowwise_sg2pass");
 }
 
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
 #if defined(OMNI_XPU_ARCH_PTL_H)
 // Large PTL BF16 ConvRot activations no longer remain cache-resident between
 // the generic kernel's two global-memory passes. One work-group therefore owns
 // one row, stages it in SLM, and cooperatively performs reduction and
-// quantization. Keep every launch geometry tied to its measured workflow shape;
-// other shapes, dtypes, and BMG retain the generic rowwise path above.
+// quantization. Keep every launch geometry tied to its measured workflow shape.
 struct RowwiseQuantizeLargePTLConfig {
     static constexpr int Columns = 10240;
     static constexpr int MinimumRows = 1024;
@@ -225,7 +225,37 @@ struct RowwiseQuantizeBooguFFNDownPTLConfig {
     static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
     static constexpr int VectorWidth = 16;
 };
+#endif
 
+#if defined(OMNI_XPU_ARCH_BMG)
+// BMG was tuned independently for the same Boogu Image Turbo 1024x1024 FP16
+// shapes. VEC16/SG20, which is the PTL-H winner, regresses BMG's K=3360 route.
+// A process-isolated BMG sweep selected VEC8/SG16 while preserving byte-exact
+// quantized output and scales for both deterministic and random inputs.
+struct RowwiseQuantizeBooguHiddenBMGConfig {
+    static constexpr int Columns = 3360;
+    static constexpr int ImageRows = 4096;
+    static constexpr int JointRows = 4205;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 16;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 8;
+};
+
+struct RowwiseQuantizeBooguFFNDownBMGConfig {
+    static constexpr int Columns = 13568;
+    static constexpr int ImageRows = 4096;
+    static constexpr int JointRows = 4205;
+    static constexpr int SubgroupSize = 32;
+    static constexpr int SubgroupsPerRow = 16;
+    static constexpr int WorkgroupSize = SubgroupSize * SubgroupsPerRow;
+    static constexpr int VectorWidth = 8;
+};
+#endif
+
+// Retain the historical PTL kernel identity so existing PTL traces remain
+// comparable. BMG uses the same SLM algorithm with independently tuned config
+// types and a BMG-specific submission label.
 template <
     typename InputT,
     int Columns,
@@ -239,7 +269,8 @@ void quantize_int8_rowwise_large_ptl_kernel(
     int8_t* __restrict__ output,
     float* __restrict__ scales,
     int64_t rows,
-    const at::Device& device) {
+    const at::Device& device,
+    const char* submission_name = "quantize_int8_rowwise_large_ptl") {
     using InputVector = sycl::vec<InputT, Config::VectorWidth>;
     using OutputVector = sycl::vec<int8_t, Config::VectorWidth>;
     static_assert(Config::WorkgroupSize <= 1024);
@@ -345,8 +376,7 @@ void quantize_int8_rowwise_large_ptl_kernel(
                 }
             });
     };
-    utils::submit_kernel(
-        cgf, device, "quantize_int8_rowwise_large_ptl");
+    utils::submit_kernel(cgf, device, submission_name);
 }
 #endif
 
@@ -641,6 +671,27 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
                 reinterpret_cast<int8_t*>(output.data_ptr()),
                 scales.data_ptr<float>(), M, x.device());
         } else {
+#elif defined(OMNI_XPU_ARCH_BMG)
+        if ((M == RowwiseQuantizeBooguHiddenBMGConfig::ImageRows ||
+             M == RowwiseQuantizeBooguHiddenBMGConfig::JointRows) &&
+            K == RowwiseQuantizeBooguHiddenBMGConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                fp16, RowwiseQuantizeBooguHiddenBMGConfig>(
+                reinterpret_cast<const fp16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device(),
+                "quantize_int8_rowwise_large_bmg");
+        } else if (
+            (M == RowwiseQuantizeBooguFFNDownBMGConfig::ImageRows ||
+             M == RowwiseQuantizeBooguFFNDownBMGConfig::JointRows) &&
+            K == RowwiseQuantizeBooguFFNDownBMGConfig::Columns) {
+            quantize_int8_rowwise_large_ptl_kernel<
+                fp16, RowwiseQuantizeBooguFFNDownBMGConfig>(
+                reinterpret_cast<const fp16*>(x.data_ptr()),
+                reinterpret_cast<int8_t*>(output.data_ptr()),
+                scales.data_ptr<float>(), M, x.device(),
+                "quantize_int8_rowwise_large_bmg");
+        } else {
 #endif
         quantize_int8_rowwise_kernel<fp16>(
             reinterpret_cast<const fp16*>(x.data_ptr()),
@@ -648,7 +699,7 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_rowwise_fused(
             scales.data_ptr<float>(),
             M, K, x.device()
         );
-#if defined(OMNI_XPU_ARCH_PTL_H)
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
         }
 #endif
     } else {
