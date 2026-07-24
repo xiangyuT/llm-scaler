@@ -25,6 +25,10 @@ def _target_supports_h120(target):
     return target in {"ptl-h", "bmg"}
 
 
+def _target_supports_noncontiguous_rms(target):
+    return target in {"ptl-h", "bmg"}
+
+
 def _can_use_omni(x):
     if _omni_norm is None or not x.is_xpu:
         return False
@@ -47,9 +51,10 @@ def _rms_input_2d(x):
         # Lumina/Z-Image Q and K are views into a combined QKV projection. The
         # last dimension is dense, but every token has a gap after the selected
         # projection. Torch decomposes RMSNorm on this layout into several
-        # large elementwise/reduction kernels. On PTL it is faster to make one
-        # dense copy and then use the ESIMD RMSNorm kernel. Keep other targets
-        # on their validated route until they receive their own workflow A/B.
+        # large elementwise/reduction kernels. On PTL-H and BMG it is faster
+        # to make one dense copy and then use the ESIMD RMSNorm kernel. Keep
+        # other targets on their fallback until they receive their own
+        # workflow A/B.
         if (
             not _allow_noncontiguous_rms
             or x.ndim != 4
@@ -105,7 +110,7 @@ def apply():
 
         target = getattr(_omni_package, "__xpu_target__", "")
         _allow_noncontiguous_rms = (
-            target == "ptl-h"
+            _target_supports_noncontiguous_rms(target)
             and os.environ.get("OMNIXPU_NONCONTIG_RMSNORM", "1") != "0"
         )
         supports_h120 = getattr(_omni_norm, "supports_h120_fp16", None)

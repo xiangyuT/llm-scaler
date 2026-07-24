@@ -63,6 +63,30 @@ class _FakeTensor:
         return self
 
 
+class _FakeSplitQKVTensor:
+    def __init__(self, length: int = 4096):
+        self.shape = (1, length, 30, 128)
+        self.ndim = 4
+        self.is_xpu = True
+        self.reshaped_to = None
+        self.materialized = False
+        self._stride = (length * 11520, 11520, 128, 1)
+
+    def is_contiguous(self):
+        return self.materialized
+
+    def stride(self, dimension):
+        return self._stride[dimension]
+
+    def contiguous(self):
+        self.materialized = True
+        return self
+
+    def reshape(self, *shape):
+        self.reshaped_to = shape
+        return self
+
+
 def test_h120_requires_native_capability(monkeypatch):
     patch = _load_patch(monkeypatch)
     patch._omni_norm = object()
@@ -82,6 +106,29 @@ def test_h120_targets_are_explicit(monkeypatch):
     assert patch._target_supports_h120("ptl-h")
     assert patch._target_supports_h120("bmg")
     assert not patch._target_supports_h120("unknown")
+
+
+def test_noncontiguous_rms_targets_are_explicit(monkeypatch):
+    patch = _load_patch(monkeypatch)
+
+    assert patch._target_supports_noncontiguous_rms("ptl-h")
+    assert patch._target_supports_noncontiguous_rms("bmg")
+    assert not patch._target_supports_noncontiguous_rms("unknown")
+
+
+def test_split_qkv_rms_materializes_only_when_enabled(monkeypatch):
+    patch = _load_patch(monkeypatch)
+    patch._omni_norm = object()
+    value = _FakeSplitQKVTensor()
+
+    patch._allow_noncontiguous_rms = False
+    assert patch._rms_input_2d(value) is None
+    assert not value.materialized
+
+    patch._allow_noncontiguous_rms = True
+    assert patch._rms_input_2d(value) is value
+    assert value.materialized
+    assert value.reshaped_to == (-1, 128)
 
 
 def test_existing_multiple_of_32_route_is_unchanged(monkeypatch):
