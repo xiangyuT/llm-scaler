@@ -30,6 +30,29 @@ def supports_h120_fp16() -> bool:
     return bool(getattr(_get_native(), "__h120_fp16__", False))
 
 
+def supports_group_norm_bmg() -> bool:
+    """Return whether the loaded native binary contains the BMG GroupNorm route."""
+    return bool(getattr(_get_native(), "__group_norm_bmg__", False))
+
+
+def group_norm_bmg(
+    input: torch.Tensor,
+    num_groups: int,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Run the validated BMG Boogu Image Turbo GroupNorm contracts.
+
+    The native entry point accepts contiguous BF16 XPU tensors for the six
+    captured ``[1,C,H,W]`` shapes, 32 groups, affine BF16 parameters, and
+    ``eps=1e-6``. Callers must retain their normal fallback for other inputs.
+    """
+    return _get_native().group_norm_bmg(
+        input, num_groups, weight, bias, eps
+    )
+
+
 def rms_norm(
     weight: torch.Tensor, input: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
@@ -176,10 +199,12 @@ def fused_adaln(
 
 
 __all__ = [
+    "group_norm_bmg",
     "rms_norm",
     "rms_norm_gate_residual",
     "layer_norm",
     "fused_add_rms_norm",
     "fused_rms_norm_linear",
     "fused_adaln",
+    "supports_group_norm_bmg",
 ]

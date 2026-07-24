@@ -25,6 +25,11 @@ namespace gguf {
 }
 namespace norm {
     torch::Tensor rms_norm(torch::Tensor weight, torch::Tensor input, double eps);
+#if defined(OMNI_XPU_ARCH_BMG)
+    torch::Tensor group_norm_bmg(
+        torch::Tensor input, int64_t groups, torch::Tensor weight,
+        torch::Tensor bias, double eps);
+#endif
 #if defined(OMNI_XPU_ARCH_PTL_H)
     torch::Tensor rms_norm_gate_residual(
         torch::Tensor weight, torch::Tensor input, torch::Tensor gate,
@@ -160,6 +165,18 @@ PYBIND11_MODULE(_C, m) {
     norm.def("rms_norm", &omni_xpu::norm::rms_norm,
         "RMSNorm using ESIMD optimization",
         py::arg("weight"), py::arg("input"), py::arg("eps") = 1e-6);
+
+#if defined(OMNI_XPU_ARCH_BMG)
+    norm.attr("__group_norm_bmg__") = true;
+    norm.def(
+        "group_norm_bmg",
+        &omni_xpu::norm::group_norm_bmg,
+        "BMG GroupNorm for validated Boogu Image Turbo activation shapes",
+        py::arg("input"), py::arg("groups"), py::arg("weight"),
+        py::arg("bias"), py::arg("eps") = 1e-6);
+#else
+    norm.attr("__group_norm_bmg__") = false;
+#endif
 
 #if defined(OMNI_XPU_ARCH_PTL_H)
     norm.def(

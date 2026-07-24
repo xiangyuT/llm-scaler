@@ -116,6 +116,23 @@ def test_noncontiguous_rms_targets_are_explicit(monkeypatch):
     assert not patch._target_supports_noncontiguous_rms("unknown")
 
 
+def test_group_norm_target_is_bmg_only(monkeypatch):
+    patch = _load_patch(monkeypatch)
+
+    assert patch._target_supports_group_norm("bmg")
+    assert not patch._target_supports_group_norm("ptl-h")
+    assert not patch._target_supports_group_norm("unknown")
+
+
+def test_group_norm_shapes_are_exact(monkeypatch):
+    patch = _load_patch(monkeypatch)
+
+    assert (1, 512, 128, 128) in patch._bmg_group_norm_shapes
+    assert (1, 128, 1024, 1024) in patch._bmg_group_norm_shapes
+    assert (1, 512, 64, 64) not in patch._bmg_group_norm_shapes
+    assert len(patch._bmg_group_norm_shapes) == 6
+
+
 def test_split_qkv_rms_materializes_only_when_enabled(monkeypatch):
     patch = _load_patch(monkeypatch)
     patch._omni_norm = object()

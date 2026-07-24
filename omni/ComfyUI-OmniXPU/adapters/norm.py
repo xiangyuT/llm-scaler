@@ -19,6 +19,15 @@ _omni_norm = None
 _logged_first_use = False
 _allow_noncontiguous_rms = False
 _allow_h120_rms = False
+_allow_bmg_group_norm = False
+_bmg_group_norm_shapes = {
+    (1, 512, 128, 128),
+    (1, 512, 256, 256),
+    (1, 512, 512, 512),
+    (1, 256, 512, 512),
+    (1, 256, 1024, 1024),
+    (1, 128, 1024, 1024),
+}
 
 
 def _target_supports_h120(target):
@@ -27,6 +36,34 @@ def _target_supports_h120(target):
 
 def _target_supports_noncontiguous_rms(target):
     return target in {"ptl-h", "bmg"}
+
+
+def _target_supports_group_norm(target):
+    return target == "bmg"
+
+
+def _can_use_bmg_group_norm(x, num_groups, weight, bias, eps):
+    return (
+        _allow_bmg_group_norm
+        and tuple(x.shape) in _bmg_group_norm_shapes
+        and x.is_xpu
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and int(num_groups) == 32
+        and weight is not None
+        and bias is not None
+        and weight.device == x.device
+        and bias.device == x.device
+        and weight.dtype == torch.bfloat16
+        and bias.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and bias.is_contiguous()
+        and weight.ndim == 1
+        and bias.ndim == 1
+        and weight.numel() == x.shape[1]
+        and bias.numel() == x.shape[1]
+        and float(eps) == 1e-6
+    )
 
 
 def _can_use_omni(x):
@@ -98,7 +135,20 @@ def _run_rms_norm(weight, x, eps):
     return _omni_norm.rms_norm(weight, x, eps)
 
 
+def _run_group_norm(x, num_groups, weight, bias, eps):
+    log_debug_event(
+        "kernel",
+        "group_norm_bmg",
+        {"input": x, "weight": weight, "bias": bias},
+        details={"backend": "bmg_sycl", "groups": int(num_groups)},
+    )
+    return _omni_norm.group_norm_bmg(
+        x, num_groups, weight, bias, eps
+    )
+
+
 def apply():
+    global _allow_bmg_group_norm
     global _allow_h120_rms, _allow_noncontiguous_rms, _omni_norm
     import sys
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
@@ -120,12 +170,27 @@ def apply():
             and supports_h120()
             and os.environ.get("OMNIXPU_H120_RMSNORM", "1") != "0"
         )
+        supports_group_norm = getattr(
+            _omni_norm, "supports_group_norm_bmg", None
+        )
+        _allow_bmg_group_norm = (
+            _target_supports_group_norm(target)
+            and callable(supports_group_norm)
+            and supports_group_norm()
+            and os.environ.get("OMNIXPU_BMG_GROUPNORM", "1") != "0"
+        )
         log.info(
             "[OmniXPU] norm: H120 FP16 native route %s (target=%s)",
             "enabled" if _allow_h120_rms else "disabled",
             target or "unknown",
         )
+        log.info(
+            "[OmniXPU] norm: BMG GroupNorm route %s (target=%s)",
+            "enabled" if _allow_bmg_group_norm else "disabled",
+            target or "unknown",
+        )
     except ImportError:
+        _allow_bmg_group_norm = False
         _allow_noncontiguous_rms = False
         _allow_h120_rms = False
 
@@ -287,6 +352,39 @@ def apply():
         log.info("[OmniXPU] norm: rebound %d by-value imports of rms_norm", rebound)
     except (ImportError, AttributeError):
         pass  # comfy.rmsnorm may not exist in all versions
+
+    # --- BMG GroupNorm exact workflow contracts ---
+    # The global functional wrapper reaches the Boogu model's GroupNorm call
+    # sites without changing its modules or graph. Every other tensor contract
+    # remains on Torch.
+    if _allow_bmg_group_norm:
+        _orig_group_norm = torch.nn.functional.group_norm
+
+        @trace_patch(
+            "norm.group_norm_bmg",
+            ("input", "num_groups", "weight", "bias", "eps"),
+            stage="dispatch",
+            verbose_only=True,
+        )
+        def _patched_group_norm(
+            input,
+            num_groups,
+            weight=None,
+            bias=None,
+            eps=1e-5,
+        ):
+            if _can_use_bmg_group_norm(
+                input, num_groups, weight, bias, eps
+            ):
+                _log_first("BMG GroupNorm", input.shape)
+                return _run_group_norm(
+                    input, num_groups, weight, bias, eps
+                )
+            return _orig_group_norm(
+                input, num_groups, weight, bias, eps
+            )
+
+        torch.nn.functional.group_norm = _patched_group_norm
 
     # --- Krea2 local RMSNorm (separate opt-in sub-switch) ---
     # Gated by OMNIXPU_KREA2_RMSNORM (default on). This is deliberately a

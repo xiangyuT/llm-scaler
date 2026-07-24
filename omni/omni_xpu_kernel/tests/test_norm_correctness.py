@@ -168,6 +168,72 @@ class TestRMSNormCorrectness:
         assert float(difference.max().item()) <= 0.0625
 
 
+class TestGroupNormBMGCorrectness:
+    """Correctness tests for the exact BMG Boogu GroupNorm route."""
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 512, 128, 128),
+            (1, 512, 256, 256),
+            (1, 512, 512, 512),
+            (1, 256, 512, 512),
+            (1, 256, 1024, 1024),
+            (1, 128, 1024, 1024),
+        ],
+    )
+    def test_group_norm_bmg_correctness(self, shape):
+        from omni_xpu_kernel import norm
+
+        if not norm.supports_group_norm_bmg():
+            pytest.skip("loaded binary does not contain the BMG GroupNorm route")
+
+        torch.manual_seed(sum(shape))
+        channels = shape[1]
+        input = torch.randn(
+            shape, device="xpu", dtype=torch.bfloat16
+        )
+        weight = torch.randn(
+            channels, device="xpu", dtype=torch.bfloat16
+        )
+        bias = torch.randn(
+            channels, device="xpu", dtype=torch.bfloat16
+        )
+        expected = torch.nn.functional.group_norm(
+            input, 32, weight, bias, eps=1e-6
+        )
+        actual = norm.group_norm_bmg(
+            input, 32, weight, bias, eps=1e-6
+        )
+
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(
+            actual, expected, rtol=0.02, atol=0.03125
+        )
+
+    @pytest.mark.skipif(not has_xpu(), reason="XPU not available")
+    def test_group_norm_bmg_rejects_uncaptured_shape(self):
+        from omni_xpu_kernel import norm
+
+        if not norm.supports_group_norm_bmg():
+            pytest.skip("loaded binary does not contain the BMG GroupNorm route")
+
+        input = torch.randn(
+            (1, 512, 64, 64),
+            device="xpu",
+            dtype=torch.bfloat16,
+        )
+        weight = torch.randn(
+            512, device="xpu", dtype=torch.bfloat16
+        )
+        bias = torch.randn(
+            512, device="xpu", dtype=torch.bfloat16
+        )
+        with pytest.raises(RuntimeError, match="unsupported BMG GroupNorm shape"):
+            norm.group_norm_bmg(input, 32, weight, bias, eps=1e-6)
+
+
 class TestLayerNormCorrectness:
     """Correctness tests for LayerNorm kernel."""
     
