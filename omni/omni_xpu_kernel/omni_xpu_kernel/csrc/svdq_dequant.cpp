@@ -62,7 +62,7 @@ constexpr int HALF_GROUP = SVDQ_GROUP_SIZE / 2;  // 32 packed bytes per group
 #if defined(OMNI_XPU_ARCH_PTL_H)
 #define OMNI_SVDQ_DEQUANT_GROUPS_PER_WI 60
 #elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_SVDQ_DEQUANT_GROUPS_PER_WI 1
+#define OMNI_SVDQ_DEQUANT_GROUPS_PER_WI 60
 #else
 #error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
 #endif
@@ -264,8 +264,7 @@ void dequantize_svdq_w4_signed_ptl_kernel(
 #if defined(OMNI_XPU_ARCH_PTL_H)
 #define OMNI_SVDQ_UNPACK_COLS_PER_WI 3840
 #elif defined(OMNI_XPU_ARCH_BMG)
-// Keep the established launch geometry until it is retuned on BMG.
-#define OMNI_SVDQ_UNPACK_COLS_PER_WI 64
+#define OMNI_SVDQ_UNPACK_COLS_PER_WI 3840
 #else
 #error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
 #endif
@@ -275,7 +274,7 @@ void dequantize_svdq_w4_signed_ptl_kernel(
 #if defined(OMNI_XPU_ARCH_PTL_H)
 #define OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION 64
 #elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION 16
+#define OMNI_SVDQ_UNPACK_BYTES_PER_ITERATION 128
 #else
 #error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
 #endif
@@ -285,7 +284,7 @@ void dequantize_svdq_w4_signed_ptl_kernel(
 #if defined(OMNI_XPU_ARCH_PTL_H)
 #define OMNI_SVDQ_UNPACK_WG_SIZE 32
 #elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_SVDQ_UNPACK_WG_SIZE 64
+#define OMNI_SVDQ_UNPACK_WG_SIZE 1
 #else
 #error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
 #endif
@@ -399,7 +398,7 @@ void unpack_svdq_int4_kernel(
 #if defined(OMNI_XPU_ARCH_PTL_H)
 #define OMNI_SVDQ_QUANT_GROUPS_PER_WI 60
 #elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_SVDQ_QUANT_GROUPS_PER_WI 1
+#define OMNI_SVDQ_QUANT_GROUPS_PER_WI 60
 #else
 #error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
 #endif

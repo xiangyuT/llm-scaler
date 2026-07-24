@@ -467,10 +467,10 @@ std::vector<torch::Tensor> dequantize_batch(
         "inputs and formats must have the same length");
     TORCH_CHECK(!inputs.empty(), "inputs must not be empty");
 
-#if defined(OMNI_XPU_ARCH_PTL_H)
-    // PTL-H launch overhead is lower than the GPU-side concat cost, including
-    // for small tensors. Dispatch each original allocation directly so batch
-    // dequantization does not add a full read+write of the packed inputs.
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+    // On PTL-H and BMG, launch overhead is lower than the GPU-side concat cost,
+    // including for small tensors. Dispatch each original allocation directly
+    // so batch dequantization does not add a full read+write of packed inputs.
     std::vector<torch::Tensor> direct_outputs(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
         TORCH_CHECK(inputs[i].is_contiguous(),

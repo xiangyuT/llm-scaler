@@ -18,8 +18,7 @@ namespace {
 #if defined(OMNI_XPU_ARCH_PTL_H)
 #define OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE 1
 #elif defined(OMNI_XPU_ARCH_BMG)
-// Keep the existing BMG path until this launch geometry is measured there.
-#define OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE 0
+#define OMNI_KITCHEN_ROPE_PAIR_SAME_SHAPE 1
 #else
 #error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
 #endif
@@ -29,7 +28,7 @@ namespace {
 #if defined(OMNI_XPU_ARCH_PTL_H)
 #define OMNI_KITCHEN_ROPE_PAIR_WG_SIZE 128
 #elif defined(OMNI_XPU_ARCH_BMG)
-#define OMNI_KITCHEN_ROPE_PAIR_WG_SIZE 256
+#define OMNI_KITCHEN_ROPE_PAIR_WG_SIZE 32
 #else
 #error "Define OMNI_XPU_ARCH_PTL_H or OMNI_XPU_ARCH_BMG"
 #endif
