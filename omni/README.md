@@ -97,8 +97,8 @@ The focused image contains:
 
 - a pinned upstream ComfyUI checkout;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
-- `comfy-kitchen==0.2.19` from the XPU-enabled
-  [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/36d4440fa4c8c09db1929c2e43f17c475c236a48),
+- `comfy-kitchen==0.2.18` from the XPU-enabled
+  [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/75eb682b18a8c9970908927ab1b98c9b125230ab),
   including the managed GGUF and Nunchaku W4A16 routes;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
