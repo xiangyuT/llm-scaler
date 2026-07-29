@@ -16,9 +16,9 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "c7ae07e5317d4a073562e278a41d98f05a4fe109",
+        "36d4440fa4c8c09db1929c2e43f17c475c236a48",
     ),
-    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.18"),
+    "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.19"),
     "COMFY_GGUF_REPOSITORY": (
         "GGUF_REPOSITORY",
         "https://github.com/analytics-zoo/ComfyUI-GGUF-XPU.git",

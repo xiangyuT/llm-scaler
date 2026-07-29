@@ -62,7 +62,7 @@ Docker image 中的 CUTE FMHA、`sycl-tla`、Linux `.so`、`/dev/dri` 和
 | ComfyUI | `0.28.0`，测试 commit `700821e1...` |
 | llm-scaler | [`37237c69...`](https://github.com/xiangyuT/llm-scaler/commit/37237c69a451463f2b1b4e82f1d270b61e01731f)（`feature/omni-0.1.0b9-preview`） |
 
-`comfy-kitchen 0.2.18` 是 Dockerfile 当前固定的 XPU fork 版本。当前 ComfyUI
+`comfy-kitchen 0.2.18` 是本节 Windows 实测固定的 XPU fork 版本。当前 ComfyUI
 调用的 Kitchen API 已经在该 fork 中完成导入检查，XPU backend 也能在
 Torch 2.12/B70 上注册。它应保留真实版本 `0.2.18`，不伪装为上游
 ComfyUI requirements 中的其他版本。
