@@ -274,12 +274,26 @@ def test_extension_metadata_tracks_native_sources(monkeypatch, tmp_path):
     )
     if sys.platform == "win32":
         assert "omni_xpu_kernel.cute.cute_fmha_torch" not in extensions
+        assert "omni_xpu_kernel.cute.cute_h3_bf16_torch" not in extensions
     else:
         cute_dependencies = {
             Path(dependency).name
             for dependency in extensions["omni_xpu_kernel.cute.cute_fmha_torch"].depends
         }
         assert "cute_fmha_config.h" in cute_dependencies
+        h3_name = "omni_xpu_kernel.cute.cute_h3_bf16_torch"
+        if XPU_TARGET == "bmg":
+            assert h3_name in extensions
+            h3_dependencies = {
+                Path(dependency).name
+                for dependency in extensions[h3_name].depends
+            }
+            assert (
+                "h3-cache-one-q-fragment-maxskip-early-v.patch"
+                in h3_dependencies
+            )
+        else:
+            assert h3_name not in extensions
     assert all(
         not Path(dependency).is_absolute()
         for extension in extensions.values()

@@ -346,6 +346,19 @@ at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
   at::Tensor o = at::empty_like(qc);
   const float scale = 1.0f / std::sqrt((float)D);
 
+#if defined(CUTE_FMHA_H3_ONLY)
+  TORCH_CHECK(
+      q.scalar_type() == at::kBFloat16,
+      "cute_fmha: H3 specialization requires BF16 Q/K/V");
+  TORCH_CHECK(
+      Lq == 63699 && H == 7,
+      "cute_fmha: H3 specialization requires [1,63699,7,128] (got ",
+      q.sizes(), ")");
+  run_d128_tile<cutlass::bfloat16_t>(
+      qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq,
+      Lkv, D, scale);
+  return o;
+#else
   if (q.scalar_type() == at::kHalf) {
     run_d128_tile<cutlass::half_t>(
         qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq,
@@ -371,9 +384,10 @@ at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
     TORCH_CHECK(false, "cute_fmha: only fp16/bf16 supported");
   }
   return o;
+#endif
 }
 
-#if defined(OMNI_XPU_ARCH_BMG)
+#if defined(OMNI_XPU_ARCH_BMG) && !defined(CUTE_FMHA_H3_ONLY)
 at::Tensor sdp_wan22_cross(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -415,7 +429,8 @@ at::Tensor sdp_wan22_cross(
 }
 #endif
 
-#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+#if (defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)) && \
+    !defined(CUTE_FMHA_H3_ONLY)
 bool is_supported_bhld_layout(
     const at::Tensor& tensor, int64_t H, int64_t L, int64_t D) {
   if (tensor.stride(3) != 1 || tensor.stride(0) != H * L * D) {
@@ -580,14 +595,15 @@ at::Tensor sdp_bhld_d120(
 #ifndef CUTE_FMHA_NS
 #define CUTE_FMHA_NS cute_fmha
 #endif
-#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+#if (defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)) && \
+    !defined(CUTE_FMHA_H3_ONLY)
 #define CUTE_FMHA_D120_DEF(m) m.def("sdp_bhld_d120(Tensor q, Tensor k, Tensor v) -> Tensor");
 #define CUTE_FMHA_D120_IMPL(m) m.impl("sdp_bhld_d120", &sdp_bhld_d120);
 #else
 #define CUTE_FMHA_D120_DEF(m)
 #define CUTE_FMHA_D120_IMPL(m)
 #endif
-#if defined(OMNI_XPU_ARCH_BMG)
+#if defined(OMNI_XPU_ARCH_BMG) && !defined(CUTE_FMHA_H3_ONLY)
 #define CUTE_FMHA_WAN22_DEF(m) \
   m.def("sdp_wan22_cross(Tensor q, Tensor k, Tensor v) -> Tensor");
 #define CUTE_FMHA_WAN22_IMPL(m) \

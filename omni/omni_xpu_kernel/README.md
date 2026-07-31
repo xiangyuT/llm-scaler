@@ -13,6 +13,7 @@ across those native ABI boundaries.
 |---|---|
 | `sdp` | ESIMD scaled dot-product attention |
 | `cute` | CUTLASS-SYCL fused attention |
+| `cute.sdp` H3 route | Exact BMG BF16 `[1,63699,7,128]` isolated specialization |
 | `cute.sdp_bhld_d128` | BMG batched/rectangular D128 BHLD attention |
 | `cute.sdp_wan22_cross` | Exact BMG Wan 2.2 14B T2V Turbo cross-attention |
 | `linear` | oneDNN FP8 weight-only GEMM |
@@ -223,12 +224,14 @@ assert omni.core_aot_target() == omni.__xpu_target__
 PY
 ```
 
-A default Linux wheel contains:
+A default Linux wheel contains the first three components below; a BMG wheel
+also contains the fourth:
 
 ```text
 omni_xpu_kernel/_C.cpython-312-x86_64-linux-gnu.so
 omni_xpu_kernel/lgrf_uni/lgrf_sdp.cpython-312-x86_64-linux-gnu.so
 omni_xpu_kernel/cute/cute_fmha_torch.cpython-312-x86_64-linux-gnu.so
+omni_xpu_kernel/cute/cute_h3_bf16_torch.cpython-312-x86_64-linux-gnu.so
 ```
 
 ## API examples
@@ -267,6 +270,13 @@ standard `1/sqrt(head_dim)` scaling; and FP16 or BF16. Neither entry point
 accepts masks, causal mode, GQA, or custom scaling. API capability does not
 imply that every shape is faster than PyTorch; callers must retain a
 performance-qualified fallback policy.
+
+On BMG, the exact BF16 BLHD `[1,63699,7,128]` self-attention contract is
+automatically dispatched to an isolated H3 sidecar. Other shapes continue to
+use the general sidecar. Set `OMNI_CUTE_H3_BF16=0` to disable only this route
+for same-wheel E2E A/B testing; this does not change the package version or the
+general CUTE implementation. `cute.supports_h3_bf16()` reports whether the
+specialized sidecar can be loaded.
 
 `sdp_wan22_cross` remains an exact MMA-K16 specialization. It accepts only
 dense FP16 BMG tensors with Q `[1, 75600, 40, 128]` and K/V
@@ -403,12 +413,15 @@ specific. Do not treat a number from one target as validation for another.
 
 ## Native layout
 
-The Linux build produces three extension components:
+The Linux build produces three extension components on PTL-H and four on BMG:
 
 - `_C.so`: main AOT extension for normalization, quantization, GGUF, SVDQuant,
   rotary, and oneDNN-backed operations;
 - `lgrf_sdp.so`: target-specific ESIMD attention sidecar;
-- `cute_fmha_torch.so`: target-specific CUTLASS-SYCL attention sidecar.
+- `cute_fmha_torch.so`: target-specific CUTLASS-SYCL attention sidecar;
+- `cute_h3_bf16_torch.so`: BMG-only exact H3 BF16 attention sidecar; it uses a
+  private patched sycl-tla header overlay and cannot alter the general CUTE
+  kernel instances.
 
 `setup.py` derives one architecture macro from `OMNI_XPU_DEVICE` so wheel
 metadata, core AOT ISA, and sidecars identify the same target. BMG core and

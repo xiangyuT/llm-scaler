@@ -43,6 +43,13 @@ XPU_ARCH_MACROS = {
     "ptl-h": "OMNI_XPU_ARCH_PTL_H",
 }
 XPU_ARCH_MACRO = XPU_ARCH_MACROS[BUILD_XPU_TARGET]
+H3_CUTE_MAINLOOP_PATCH = (
+    Path(__file__).parent
+    / "omni_xpu_kernel"
+    / "cute"
+    / "patches"
+    / "h3-cache-one-q-fragment-maxskip-early-v.patch"
+)
 
 BMG_CUTE_REMAINDER_MASK_ORIGINAL = """\
           FragSRow k_rem_mask;
@@ -127,6 +134,52 @@ def prepare_bmg_cute_include_overlay(cutlass_root, build_temp):
         ),
         encoding="utf-8",
     )
+    shutil.copyfile(fusion_source, overlay_dir / fusion_source.name)
+    return overlay_root
+
+
+def prepare_bmg_h3_cute_include_overlay(cutlass_root, build_temp):
+    """Layer the validated H3 mainloop patch over the private BMG overlay.
+
+    The H3 sidecar is compiled independently from the general CUTE sidecar, so
+    these changes cannot alter existing D120, D128, or Wan kernel instances.
+    ``--fuzz=0`` and the checked return code make a sycl-tla source mismatch a
+    build failure instead of silently accepting a partially applied patch.
+    """
+    base_overlay = prepare_bmg_cute_include_overlay(cutlass_root, build_temp)
+    relative_dir = Path("flash_attention_v2") / "collective"
+    source_dir = base_overlay / relative_dir
+    mainloop_source = source_dir / "xe_fmha_fwd_mainloop.hpp"
+    fusion_source = source_dir / "fmha_fusion.hpp"
+    if not H3_CUTE_MAINLOOP_PATCH.is_file():
+        raise RuntimeError(
+            f"Missing validated H3 CUTE mainloop patch: {H3_CUTE_MAINLOOP_PATCH}"
+        )
+
+    overlay_root = Path(build_temp) / "cute_bmg_h3_include_overlay"
+    overlay_dir = overlay_root / relative_dir
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    output_header = overlay_dir / mainloop_source.name
+    result = subprocess.run(
+        [
+            "patch",
+            "--batch",
+            "--forward",
+            "--fuzz=0",
+            f"--output={output_header}",
+            str(mainloop_source),
+            str(H3_CUTE_MAINLOOP_PATCH),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Pinned sycl-tla H3 CUTE source no longer matches the validated "
+            "patch contract:\n"
+            + result.stdout
+            + result.stderr
+        )
     shutil.copyfile(fusion_source, overlay_dir / fusion_source.name)
     return overlay_root
 
@@ -427,7 +480,8 @@ class ICPXBuildExt(build_ext):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         is_lgrf = ext.name.endswith("lgrf_sdp")
-        is_cute = ext.name.endswith("cute_fmha_torch")
+        is_cute_h3 = ext.name.endswith("cute_h3_bf16_torch")
+        is_cute = ext.name.endswith("cute_fmha_torch") or is_cute_h3
 
         # Source directory
         if is_lgrf:
@@ -554,10 +608,22 @@ class ICPXBuildExt(build_ext):
                         "examples/common/, applications/. Got: " + repr(cutlass))
                 cute_overlay_flags = []
                 if BUILD_XPU_TARGET == "bmg":
-                    overlay = prepare_bmg_cute_include_overlay(
-                        cutlass, self.build_temp
+                    overlay = (
+                        prepare_bmg_h3_cute_include_overlay(
+                            cutlass, self.build_temp
+                        )
+                        if is_cute_h3
+                        else prepare_bmg_cute_include_overlay(
+                            cutlass, self.build_temp
+                        )
                     )
                     cute_overlay_flags.append(f"-I{overlay}")
+                cute_variant_flags = []
+                if is_cute_h3:
+                    cute_variant_flags = [
+                        "-DCUTE_FMHA_H3_ONLY=1",
+                        "-DCUTE_FMHA_NS=cute_h3_bf16",
+                    ]
                 cmd += [
                     "-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-shared",
                     "-fsycl-targets=spir64_gen",
@@ -569,6 +635,7 @@ class ICPXBuildExt(build_ext):
                     "-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET",
                     f"-D{XPU_ARCH_MACRO}=1",
                     f"-D_GLIBCXX_USE_CXX11_ABI={torch_cxx11_abi}",
+                    *cute_variant_flags,
                     *cute_overlay_flags,
                     f"-I{cutlass}/include",
                     f"-I{cutlass}/tools/util/include",
@@ -670,7 +737,9 @@ class ICPXExtension(Extension):
             kernel_root = source_root / "omni_xpu_kernel" / "lgrf_uni"
             sources = [kernel_root / "sdp_kernels.cpp"]
             depends = sorted(kernel_root.rglob("*.h"))
-        elif name.endswith("cute_fmha_torch"):
+        elif name.endswith("cute_fmha_torch") or name.endswith(
+            "cute_h3_bf16_torch"
+        ):
             kernel_root = source_root / "omni_xpu_kernel" / "cute"
             sources = [kernel_root / "cute_fmha_torch.cpp"]
             csrc_root = source_root / "omni_xpu_kernel" / "csrc"
@@ -679,6 +748,12 @@ class ICPXExtension(Extension):
                 csrc_root / "bmg_kernel_policy.h",
                 csrc_root / "device_utils.h",
             ]
+            if name.endswith("cute_h3_bf16_torch"):
+                depends.append(
+                    kernel_root
+                    / "patches"
+                    / "h3-cache-one-q-fragment-maxskip-early-v.patch"
+                )
         else:
             kernel_root = source_root / "omni_xpu_kernel" / "csrc"
             sources = sorted(kernel_root.glob("*.cpp"))
@@ -732,6 +807,12 @@ if _cutlass_sycl_required and not _cutlass_sycl_available:
     )
 if not IS_WINDOWS and _cutlass_sycl_available:
     _ext_modules.append(ICPXExtension("omni_xpu_kernel.cute.cute_fmha_torch", sourcedir="."))
+    if BUILD_XPU_TARGET == "bmg":
+        _ext_modules.append(
+            ICPXExtension(
+                "omni_xpu_kernel.cute.cute_h3_bf16_torch", sourcedir="."
+            )
+        )
 
 setup(
     name="omni_xpu_kernel",

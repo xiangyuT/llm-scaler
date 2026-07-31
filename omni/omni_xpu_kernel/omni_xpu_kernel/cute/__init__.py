@@ -18,9 +18,10 @@ rectangular D128 BHLD entry point through ``sdp_bhld_d128``.
 Unlike the ESIMD ``sdp`` kernel (fp16 accumulator + adaptive V-scaling), the cute
 FMHA accumulates QK and P*V in fp32, so it does not overflow on large-magnitude
 activations (e.g. Qwen-Image). It is AOT-compiled into ``cute_fmha_torch.so`` and
-exposes ``torch.ops.cute_fmha.sdp``. The generic entry point accepts
-self-attention only; validated rectangular workflow contracts use dedicated
-entry points.
+exposes ``torch.ops.cute_fmha.sdp``. BMG wheels also contain an isolated H3
+BF16 sidecar for the exact ``[1,63699,7,128]`` contract. The generic entry point
+accepts self-attention only; validated rectangular workflow contracts use
+dedicated entry points.
 """
 
 import glob
@@ -29,6 +30,7 @@ import os
 import torch
 
 _loaded = False
+_h3_loaded = False
 
 
 def _find_so():
@@ -63,6 +65,67 @@ def _ensure_loaded():
     _loaded = True
 
 
+def _find_h3_so():
+    """Locate the exact-contract BMG H3 BF16 sidecar."""
+    env = os.environ.get("OMNI_CUTE_H3_BF16_SO", "")
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [os.path.join(here, "cute_h3_bf16_torch.so")]
+    cands += sorted(
+        glob.glob(os.path.join(here, "cute_h3_bf16_torch*.so"))
+    )
+    for candidate in cands:
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+def _ensure_h3_loaded():
+    global _h3_loaded
+    if _h3_loaded:
+        return
+    so = _find_h3_so()
+    if not so or not os.path.exists(so):
+        raise ImportError(
+            "cute_h3_bf16_torch .so not found next to omni_xpu_kernel.cute "
+            "(set OMNI_CUTE_H3_BF16_SO to override)"
+        )
+    torch.ops.load_library(so)
+    _h3_loaded = True
+
+
+def supports_h3_bf16() -> bool:
+    """Whether the isolated exact-contract BMG H3 sidecar is available."""
+    try:
+        _ensure_h3_loaded()
+        return hasattr(torch.ops.cute_h3_bf16, "sdp")
+    except Exception:
+        return False
+
+
+def _h3_route_enabled() -> bool:
+    value = os.environ.get("OMNI_CUTE_H3_BF16", "1").strip().lower()
+    return value not in {"0", "false", "off", "no"}
+
+
+def _is_h3_bf16_contract(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> bool:
+    shape = (1, 63699, 7, 128)
+    return (
+        q.device.type == "xpu"
+        and q.dtype == torch.bfloat16
+        and tuple(q.shape) == shape
+        and tuple(k.shape) == shape
+        and tuple(v.shape) == shape
+        and k.device == q.device
+        and v.device == q.device
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+    )
+
+
 def is_available():
     try:
         _ensure_loaded()
@@ -74,6 +137,12 @@ def is_available():
 def sdp(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Fused scaled-dot-product attention. Inputs [B, L, H, D] (B==1, D==128)."""
     _ensure_loaded()
+    if (
+        _h3_route_enabled()
+        and _is_h3_bf16_contract(q, k, v)
+        and supports_h3_bf16()
+    ):
+        return torch.ops.cute_h3_bf16.sdp(q, k, v)
     return torch.ops.cute_fmha.sdp(q, k, v)
 
 
@@ -148,5 +217,6 @@ __all__ = [
     "supports_d128_bhld",
     "sdp_bhld_d120",
     "supports_d120_bhld",
+    "supports_h3_bf16",
     "is_available",
 ]
