@@ -380,8 +380,13 @@ def test_bmg_cute_overlay_patches_private_header_copy(monkeypatch, tmp_path):
     collective.mkdir(parents=True)
     original = namespace["BMG_CUTE_REMAINDER_MASK_ORIGINAL"]
     replacement = namespace["BMG_CUTE_REMAINDER_MASK_REPLACEMENT"]
+    i86_transforms = namespace["WAN_ANIMATE2_I86_TRANSFORMS"]
     source_header = collective / "xe_fmha_fwd_mainloop.hpp"
-    source_header.write_text(f"prefix\n{original}suffix\n", encoding="utf-8")
+    i86_source = "\n".join(source for _, source, _ in i86_transforms)
+    source_header.write_text(
+        f"prefix\n{original}\n{i86_source}\nsuffix\n",
+        encoding="utf-8",
+    )
     (collective / "fmha_fusion.hpp").write_text(
         "fusion sentinel\n", encoding="utf-8"
     )
@@ -398,10 +403,32 @@ def test_bmg_cute_overlay_patches_private_header_copy(monkeypatch, tmp_path):
 
     assert replacement in patched
     assert original not in patched
+    for _, source, transformed in i86_transforms:
+        assert transformed in patched
+        assert source not in patched
     assert original in source_header.read_text(encoding="utf-8")
     assert (
         overlay_collective / "fmha_fusion.hpp"
     ).read_text(encoding="utf-8") == "fusion sentinel\n"
+
+
+def test_bmg_cute_overlay_rejects_partial_upstream_match(monkeypatch, tmp_path):
+    import setuptools
+
+    monkeypatch.chdir(PROJECT_ROOT)
+    monkeypatch.setenv("OMNI_XPU_REQUIRE_CUTE", "0")
+    monkeypatch.setattr(setuptools, "setup", lambda **kwargs: None)
+    namespace = run_path(
+        str(PROJECT_ROOT / "setup.py"), run_name="__cute_bmg_overlay_guard_test__"
+    )
+
+    transforms = namespace["WAN_ANIMATE2_I86_TRANSFORMS"]
+    name, source, _ = transforms[0]
+    with pytest.raises(RuntimeError, match=name):
+        namespace["apply_checked_transforms"](
+            source + source,
+            transforms[:1],
+        )
 
 
 @pytest.mark.parametrize("target", SUPPORTED_XPU_TARGETS)

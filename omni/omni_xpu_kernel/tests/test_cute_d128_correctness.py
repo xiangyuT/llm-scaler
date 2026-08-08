@@ -82,6 +82,36 @@ def test_cute_d128_bmg_matches_wan22_t2v_turbo_720p_cross_contract():
     assert float(difference.max().item()) <= 0.00390625
 
 
+@pytest.mark.skipif(
+    not has_bmg_cute(), reason="BMG CUTE D128 sidecar unavailable"
+)
+def test_cute_d128_bmg_matches_wan_animate2_long_kv_contract():
+    from omni_xpu_kernel import cute
+
+    if not cute.supports_d128_bhld():
+        pytest.skip("D128 BHLD attention capability is unavailable")
+
+    torch.xpu.manual_seed_all(20260808)
+    q = torch.randn(
+        (1, 1590, 40, 128), device="xpu", dtype=torch.float16
+    ).permute(0, 2, 1, 3)
+    k = torch.randn(
+        (1, 34980, 40, 128), device="xpu", dtype=torch.float16
+    ).permute(0, 2, 1, 3)
+    v = torch.randn_like(k)
+
+    assert q.stride() == (8140800, 128, 5120, 1)
+    assert k.stride() == v.stride() == (179097600, 128, 5120, 1)
+    actual = cute.sdp_bhld_d128(q, k, v)
+    expected = F.scaled_dot_product_attention(q, k, v)
+
+    assert actual.shape == q.shape
+    assert actual.stride() == q.stride()
+    assert torch.isfinite(actual).all()
+    difference = (actual.float() - expected.float()).abs()
+    assert float(difference.max().item()) <= 0.00390625
+
+
 @pytest.mark.parametrize("kv_len", [3520, 1024])
 @pytest.mark.skipif(
     not has_bmg_cute(), reason="BMG CUTE D128 sidecar unavailable"

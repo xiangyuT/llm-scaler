@@ -34,6 +34,20 @@ VALIDATED_ONEDNN_VERSION = (3, 9, 1)
 
 
 VERSION_NAMESPACE = run_path(str(Path(__file__).parent / "omni_xpu_kernel" / "_version.py"))
+_BMG_CUTE_OVERLAY_NAMESPACE = run_path(
+    str(
+        Path(__file__).parent
+        / "omni_xpu_kernel"
+        / "cute"
+        / "_bmg_mainloop_overlay.py"
+    )
+)
+WAN_ANIMATE2_I86_TRANSFORMS = _BMG_CUTE_OVERLAY_NAMESPACE[
+    "WAN_ANIMATE2_I86_TRANSFORMS"
+]
+apply_checked_transforms = _BMG_CUTE_OVERLAY_NAMESPACE[
+    "apply_checked_transforms"
+]
 BUILD_TORCH_VERSION = VERSION_NAMESPACE["get_installed_torch_version"]()
 BUILD_XPU_TARGET = VERSION_NAMESPACE["get_build_xpu_target"]()
 PACKAGE_VERSION = VERSION_NAMESPACE["get_package_version"](
@@ -117,15 +131,18 @@ def prepare_bmg_cute_include_overlay(cutlass_root, build_temp):
             f"validated overlay contract (matches={matches})"
         )
 
+    text = text.replace(
+        BMG_CUTE_REMAINDER_MASK_ORIGINAL,
+        BMG_CUTE_REMAINDER_MASK_REPLACEMENT,
+        1,
+    )
+    text = apply_checked_transforms(text, WAN_ANIMATE2_I86_TRANSFORMS)
+
     overlay_root = Path(build_temp) / "cute_bmg_include_overlay"
     overlay_dir = overlay_root / relative_dir
     overlay_dir.mkdir(parents=True, exist_ok=True)
     (overlay_dir / mainloop_source.name).write_text(
-        text.replace(
-            BMG_CUTE_REMAINDER_MASK_ORIGINAL,
-            BMG_CUTE_REMAINDER_MASK_REPLACEMENT,
-            1,
-        ),
+        text,
         encoding="utf-8",
     )
     shutil.copyfile(fusion_source, overlay_dir / fusion_source.name)
