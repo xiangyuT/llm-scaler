@@ -86,6 +86,38 @@ bool d120_bmg_single_supported(
            freqs.size(5) == 2;
 }
 
+bool wan_animate2_bmg_single_supported(
+    const torch::Tensor& x,
+    const torch::Tensor& freqs) {
+    constexpr int64_t Heads = 40;
+    constexpr int64_t HeadDim = 128;
+    constexpr int64_t Pairs = HeadDim / 2;
+    if (!x.device().is_xpu() || !freqs.device().is_xpu() ||
+        x.device() != freqs.device()) {
+        return false;
+    }
+    if (x.scalar_type() != torch::kFloat16 ||
+        freqs.scalar_type() != torch::kFloat32) {
+        return false;
+    }
+    if (!x.is_contiguous() || !freqs.is_contiguous()) return false;
+    if (x.dim() != 4 || freqs.dim() != 6) return false;
+    if (x.size(0) != 1 || x.size(2) != Heads ||
+        x.size(3) != HeadDim) {
+        return false;
+    }
+    if (x.numel() > std::numeric_limits<uint32_t>::max() ||
+        freqs.numel() > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    return freqs.size(0) == 1 &&
+           freqs.size(1) == x.size(1) &&
+           freqs.size(2) == 1 &&
+           freqs.size(3) == Pairs &&
+           freqs.size(4) == 2 &&
+           freqs.size(5) == 2;
+}
+
 bool krea2_bmg_pair_supported(
     const torch::Tensor& xq,
     const torch::Tensor& xk,
@@ -105,7 +137,7 @@ bool krea2_bmg_pair_supported(
                torch::IntArrayRef({1, 1, 4192, 64, 2, 2});
 }
 
-inline fp16 apply_d120_component(
+inline fp16 apply_fp16_rope_component(
     float f0,
     float f1,
     fp16 x0,
@@ -160,9 +192,9 @@ void launch_rope_d120_bmg(
                     const fp16 x0 = x_ptr[x_offset];
                     const fp16 x1 = x_ptr[x_offset + 1];
                     out_ptr[x_offset] =
-                        apply_d120_component(f00, f01, x0, x1);
+                        apply_fp16_rope_component(f00, f01, x0, x1);
                     out_ptr[x_offset + 1] =
-                        apply_d120_component(f10, f11, x0, x1);
+                        apply_fp16_rope_component(f10, f11, x0, x1);
                 }
             });
     };
@@ -178,6 +210,61 @@ void dispatch_rope_d120_bmg(
     } else {
         launch_rope_d120_bmg<28>(x, freqs, output);
     }
+}
+
+// Animate2 stores FP16 Q/K as contiguous [1,S,40,128] and broadcasts one
+// FP32 frequency matrix over all 40 heads. One work-group per token loads each
+// 2x2 matrix once, avoids the generic kernel's 64-bit flat-index division, and
+// reuses the matrix while streaming the same pair across all heads.
+void launch_rope_wan_animate2_bmg(
+    const torch::Tensor& x,
+    const torch::Tensor& freqs,
+    torch::Tensor& output) {
+    constexpr uint32_t Heads = 40;
+    constexpr uint32_t HeadDim = 128;
+    constexpr uint32_t Pairs = HeadDim / 2;
+    constexpr uint32_t FreqValuesPerToken = Pairs * 4;
+    constexpr uint32_t WG = Pairs;
+
+    const auto* x_ptr = reinterpret_cast<const fp16*>(x.data_ptr());
+    const auto* f_ptr = freqs.data_ptr<float>();
+    auto* out_ptr = reinterpret_cast<fp16*>(output.data_ptr());
+    const uint32_t tokens = static_cast<uint32_t>(x.size(1));
+
+    auto cgf = [&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(static_cast<size_t>(tokens) * WG),
+                sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> item) {
+                const uint32_t token =
+                    static_cast<uint32_t>(item.get_group(0));
+                const uint32_t pair =
+                    static_cast<uint32_t>(item.get_local_id(0));
+                const uint32_t token_x_base =
+                    token * Heads * HeadDim;
+                const uint32_t f_offset =
+                    token * FreqValuesPerToken + pair * 4;
+                const float f00 = f_ptr[f_offset];
+                const float f01 = f_ptr[f_offset + 1];
+                const float f10 = f_ptr[f_offset + 2];
+                const float f11 = f_ptr[f_offset + 3];
+
+#pragma unroll
+                for (uint32_t head = 0; head < Heads; ++head) {
+                    const uint32_t x_offset =
+                        token_x_base + head * HeadDim + pair * 2;
+                    const fp16 x0 = x_ptr[x_offset];
+                    const fp16 x1 = x_ptr[x_offset + 1];
+                    out_ptr[x_offset] =
+                        apply_fp16_rope_component(f00, f01, x0, x1);
+                    out_ptr[x_offset + 1] =
+                        apply_fp16_rope_component(f10, f11, x0, x1);
+                }
+            });
+    };
+    utils::submit_kernel(
+        cgf, x.device(), "kitchen_rope_wan_animate2_bmg");
 }
 #endif
 
@@ -719,6 +806,12 @@ torch::Tensor apply_kitchen_rope1_fast(
                 output,
                 unused,
                 split_half);
+        return output;
+    }
+    if (!split_half && wan_animate2_bmg_single_supported(x, freqs)) {
+        if (output.numel() != 0) {
+            launch_rope_wan_animate2_bmg(x, freqs, output);
+        }
         return output;
     }
     if (!split_half && d120_bmg_single_supported(x, freqs)) {

@@ -199,6 +199,36 @@ def test_kitchen_rope_bmg_d120_single_exact(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("sequence_length", [31, 257, 1590])
+@pytest.mark.parametrize("input_pattern", ["random", "alternating"])
+def test_kitchen_rope_bmg_wan_animate2_single(sequence_length, input_pattern):
+    if not torch.xpu.is_available():
+        pytest.skip("XPU is unavailable")
+    if omni_xpu_kernel.core_aot_target() != "bmg":
+        pytest.skip("BMG-specific Wan Animate2 RoPE route")
+
+    torch.xpu.manual_seed_all(20260808 + sequence_length)
+    shape = (1, sequence_length, 40, 128)
+    freq_shape = (1, sequence_length, 1, 64, 2, 2)
+    if input_pattern == "random":
+        x = torch.randn(*shape, device="xpu", dtype=torch.float16)
+        freqs = torch.randn(*freq_shape, device="xpu", dtype=torch.float32)
+    else:
+        x = torch.empty(*shape, device="xpu", dtype=torch.float16)
+        x[..., 0::2] = 256
+        x[..., 1::2] = -256
+        freqs = torch.empty(*freq_shape, device="xpu", dtype=torch.float32)
+        freqs[..., 0, 0] = 0.5
+        freqs[..., 0, 1] = -0.25
+        freqs[..., 1, 0] = 0.25
+        freqs[..., 1, 1] = 0.5
+
+    assert rotary.kitchen_rope_fast_supported(x, freqs)
+    actual = rotary.apply_kitchen_rope1(x, freqs)
+    expected = _adjacent_reference(x, freqs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_h3_packed_qkv_partial_rms_rope_inplace():
     if not torch.xpu.is_available():
         pytest.skip("XPU is unavailable")
