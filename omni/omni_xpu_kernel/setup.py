@@ -42,8 +42,8 @@ _BMG_CUTE_OVERLAY_NAMESPACE = run_path(
         / "_bmg_mainloop_overlay.py"
     )
 )
-WAN_ANIMATE2_I86_TRANSFORMS = _BMG_CUTE_OVERLAY_NAMESPACE[
-    "WAN_ANIMATE2_I86_TRANSFORMS"
+BMG_MAINLOOP_POLICY_TRANSFORMS = _BMG_CUTE_OVERLAY_NAMESPACE[
+    "BMG_MAINLOOP_POLICY_TRANSFORMS"
 ]
 apply_checked_transforms = _BMG_CUTE_OVERLAY_NAMESPACE[
     "apply_checked_transforms"
@@ -136,7 +136,7 @@ def prepare_bmg_cute_include_overlay(cutlass_root, build_temp):
         BMG_CUTE_REMAINDER_MASK_REPLACEMENT,
         1,
     )
-    text = apply_checked_transforms(text, WAN_ANIMATE2_I86_TRANSFORMS)
+    text = apply_checked_transforms(text, BMG_MAINLOOP_POLICY_TRANSFORMS)
 
     overlay_root = Path(build_temp) / "cute_bmg_include_overlay"
     overlay_dir = overlay_root / relative_dir

@@ -107,7 +107,9 @@ template <
     int MmaKOverride = 0,
     int VTileOverride = 0,
     int HeadDimOverride = 0,
-    bool WanAnimate2I86 = false>
+    bool CacheQFragment = false,
+    bool PrefetchVEarly = false,
+    bool SkipUnchangedMax = false>
 struct D128TileKernel {
   using PlatformConfig = cute_fmha_config::ActiveConfig;
   static constexpr int QTile =
@@ -186,11 +188,15 @@ struct D128TileKernel {
 
 #if defined(OMNI_XPU_ARCH_BMG)
   using MainloopDispatchPolicy =
-      cutlass::fmha::XeDefault<PipelineStages, WanAnimate2I86>;
+      cutlass::fmha::XeDefault<
+          PipelineStages,
+          CacheQFragment,
+          PrefetchVEarly,
+          SkipUnchangedMax>;
 #else
   static_assert(
-      !WanAnimate2I86,
-      "Wan Animate2 iteration 86 is a BMG-only mainloop policy");
+      !CacheQFragment && !PrefetchVEarly && !SkipUnchangedMax,
+      "CUTE mainloop feature policies are BMG-only");
   using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
 #endif
   using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
@@ -216,7 +222,9 @@ template <
     int MmaKOverride = 0,
     int VTileOverride = 0,
     int HeadDimOverride = 0,
-    bool WanAnimate2I86 = false>
+    bool CacheQFragment = false,
+    bool PrefetchVEarly = false,
+    bool SkipUnchangedMax = false>
 void run_d128_tile(
     const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
     int B, int H, int Lq, int Lkv, int D, float scale,
@@ -234,7 +242,9 @@ void run_d128_tile(
       MmaKOverride,
       VTileOverride,
       HeadDimOverride,
-      WanAnimate2I86>;
+      CacheQFragment,
+      PrefetchVEarly,
+      SkipUnchangedMax>;
   using K    = typename KT::Kernel;
   using PS   = typename KT::ProblemShapeType;
 
@@ -555,7 +565,8 @@ at::Tensor sdp_bhld_d128(
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
   if (q.scalar_type() == at::kHalf) {
     if (use_wan_animate2_i86(q, k, v, B, H, Lq, Lkv, D)) {
-      run_d128_tile<cutlass::half_t, 0, 0, 0, 0, 0, 0, true>(
+      run_d128_tile<
+          cutlass::half_t, 0, 0, 0, 0, 0, 0, true, true, true>(
           q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(),
           B, H, Lq, Lkv, D, scale,
           q.stride(2), q.stride(1), q.stride(0),
@@ -691,9 +702,13 @@ at::Tensor sdp_bhld_d120(
     // L4096 has no Q-tile remainder.  Doubling both the Q tile and subgroup
     // count preserves the proven 16-row per-subgroup fragment while halving
     // work-group scheduling and reusing each K/V traversal across twice as
-    // many queries.  L4205 retains Q256/SG16 because its Q512 tail regresses.
+    // many queries. Its exact B70 capture also benefits from the complete
+    // cache-Q/early-V/max-skip policy. L4205 retains Q256/SG16 and the default
+    // mainloop because its Q512 tail regresses and the feature bundle is not
+    // validated for that contract.
     if (L == 4096) {
-      run_d128_tile<cutlass::half_t, 1, 512, 32>(
+      run_d128_tile<
+          cutlass::half_t, 1, 512, 32, 0, 0, 0, true, true, true>(
           q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L,
           D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
           k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),

@@ -380,11 +380,13 @@ def test_bmg_cute_overlay_patches_private_header_copy(monkeypatch, tmp_path):
     collective.mkdir(parents=True)
     original = namespace["BMG_CUTE_REMAINDER_MASK_ORIGINAL"]
     replacement = namespace["BMG_CUTE_REMAINDER_MASK_REPLACEMENT"]
-    i86_transforms = namespace["WAN_ANIMATE2_I86_TRANSFORMS"]
+    policy_transforms = namespace["BMG_MAINLOOP_POLICY_TRANSFORMS"]
     source_header = collective / "xe_fmha_fwd_mainloop.hpp"
-    i86_source = "\n".join(source for _, source, _ in i86_transforms)
+    policy_source = "\n".join(
+        source for _, source, _ in policy_transforms
+    )
     source_header.write_text(
-        f"prefix\n{original}\n{i86_source}\nsuffix\n",
+        f"prefix\n{original}\n{policy_source}\nsuffix\n",
         encoding="utf-8",
     )
     (collective / "fmha_fusion.hpp").write_text(
@@ -403,7 +405,7 @@ def test_bmg_cute_overlay_patches_private_header_copy(monkeypatch, tmp_path):
 
     assert replacement in patched
     assert original not in patched
-    for _, source, transformed in i86_transforms:
+    for _, source, transformed in policy_transforms:
         assert transformed in patched
         assert source not in patched
     assert original in source_header.read_text(encoding="utf-8")
@@ -422,7 +424,7 @@ def test_bmg_cute_overlay_rejects_partial_upstream_match(monkeypatch, tmp_path):
         str(PROJECT_ROOT / "setup.py"), run_name="__cute_bmg_overlay_guard_test__"
     )
 
-    transforms = namespace["WAN_ANIMATE2_I86_TRANSFORMS"]
+    transforms = namespace["BMG_MAINLOOP_POLICY_TRANSFORMS"]
     name, source, _ = transforms[0]
     with pytest.raises(RuntimeError, match=name):
         namespace["apply_checked_transforms"](

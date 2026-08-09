@@ -7,19 +7,21 @@ cannot silently produce a partially integrated kernel.
 """
 
 
-WAN_ANIMATE2_POLICY_ORIGINAL = """\
+BMG_MAINLOOP_POLICY_ORIGINAL = """\
 template <int Stages> class XeDefault {};   // Default FMHA mainloop, P in registers.
 """
 
-WAN_ANIMATE2_POLICY_REPLACEMENT = """\
-// The second template argument selects the iteration-86 structural mainloop.
-// It defaults off so every pre-existing CUTE instantiation retains the pinned
-// upstream execution order and online-softmax work.
-template <int Stages, bool WanAnimate2I86 = false>
+BMG_MAINLOOP_POLICY_REPLACEMENT = """\
+// Independent compile-time features keep model/layout dispatch outside the
+// collective. Defaults preserve the pinned upstream mainloop exactly.
+template <int Stages,
+          bool CacheQFragment = false,
+          bool PrefetchVEarly = false,
+          bool SkipUnchangedMax = false>
 class XeDefault {};   // Default FMHA mainloop, P in registers.
 """
 
-WAN_ANIMATE2_SPECIALIZATION_ORIGINAL = """\
+BMG_MAINLOOP_SPECIALIZATION_ORIGINAL = """\
 template <int Stages,
           bool CausalMask_, bool CachedKV_, bool PagedKV_,
           class TiledMMAQK_, class TiledMMAPV_, int VTiles_,
@@ -30,43 +32,49 @@ template <int Stages,
 struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
 """
 
-WAN_ANIMATE2_SPECIALIZATION_REPLACEMENT = """\
-template <int Stages, bool WanAnimate2I86,
+BMG_MAINLOOP_SPECIALIZATION_REPLACEMENT = """\
+template <int Stages,
+          bool CacheQFragment,
+          bool PrefetchVEarly,
+          bool SkipUnchangedMax,
           bool CausalMask_, bool CachedKV_, bool PagedKV_,
           class TiledMMAQK_, class TiledMMAPV_, int VTiles_,
           class TensorQ_, class TensorK_, class TensorV_,
           class TensorK_cache_, class TensorV_cache_,
           class TiledCopyQ_, class TiledCopyK_, class TiledCopyV_,
           class TiledCopyK_cache_, class TiledCopyV_cache_>
-struct FMHAFwdMainloop<XeDefault<Stages, WanAnimate2I86>,
+struct FMHAFwdMainloop<XeDefault<Stages,
+                                  CacheQFragment,
+                                  PrefetchVEarly,
+                                  SkipUnchangedMax>,
                        CausalMask_, CachedKV_, PagedKV_,
 """
 
-WAN_ANIMATE2_Q_FRAGMENT_ORIGINAL = """\
+BMG_MAINLOOP_Q_FRAGMENT_ORIGINAL = """\
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
     auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_,_,0));
 """
 
-WAN_ANIMATE2_Q_FRAGMENT_REPLACEMENT = """\
+BMG_MAINLOOP_Q_FRAGMENT_REPLACEMENT = """\
     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
-    // Only the i86 specialization consumes this fragment. The generic
-    // specialization leaves it dead and the compiler removes it.
+    // Only CacheQFragment policies consume this fragment. The default policy
+    // leaves it dead and the compiler removes it.
     decltype(tQrQ) tQrQ_cached0;
     auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_,_,0));
 """
 
-WAN_ANIMATE2_Q_PRELOAD_ORIGINAL = """\
+BMG_MAINLOOP_Q_PRELOAD_ORIGINAL = """\
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_,_,_,D));
     }
     for (int D = 0; D < size<4>(pKgK); D++) {
 """
 
-WAN_ANIMATE2_Q_PRELOAD_REPLACEMENT = """\
+BMG_MAINLOOP_Q_PRELOAD_REPLACEMENT = """\
     for (int D = 0; D < size<3>(pQgQ); D++) {
       prefetch(prefetch_q, pQgQ(_,_,_,D));
     }
-    if constexpr (WanAnimate2I86) {
+    if constexpr (CacheQFragment) {
       // Q is invariant across the K loop. Cache one register fragment; this
       // is the only fragment with a repeat load in the validated Q256 policy.
       copy(copy_q, tQgQ(_,_,_,0), tQrQ_cached0);
@@ -74,7 +82,7 @@ WAN_ANIMATE2_Q_PRELOAD_REPLACEMENT = """\
     for (int D = 0; D < size<4>(pKgK); D++) {
 """
 
-WAN_ANIMATE2_GEMM_ORIGINAL = """\
+BMG_MAINLOOP_GEMM_ORIGINAL = """\
       /* GEMM 1: S = K * Q */
       clear(tSrS);
       CUTLASS_PRAGMA_UNROLL
@@ -94,8 +102,8 @@ WAN_ANIMATE2_GEMM_ORIGINAL = """\
       }
 """
 
-WAN_ANIMATE2_GEMM_REPLACEMENT = """\
-      if constexpr (WanAnimate2I86) {
+BMG_MAINLOOP_GEMM_REPLACEMENT = """\
+      if constexpr (PrefetchVEarly) {
         // Start V fetch before Q*K so the long-KV path can overlap its latency
         // with GEMM 1. Other CUTE contracts retain the upstream ordering.
         CUTLASS_PRAGMA_UNROLL
@@ -108,7 +116,7 @@ WAN_ANIMATE2_GEMM_REPLACEMENT = """\
       clear(tSrS);
       CUTLASS_PRAGMA_UNROLL
       for (int D = 0; D < size<4>(tKgK); D++) {
-        if constexpr (WanAnimate2I86) {
+        if constexpr (CacheQFragment) {
           if (D == 0) {
             reorder(tQrQ_cached0, tSrQ);
           } else {
@@ -125,7 +133,7 @@ WAN_ANIMATE2_GEMM_REPLACEMENT = """\
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
-      if constexpr (!WanAnimate2I86) {
+      if constexpr (!PrefetchVEarly) {
         /* V prefetch for GEMM 2 */
         CUTLASS_PRAGMA_UNROLL
         for (int VV = 0; VV < VTiles; VV++) {
@@ -134,7 +142,7 @@ WAN_ANIMATE2_GEMM_REPLACEMENT = """\
       }
 """
 
-WAN_ANIMATE2_SOFTMAX_CALL_ORIGINAL = """\
+BMG_MAINLOOP_SOFTMAX_CALL_ORIGINAL = """\
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
       auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
       reorder(tSrS, tArP);
@@ -148,7 +156,7 @@ WAN_ANIMATE2_SOFTMAX_CALL_ORIGINAL = """\
         if (K != blk_k0) {
 """
 
-WAN_ANIMATE2_SOFTMAX_CALL_REPLACEMENT = """\
+BMG_MAINLOOP_SOFTMAX_CALL_REPLACEMENT = """\
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
       bool subgroup_needs_rescale = K != blk_k0;
       auto rescale = softmax(
@@ -165,7 +173,7 @@ WAN_ANIMATE2_SOFTMAX_CALL_REPLACEMENT = """\
         if (subgroup_needs_rescale) {
 """
 
-WAN_ANIMATE2_SOFTMAX_ORIGINAL = """\
+BMG_MAINLOOP_SOFTMAX_ORIGINAL = """\
   FragSRow
   softmax(bool       first_block, // First softmax block?
           FragS    & tS,          // Softmax src/dst block
@@ -205,7 +213,7 @@ WAN_ANIMATE2_SOFTMAX_ORIGINAL = """\
   }
 """
 
-WAN_ANIMATE2_SOFTMAX_REPLACEMENT = """\
+BMG_MAINLOOP_SOFTMAX_REPLACEMENT = """\
   FragSRow
   softmax(bool       first_block,             // First softmax block?
           FragS    & tS,                      // Softmax src/dst block
@@ -216,7 +224,7 @@ WAN_ANIMATE2_SOFTMAX_REPLACEMENT = """\
     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
 
     FragSRow rescale;
-    if constexpr (WanAnimate2I86) {
+    if constexpr (SkipUnchangedMax) {
       bool local_max_unchanged = true;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < tS_max.size(); i++) {
@@ -272,41 +280,41 @@ WAN_ANIMATE2_SOFTMAX_REPLACEMENT = """\
 """
 
 
-WAN_ANIMATE2_I86_TRANSFORMS = (
+BMG_MAINLOOP_POLICY_TRANSFORMS = (
     (
-        "wan-animate2 policy selector",
-        WAN_ANIMATE2_POLICY_ORIGINAL,
-        WAN_ANIMATE2_POLICY_REPLACEMENT,
+        "BMG mainloop policy selector",
+        BMG_MAINLOOP_POLICY_ORIGINAL,
+        BMG_MAINLOOP_POLICY_REPLACEMENT,
     ),
     (
-        "wan-animate2 policy specialization",
-        WAN_ANIMATE2_SPECIALIZATION_ORIGINAL,
-        WAN_ANIMATE2_SPECIALIZATION_REPLACEMENT,
+        "BMG mainloop policy specialization",
+        BMG_MAINLOOP_SPECIALIZATION_ORIGINAL,
+        BMG_MAINLOOP_SPECIALIZATION_REPLACEMENT,
     ),
     (
-        "wan-animate2 cached Q fragment",
-        WAN_ANIMATE2_Q_FRAGMENT_ORIGINAL,
-        WAN_ANIMATE2_Q_FRAGMENT_REPLACEMENT,
+        "BMG mainloop cached Q fragment",
+        BMG_MAINLOOP_Q_FRAGMENT_ORIGINAL,
+        BMG_MAINLOOP_Q_FRAGMENT_REPLACEMENT,
     ),
     (
-        "wan-animate2 Q preload",
-        WAN_ANIMATE2_Q_PRELOAD_ORIGINAL,
-        WAN_ANIMATE2_Q_PRELOAD_REPLACEMENT,
+        "BMG mainloop Q preload",
+        BMG_MAINLOOP_Q_PRELOAD_ORIGINAL,
+        BMG_MAINLOOP_Q_PRELOAD_REPLACEMENT,
     ),
     (
-        "wan-animate2 QK/V ordering",
-        WAN_ANIMATE2_GEMM_ORIGINAL,
-        WAN_ANIMATE2_GEMM_REPLACEMENT,
+        "BMG mainloop QK/V ordering",
+        BMG_MAINLOOP_GEMM_ORIGINAL,
+        BMG_MAINLOOP_GEMM_REPLACEMENT,
     ),
     (
-        "wan-animate2 softmax call",
-        WAN_ANIMATE2_SOFTMAX_CALL_ORIGINAL,
-        WAN_ANIMATE2_SOFTMAX_CALL_REPLACEMENT,
+        "BMG mainloop softmax call",
+        BMG_MAINLOOP_SOFTMAX_CALL_ORIGINAL,
+        BMG_MAINLOOP_SOFTMAX_CALL_REPLACEMENT,
     ),
     (
-        "wan-animate2 subgroup max skip",
-        WAN_ANIMATE2_SOFTMAX_ORIGINAL,
-        WAN_ANIMATE2_SOFTMAX_REPLACEMENT,
+        "BMG mainloop subgroup max skip",
+        BMG_MAINLOOP_SOFTMAX_ORIGINAL,
+        BMG_MAINLOOP_SOFTMAX_REPLACEMENT,
     ),
 )
 
