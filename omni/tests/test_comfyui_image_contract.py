@@ -63,7 +63,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "3ab29453b560cbd831cb98fcabf2bebc3d6a78c5",
+        "2e481f82072651865b2cfa202aad15c9499efe96",
     ),
     "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.4.13"),
     "COMFY_GGUF_REPOSITORY": (
@@ -288,6 +288,18 @@ class ComfyUIImageContractTest(unittest.TestCase):
             {
                 "test_xpu_backend.py",
                 "test_xpu_comfyui_opt_in.py",
+                "test_xpu_native_hook_unit.py",
+            },
+        )
+        self.assertEqual(
+            validator.AIMDO_NATIVE_HOOK_SYMBOLS,
+            {
+                "urUSMDeviceAlloc",
+                "urUSMFree",
+                "xpu_ur_hook_disable",
+                "xpu_ur_hook_enable",
+                "xpu_ur_hook_get_stats",
+                "xpu_ur_hook_is_interposed",
             },
         )
 

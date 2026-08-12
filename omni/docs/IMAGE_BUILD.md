@@ -70,7 +70,7 @@ The focused Dockerfile separates the frequently changed native projects:
 | `sycl-tla` | Pinned native headers |
 | `kernel-wheel` | Target-specific `omni_xpu_kernel` wheel |
 | `kitchen-wheel` | Pinned Comfy Kitchen wheel |
-| `aimdo-wheel` | Pinned AIMDO wheel with the Level Zero XPU backend |
+| `aimdo-wheel` | Pinned AIMDO wheel with Level Zero VBAR and native allocator pressure support |
 | `builder-comfyui` | Wheel installation and local ComfyUI integration |
 | `runtime-comfyui` | Final labels, environment, and runtime metadata |
 

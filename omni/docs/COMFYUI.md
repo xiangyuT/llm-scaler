@@ -39,13 +39,13 @@ out-of-memory risk:
 /llm/entrypoints/start_comfyui.sh
 ```
 
-The entrypoint enables ComfyUI DynamicVRAM, backed by the image's pinned AIMDO
-XPU/Level Zero allocator, enables Node Manager, and reserves 4 GiB of XPU
-memory. DynamicVRAM stages, unloads, and reloads model weights to preserve
-activation headroom during model switching or text re-encoding. This can avoid
-OOM failures, but the additional weight-management work can reduce performance
-when the workflow already fits in XPU memory. The reserve can be changed with
-`OMNI_COMFYUI_RESERVE_VRAM_GB` when required by a specific workload.
+The entrypoint preloads the image's pinned AIMDO native XPU allocator pressure
+hook, enables ComfyUI DynamicVRAM and Node Manager, and reserves 4 GiB of XPU
+memory. PyTorch retains its native activation cache while AIMDO stages,
+unloads, and reloads model weights under physical-memory pressure. This can
+avoid OOM failures, but can reduce performance when the workflow already fits
+in XPU memory. The reserve can be changed with `OMNI_COMFYUI_RESERVE_VRAM_GB`
+when required by a specific workload.
 
 Additional ComfyUI arguments are forwarded by the entrypoint. For example:
 

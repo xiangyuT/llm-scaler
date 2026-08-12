@@ -89,8 +89,9 @@ connections. The matching `comfyui-manager` Python package is installed in the
 image; append `--enable-manager` when Node Manager is needed.
 
 Use the supplied entrypoint only for workflows with a known or observed XPU
-out-of-memory risk. It enables DynamicVRAM with the pinned AIMDO XPU backend,
-reserves 4 GiB of XPU memory, and enables Node Manager. This lets resident
+out-of-memory risk. It preloads the pinned AIMDO native allocator pressure
+hook, enables DynamicVRAM, reserves 4 GiB of XPU memory, and enables Node
+Manager. This lets resident
 model weights be staged, unloaded, or reloaded to preserve activation
 headroom, but the additional memory management can reduce performance for
 workflows that already fit in memory:
@@ -124,8 +125,8 @@ The focused image contains:
   including the managed GGUF and Nunchaku W4A16 routes;
 - `comfy-aimdo==0.4.13` from the XPU-enabled
   [`comfy-aimdo` fork](https://github.com/xiangyuT/comfy-aimdo-xpu) at revision
-  `3ab29453b560cbd831cb98fcabf2bebc3d6a78c5`, built with its Level Zero
-  allocator backend;
+  `2e481f82072651865b2cfa202aad15c9499efe96`, built with its Level Zero VBAR
+  backend and native PyTorch XPU allocator pressure hook;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
   pinned checkout's requirements;

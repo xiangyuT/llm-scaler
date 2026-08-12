@@ -9,6 +9,7 @@ device and should not encode release-policy assertions in cached build layers.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import importlib
 import importlib.metadata
@@ -90,6 +91,15 @@ AIMDO_SOURCE_ROOT = Path("/llm/comfy-aimdo-xpu")
 AIMDO_REQUIRED_XPU_TESTS = {
     "test_xpu_backend.py",
     "test_xpu_comfyui_opt_in.py",
+    "test_xpu_native_hook_unit.py",
+}
+AIMDO_NATIVE_HOOK_SYMBOLS = {
+    "urUSMDeviceAlloc",
+    "urUSMFree",
+    "xpu_ur_hook_disable",
+    "xpu_ur_hook_enable",
+    "xpu_ur_hook_get_stats",
+    "xpu_ur_hook_is_interposed",
 }
 
 
@@ -185,6 +195,17 @@ def main() -> None:
     if not aimdo_xpu_library.is_file():
         raise RuntimeError(
             f"Comfy AIMDO XPU library is missing: {aimdo_xpu_library}"
+        )
+    aimdo_xpu_cdll = ctypes.CDLL(str(aimdo_xpu_library))
+    missing_aimdo_hook_symbols = sorted(
+        name
+        for name in AIMDO_NATIVE_HOOK_SYMBOLS
+        if not hasattr(aimdo_xpu_cdll, name)
+    )
+    if missing_aimdo_hook_symbols:
+        raise RuntimeError(
+            "Comfy AIMDO native XPU hook symbols are missing: "
+            + ", ".join(missing_aimdo_hook_symbols)
         )
     missing_aimdo_tests = sorted(
         name
@@ -369,6 +390,7 @@ def main() -> None:
         f"manager={comfyui_dependency_versions['comfyui-manager']}, "
         f"kitchen={expected_kitchen}, "
         f"aimdo={expected_aimdo}@{expected_aimdo_revision[:12]}, "
+        f"aimdo_native_hook_symbols={len(AIMDO_NATIVE_HOOK_SYMBOLS)}, "
         f"gguf={dependency_versions['gguf']}, nunchaku={expected_nunchaku}, "
         f"xpu={device_name!r}, kitchen_capabilities={len(capabilities)}, "
         f"h3_templates={len(h3_template_hashes)}"
