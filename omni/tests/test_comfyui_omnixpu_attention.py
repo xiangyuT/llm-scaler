@@ -738,6 +738,50 @@ def test_bmg_minimax_h3_h56_uses_direct_qkv_bhld_cute(
     }
 
 
+def test_bmg_minimax_h3_h56_d128_is_not_limited_to_torch211(monkeypatch):
+    patch, attention, calls = _load_patch(
+        monkeypatch,
+        target="bmg",
+        torch_version="2.12.0+xpu",
+        backend="cute",
+    )
+    seq = 15787
+    q = _FakeTensor(seq=seq, heads=56, stride=(7168, 128, 21504, 1))
+    k = _FakeTensor(seq=seq, heads=56, stride=(7168, 128, 21504, 1))
+    v = _FakeTensor(seq=seq, heads=56, stride=(7168, 128, 21504, 1))
+
+    result = attention.optimized_attention(
+        q, k, v, heads=56, skip_reshape=True
+    )
+
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute_d128_bhld"]
+    assert patch.get_stats()["routes"] == {
+        "minimax_h3_h56_bf16_d128_qkv_bhld": 1
+    }
+
+
+@pytest.mark.parametrize("torch_version", ["2.10.0+xpu", "2.12.0+xpu"])
+def test_bmg_general_d128_capability_route_is_not_torch_minor_gated(
+    monkeypatch, torch_version
+):
+    patch, attention, calls = _load_patch(
+        monkeypatch,
+        target="bmg",
+        torch_version=torch_version,
+        backend="cute",
+    )
+    tensor = _FakeTensor(seq=3520, heads=32, batch=2)
+
+    result = attention.optimized_attention(
+        tensor, tensor, tensor, heads=32, skip_reshape=True
+    )
+
+    assert isinstance(result, _FakeTensor)
+    assert calls == ["cute_d128_bhld"]
+    assert patch.get_stats()["routes"] == {"bmg_b2_bf16_d128_self": 1}
+
+
 @pytest.mark.parametrize(
     ("seq", "stride"),
     [
@@ -767,8 +811,6 @@ def test_bmg_minimax_h3_h56_rejects_unvalidated_contract(
     ("target", "torch_version", "capable", "q_len", "kv_len"),
     [
         ("ptl-h", "2.11.0+xpu", True, 3520, 3520),
-        ("bmg", "2.10.0+xpu", True, 3520, 3520),
-        ("bmg", "2.12.0+xpu", True, 3520, 3520),
         ("bmg", "2.11.0+xpu", False, 3520, 3520),
         ("bmg", "2.11.0+xpu", True, 767, 767),
         ("bmg", "2.11.0+xpu", True, 1023, 1024),

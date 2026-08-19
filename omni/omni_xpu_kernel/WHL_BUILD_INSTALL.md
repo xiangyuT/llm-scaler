@@ -115,8 +115,8 @@ Torch 2.12 的导入测试通过，但 `omni_xpu_kernel` 本身不依赖 torchvi
 
 ## 2. Windows wheel 的组成与限制
 
-Windows 构建产出两个原生扩展，并把核心扩展直接依赖的 oneDNN runtime
-及其 redistribution notices 内置到同一个 wheel：
+Windows 默认构建产出两个原生扩展，并把核心扩展直接依赖的 oneDNN
+runtime 及其 redistribution notices 内置到同一个 wheel：
 
 ```text
 omni_xpu_kernel/_C.cp313-win_amd64.pyd
@@ -129,10 +129,12 @@ omni_xpu_kernel/.libs/onednn/VERSION
 
 - `_C` 包含 norm、FP8、GGUF、SVDQ、INT8、rotary 和 oneDNN 等核心算子。
 - `lgrf_sdp` 是独立的 ESIMD SDP sidecar。
-- CUTE FMHA 当前是 Linux-only，Windows 必须设置
-  `OMNI_XPU_REQUIRE_CUTE=0`。
-- Windows ComfyUI 默认保留 PyTorch SDPA；ESIMD sidecar 仅在显式设置
-  `OMNI_ATTN_BACKEND=esimd` 时由 Custom Node 使用。
+- Windows CUTE FMHA 仍是实验性 BMG sidecar，默认不编译。只有显式设置
+  `OMNI_XPU_REQUIRE_CUTE=1` 并提供完整 `CUTLASS_SYCL_ROOT` 时，wheel 才会
+  额外包含 `omni_xpu_kernel/cute/cute_fmha_torch.cp313-win_amd64.pyd`。
+- Windows ComfyUI 默认保留 PyTorch SDPA。CUTE wheel 也不会改变运行时默认值；
+  只有显式设置 `OMNI_ATTN_BACKEND=cute` 才会由 Custom Node 使用。
+  ESIMD 同理需要显式设置 `OMNI_ATTN_BACKEND=esimd`。
 - `OMNI_XPU_DEVICE=bmg` 会把核心扩展和 sidecar 都 AOT 编译为 BMG
   `spir64_gen` 镜像。
 - PTL-H 必须单独使用 `OMNI_XPU_DEVICE=ptl-h` 构建，不能安装 BMG wheel。
@@ -267,6 +269,26 @@ set "OMNI_XPU_REQUIRE_CUTE=0"
 
 set "PATH=%BUILD_ROOT%\venv\Library\bin;%BUILD_ROOT%\venv\Lib\site-packages\torch\lib;%DNNLROOT%\bin;%PATH%"
 ```
+
+以上是默认的 core-only Windows wheel。要显式构建实验性 BMG CUTE
+sidecar，请准备干净的 sycl-tla v0.8 checkout，并在构建前改为：
+
+```bat
+set "CUTLASS_SYCL_ROOT=<clean-sycl-tla-v0.8-directory>"
+set "OMNI_XPU_REQUIRE_CUTE=1"
+```
+
+构建只在临时 include overlay 中应用兼容修复，不会改写
+`CUTLASS_SYCL_ROOT`；源码版本不匹配时会直接失败。Windows PTL-H CUTE
+尚未验收，因此该显式构建当前只接受 `OMNI_XPU_DEVICE=bmg`。
+
+安装带 CUTE 的 wheel 后，仍需在启动 ComfyUI 前显式启用运行时路由：
+
+```bat
+set "OMNI_ATTN_BACKEND=cute"
+```
+
+不设置该变量时，Windows 继续使用默认 PyTorch SDPA。
 
 如果使用第 4 节的项目内 Windows SDK，继续在同一个 `cmd.exe` 设置：
 

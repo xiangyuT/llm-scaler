@@ -114,7 +114,7 @@ be installed on PTL-H.
 - A matched oneAPI oneDNN 3.9.1 development installation on Windows; the
   build vendors its `dnnl.dll` and redistribution notices into the wheel
 - Intel [`sycl-tla`](https://github.com/intel/sycl-tla) headers for the
-  default Linux CUTE build
+  default Linux CUTE build or explicit experimental Windows BMG CUTE build
 
 Torch and oneDNN are intentionally not listed as isolated build dependencies.
 Install the target runtime first, then build with `--no-build-isolation` so the
@@ -173,6 +173,12 @@ must not be mistaken for the default image artifact.
 
 For Windows build and installation details, see
 [`WHL_BUILD_INSTALL.md`](WHL_BUILD_INSTALL.md).
+
+Windows wheels remain core-only by default even when a sycl-tla checkout is
+present. Set both `CUTLASS_SYCL_ROOT=<clean-sycl-tla-v0.8-checkout>` and
+`OMNI_XPU_REQUIRE_CUTE=1` to include the experimental BMG CUTE `.pyd`. Runtime
+routing is a separate opt-in: ComfyUI continues to use PyTorch SDPA unless
+`OMNI_ATTN_BACKEND=cute` is set before launch.
 
 ### oneDNN consistency
 
@@ -451,12 +457,16 @@ specific. Do not treat a number from one target as validation for another.
 
 ## Native layout
 
-The Linux build produces three extension components:
+The default Linux build produces three extension components:
 
 - `_C.so`: main AOT extension for normalization, quantization, GGUF, SVDQuant,
   rotary, and oneDNN-backed operations;
 - `lgrf_sdp.so`: target-specific ESIMD attention sidecar;
 - `cute_fmha_torch.so`: target-specific CUTLASS-SYCL attention sidecar.
+
+The default Windows build contains `_C.pyd` and `lgrf_sdp.pyd`. An explicitly
+enabled BMG CUTE build adds `cute_fmha_torch.pyd`; it does not enable the CUTE
+runtime route automatically.
 
 `setup.py` derives one architecture macro from `OMNI_XPU_DEVICE` so wheel
 metadata, core AOT ISA, and sidecars identify the same target. BMG core and

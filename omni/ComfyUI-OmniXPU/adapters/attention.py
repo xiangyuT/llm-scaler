@@ -1,6 +1,8 @@
+import glob
 import logging
 import os
 import sys
+from importlib.machinery import EXTENSION_SUFFIXES
 
 import torch
 
@@ -38,7 +40,7 @@ _VALIDATE_OUTPUT_ENV = "OMNIXPU_VALIDATE_ATTENTION_OUTPUT"
 #                      ~6% faster on large self-attn but fp16 accumulator).
 #   torch            — no cute/esimd; always fall back to PyTorch SDPA.
 # The cute backend prefers the packaged omni_xpu_kernel.cute module and falls back
-# to a raw .so (OMNI_CUTE_FMHA_SO overrides the path).
+# to a raw native extension (OMNI_CUTE_FMHA_SO overrides the path).
 #
 # Windows defaults to the upstream PyTorch SDPA path. ESIMD remains available
 # only through an explicit OMNI_ATTN_BACKEND=esimd opt-in.
@@ -443,7 +445,6 @@ def _prepare_bmg_d128_bhld_cute(
     if not (
         _backend_name == "cute"
         and _omni_xpu_target() == "bmg"
-        and _torch_major_minor() == (2, 11)
         and callable(capability)
         and capability()
         and (
@@ -534,19 +535,28 @@ def _use_bmg_wan22_cute_cross(
     )
 
 
-def _default_cute_so():
+def _default_cute_extension():
     # Ship next to the omni_xpu_kernel package by default.
     try:
         import omni_xpu_kernel as pkg
 
         d = os.path.dirname(os.path.abspath(pkg.__file__))
-        return os.path.join(d, "cute", "cute_fmha_torch.so")
+        root = os.path.join(d, "cute", "cute_fmha_torch")
+        for suffix in (*EXTENSION_SUFFIXES, ".pyd", ".so"):
+            exact = root + suffix
+            if os.path.isfile(exact):
+                return exact
+            matches = sorted(glob.glob(root + "*" + suffix))
+            if matches:
+                return matches[0]
+        return root + (".pyd" if sys.platform == "win32" else ".so")
     except Exception:
         return ""
 
 
 def _load_cute_backend():
-    # Preferred: the packaged submodule (handles .so location + torch op load).
+    # Preferred: the packaged submodule (handles native extension location and
+    # torch op load).
     try:
         from omni_xpu_kernel import cute as _cute
 
@@ -554,12 +564,18 @@ def _load_cute_backend():
             return _cute, None
     except Exception:
         pass
-    # Fallback: load a raw .so directly (dev / override via OMNI_CUTE_FMHA_SO).
-    so = os.environ.get("OMNI_CUTE_FMHA_SO", "") or _default_cute_so()
-    if not so or not os.path.exists(so):
-        return None, f"cute backend unavailable (.so not found: {so})"
+    # Fallback: load a raw extension directly (development/path override).
+    extension = (
+        os.environ.get("OMNI_CUTE_FMHA_SO", "")
+        or _default_cute_extension()
+    )
+    if not extension or not os.path.exists(extension):
+        return None, (
+            "cute backend unavailable "
+            f"(native extension not found: {extension})"
+        )
     try:
-        torch.ops.load_library(so)
+        torch.ops.load_library(extension)
         fn = torch.ops.cute_fmha.sdp
 
         class _Wrap:
