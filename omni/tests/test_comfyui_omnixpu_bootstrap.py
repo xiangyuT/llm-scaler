@@ -105,27 +105,16 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
 
 def test_disabled_components_are_reported_without_importing_modules(monkeypatch):
     patches = _load_registry(monkeypatch)
-    cfg = types.SimpleNamespace(
-        attention=False,
-        sparse_attention=False,
-        rotary=False,
-        norm=False,
-        h3_rms_modulation=False,
-        fp8_gemm=False,
-        int8_ffn=False,
-        dynamic_vram_boundary_trim=False,
-        lora_memory=False,
-        seedvr_ada_reshape=False,
-        seedvr_capacity=False,
-        seedvr_cat_pad=False,
-        large_video_preprocess=False,
-        interpolate_fix=False,
-        median_fix=False,
-    )
+    monkeypatch.setenv("OMNIXPU_ENABLE", "0")
+    cfg = _load_module("omnixpu_bootstrap_disabled_config", _PLUGIN / "config.py").Config()
+    components = patches.get_components()
+    assert all(getattr(cfg, entry["flag"]) is False for entry in components)
     patches.apply_all_patches(cfg)
 
-    assert all(entry["status"] == "skipped" for entry in patches.get_status())
-    for entry in patches.get_components():
+    statuses = patches.get_status()
+    assert [entry["name"] for entry in statuses] == [entry["name"] for entry in components]
+    assert all(entry["status"] == "skipped" for entry in statuses)
+    for entry in components:
         module_name = entry["module"].removesuffix(".py").replace("/", ".")
         assert f"omnixpu_bootstrap_test.{module_name}" not in sys.modules
 
