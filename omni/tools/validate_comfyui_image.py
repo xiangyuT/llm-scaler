@@ -9,6 +9,7 @@ device and should not encode release-policy assertions in cached build layers.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import importlib
 import importlib.metadata
@@ -83,7 +84,7 @@ REQUIRED_MINIMAX_H3_TEMPLATES = {
 }
 PINNED_MINIMAX_H3_TEMPLATE_HASHES = {
     "video_minimax_h3_t2v.json": (
-        "eb9cc8c78a4e83a2657c9926677b6353db0ed2947d91da736e9cdae194a3db4a"
+        "2400b01a7c8acae3fed038c0372f08bacb90d2cdf915febadbe7e3f9802506ea"
     ),
 }
 
@@ -237,6 +238,33 @@ def add_comfyui_to_import_path() -> None:
     comfyui_root = str(COMFYUI_ROOT)
     if comfyui_root not in sys.path:
         sys.path.insert(0, comfyui_root)
+
+
+def require_minimax_h3_templates(distribution) -> dict[str, str]:
+    """Bind the current official templates to their installed wheel RECORD."""
+    files = tuple(distribution.files or ())
+    observed = {}
+    for name in sorted(REQUIRED_MINIMAX_H3_TEMPLATES):
+        relative = "comfyui_workflow_templates_json/templates/" + name
+        matches = [entry for entry in files if str(entry) == relative]
+        if len(matches) != 1:
+            raise RuntimeError(f"MiniMax H3 template must have one installed RECORD entry: {name}")
+        entry = matches[0]
+        path = Path(distribution.locate_file(entry))
+        if not path.is_file():
+            raise RuntimeError(f"ComfyUI workflow template package is missing MiniMax H3 file: {name}")
+        content = path.read_bytes()
+        digest = hashlib.sha256(content).digest()
+        record_hash = entry.hash
+        if (record_hash is None or record_hash.mode != "sha256"
+                or record_hash.value != base64.urlsafe_b64encode(digest).decode().rstrip("=")
+                or entry.size != len(content)):
+            raise RuntimeError(f"MiniMax H3 template differs from installed RECORD: {name}")
+        json.loads(content)
+        observed[name] = digest.hex()
+    for name, expected in PINNED_MINIMAX_H3_TEMPLATE_HASHES.items():
+        require_equal(f"MiniMax H3 official template hash ({name})", observed[name], expected)
+    return observed
 
 
 def require_kitchen_xpu_capabilities(backend: dict) -> set[str]:
@@ -791,31 +819,7 @@ def main() -> None:
     template_distribution = importlib.metadata.distribution(
         "comfyui-workflow-templates-json"
     )
-    template_root = Path(
-        template_distribution.locate_file(
-            "comfyui_workflow_templates_json/templates"
-        )
-    )
-    missing_templates = sorted(
-        name for name in REQUIRED_MINIMAX_H3_TEMPLATES
-        if not (template_root / name).is_file()
-    )
-    if missing_templates:
-        raise RuntimeError(
-            "ComfyUI workflow template package is missing MiniMax H3 files: "
-            + ", ".join(missing_templates)
-        )
-    h3_template_hashes = {}
-    for name in sorted(REQUIRED_MINIMAX_H3_TEMPLATES):
-        path = template_root / name
-        json.loads(path.read_text(encoding="utf-8"))
-        h3_template_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    for name, expected_hash in PINNED_MINIMAX_H3_TEMPLATE_HASHES.items():
-        require_equal(
-            f"MiniMax H3 official template hash ({name})",
-            h3_template_hashes[name],
-            expected_hash,
-        )
+    h3_template_hashes = require_minimax_h3_templates(template_distribution)
 
     dependency_manifest = Path("/llm/manifests/comfyui-python-freeze.txt")
     if not dependency_manifest.is_file() or not dependency_manifest.read_text(
