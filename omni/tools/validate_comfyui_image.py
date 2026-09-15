@@ -239,15 +239,88 @@ def add_comfyui_to_import_path() -> None:
         sys.path.insert(0, comfyui_root)
 
 
-def require_kitchen_xpu_capabilities(backend: dict) -> None:
+def require_kitchen_xpu_capabilities(backend: dict) -> set[str]:
     if not backend["available"]:
         raise RuntimeError(f"Kitchen XPU backend is unavailable: {backend}")
-    missing = REQUIRED_KITCHEN_CAPABILITIES - set(backend["capabilities"])
+    capabilities = set(backend["capabilities"])
+    missing = REQUIRED_KITCHEN_CAPABILITIES - capabilities
     if missing:
         raise RuntimeError(
             "Kitchen XPU backend is missing required capabilities: "
             + ", ".join(sorted(missing))
         )
+    return capabilities
+
+
+def prepare_native_allocator_preload() -> None:
+    """Restart the validator with the provider's verified Linux native hook."""
+    if sys.platform != "linux":
+        return
+    if "torch" in sys.modules or "comfy_aimdo.control" in sys.modules:
+        raise RuntimeError("native preload must be prepared before AIMDO or Torch initialization")
+    resolved = subprocess.run(
+        [sys.executable, str(OMNIXPU_RUNTIME_BOOTSTRAP), "--native-preload-path"],
+        check=True, capture_output=True, text=True,
+    )
+    library = resolved.stdout.strip()
+    if (not Path(library).is_absolute() or not Path(library).is_file()
+            or any(character in library for character in " :\t\r\n")):
+        raise RuntimeError("native preload resolver did not return one verified library path")
+    preload = os.environ.get("LD_PRELOAD", "")
+    if library in re.split(r"[\s:]+", preload):
+        # Environment text only avoids a second exec. The runtime gate below
+        # still requires the actual native symbol interposition and hook stats.
+        return
+    environment = dict(os.environ)
+    environment["LD_PRELOAD"] = library + (":" + preload if preload else "")
+    os.execvpe(sys.executable, [sys.executable, *sys.orig_argv[1:]], environment)
+
+
+AIMDO_HOOK_ERROR_COUNTERS = (
+    "runtime_oom_calls", "dropped_metadata_calls", "duplicate_pointer_calls",
+)
+
+
+def require_aimdo_native_allocator(control) -> dict[str, int]:
+    """Require native UR interposition while Torch retains allocator ownership."""
+    require_equal("Comfy AIMDO Linux allocator mode", control.get_xpu_allocator_mode(), "native_hook")
+    if getattr(control, "_xpu_allocator_ready", False) is not True:
+        raise RuntimeError("Comfy AIMDO Linux native hook allocator is not ready")
+    library = getattr(control, "lib", None)
+    if library is None:
+        raise RuntimeError("Comfy AIMDO Linux native runtime is not loaded")
+    if getattr(control, "_torch_allocator", None) is not None or any(
+        getattr(control, name, None) is not None for name in (
+            "_torch_xpu_empty_cache_original", "_torch_xpu_memory_stats_original",
+            "_torch_xpu_reset_peak_stats_original",
+        )
+    ):
+        raise RuntimeError("Comfy AIMDO native mode must retain Torch's native allocator and cache APIs")
+    interposed = getattr(library, "xpu_ur_hook_is_interposed", None)
+    if not callable(interposed) or not interposed():
+        raise RuntimeError("Comfy AIMDO Linux native UR hook is not interposed")
+    query = getattr(control, "get_xpu_ur_hook_stats", None)
+    if not callable(query):
+        raise RuntimeError("Comfy AIMDO native UR hook statistics API is missing")
+    stats = query()
+    # Unknown-device allocation and untracked-pointer free are normal native
+    # forwarding paths. Retain their counters without treating them as errors.
+    required = ("tracked_alloc_calls", "tracked_alloc_bytes", "unknown_device_calls",
+                "unknown_free_calls", *AIMDO_HOOK_ERROR_COUNTERS)
+    if not isinstance(stats, dict) or any(
+        type(stats.get(name)) is not int or stats[name] < 0 for name in required
+    ):
+        raise RuntimeError("Comfy AIMDO native UR hook statistics are incomplete or invalid")
+    errors = {name: stats[name] for name in AIMDO_HOOK_ERROR_COUNTERS if stats[name]}
+    if errors:
+        raise RuntimeError(f"Comfy AIMDO native UR hook reported errors: {errors}")
+    return stats
+
+
+def require_aimdo_tracked_allocation(before: dict[str, int], after: dict[str, int]) -> None:
+    """Require the existing XPU audio check to reach the physical allocator hook."""
+    if any(after[name] <= before[name] for name in ("tracked_alloc_calls", "tracked_alloc_bytes")):
+        raise RuntimeError("Comfy AIMDO native UR hook did not track the XPU audio allocation")
 
 
 def require_native_sparse_attention_backend(
@@ -502,6 +575,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    prepare_native_allocator_preload()
     add_comfyui_to_import_path()
 
     (
@@ -673,17 +747,7 @@ def main() -> None:
             f"Comfy AIMDO XPU library is missing: {aimdo_xpu_library}"
         )
     if sys.platform == "linux":
-        require_equal(
-            "Comfy AIMDO Linux allocator mode",
-            str(comfy_aimdo.control.get_xpu_allocator_mode()),
-            "global",
-        )
-        if not getattr(comfy_aimdo.control, "_xpu_allocator_ready", False):
-            raise RuntimeError("Comfy AIMDO Linux allocator takeover is not ready")
-        if getattr(comfy_aimdo.control, "lib", None) is None:
-            raise RuntimeError("Comfy AIMDO Linux native runtime is not loaded")
-        if getattr(comfy_aimdo.control, "_torch_allocator", None) is None:
-            raise RuntimeError("Comfy AIMDO Linux Torch allocator is not installed")
+        require_aimdo_native_allocator(comfy_aimdo.control)
     missing_aimdo_tests = sorted(
         name
         for name in AIMDO_REQUIRED_XPU_TESTS
@@ -851,9 +915,14 @@ def main() -> None:
 
     require_aimdo_xpu_devices(comfy_aimdo.control)
 
-    require_kitchen_xpu_capabilities(comfy_kitchen.list_backends()["xpu"])
+    capabilities = require_kitchen_xpu_capabilities(comfy_kitchen.list_backends()["xpu"])
     sol_attn_backend = require_native_sparse_attention_backend()
 
+    if sys.platform == "linux":
+        # Start the existing functional audio check with no cached free blocks,
+        # so its allocation must reach UR instead of reusing a Torch cache hit.
+        torch.xpu.empty_cache()
+        aimdo_before = require_aimdo_native_allocator(comfy_aimdo.control)
     audio = torch.linspace(-1.0, 1.0, 1600, device="xpu").unsqueeze(0)
     resampled_audio = torchaudio.functional.resample(audio, 16000, 24000)
     torch.xpu.synchronize()
@@ -864,6 +933,9 @@ def main() -> None:
         )
     if not bool(torch.isfinite(resampled_audio).all().item()):
         raise RuntimeError("torchaudio XPU resample returned non-finite values")
+    if sys.platform == "linux":
+        aimdo_after = require_aimdo_native_allocator(comfy_aimdo.control)
+        require_aimdo_tracked_allocation(aimdo_before, aimdo_after)
 
     device_name = torch.xpu.get_device_name(0)
     print(
@@ -886,6 +958,7 @@ def main() -> None:
         f"aimdo={expected_aimdo}, "
         "aimdo_provider="
         f"{provider_details['comfy_aimdo.xpu']['revision'][:12]}, "
+        f"aimdo_native_hook_stats={aimdo_after if sys.platform == 'linux' else None}, "
         f"provider_wheels={provider_wheel_hashes}, "
         f"runtime_constraints={runtime_constraints}, "
         f"sol_attn={sol_attn_backend['backend']}@"

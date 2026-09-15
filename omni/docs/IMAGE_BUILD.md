@@ -194,7 +194,7 @@ explicit diagnostics and do not replace device-backed acceptance. The same
 validator also requires exact Kitchen, AIMDO, GGUF, and combined Nunchaku
 provider source revisions; both official distributions; both disjoint provider
 distributions; conditional routing; the installed AIMDO XPU backend and Linux
-allocator takeover after a verified unwind of official AIMDO's reversible
+`native_hook` mode after a verified unwind of official AIMDO's reversible
 pre-device state; the
 GGUF/SentencePiece/Protobuf imports; the bundled `nunchaku_torch` runtime; and
 the managed Kitchen GGUF/W4A16 capabilities. It additionally fails closed if
@@ -208,6 +208,17 @@ SOL/SLA/VSA API. It records the installed CUTE DSO hash and rejects an external
 library override. Actual node registration and generated media remain workflow
 lifecycle checks. The legacy Sol custom node, its source pins and experimental
 gate are retired; see [migration and usage](SPARSE_ATTENTION.md).
+
+Before AIMDO or Torch initialization, the validator resolves the installed
+provider's verified native preload and restarts Python with it when needed.
+It requires actual UR hook interposition, preserved Torch allocator ownership,
+valid hook counters and a tracked physical allocation during the existing XPU
+audio check. An explicit `global` allocator selection does not satisfy this gate.
+Only runtime OOM, metadata loss and duplicate-pointer counters are errors;
+unknown-device and untracked-free counters describe normal forwarding paths.
+Clearing unused Torch cache before this isolated validator check establishes
+its allocation boundary; it changes no canonical workflow cache or performance
+measurement.
 
 This source-built image supports BMG.
 
