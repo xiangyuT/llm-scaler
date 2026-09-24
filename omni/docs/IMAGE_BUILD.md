@@ -42,10 +42,12 @@ The supported environment overrides are:
 | `COMFYUI_MANAGER_VERSION` | Integrated Node Manager package version | pinned in `build.sh` |
 | `COMFY_KITCHEN_REPOSITORY` | Kitchen XPU provider source repository | pinned in `build.sh` |
 | `COMFY_KITCHEN_COMMIT` | Kitchen XPU provider source revision | pinned in `build.sh` |
-| `COMFY_KITCHEN_VERSION` | Official Kitchen and matching provider version | pinned in `build.sh` |
+| `COMFY_KITCHEN_VERSION` | Official Kitchen dependency version | pinned in `build.sh` |
+| `COMFY_KITCHEN_PROVIDER_VERSION` | Provider distribution/source-wheel version | pinned in `build.sh` |
 | `COMFY_AIMDO_REPOSITORY` | AIMDO XPU provider source repository | pinned in `build.sh` |
 | `COMFY_AIMDO_COMMIT` | AIMDO XPU provider source revision | pinned in `build.sh` |
-| `COMFY_AIMDO_VERSION` | Official AIMDO and matching provider version | pinned in `build.sh` |
+| `COMFY_AIMDO_VERSION` | Official AIMDO dependency version | pinned in `build.sh` |
+| `COMFY_AIMDO_PROVIDER_VERSION` | Provider distribution/source-wheel version | pinned in `build.sh` |
 | `COMFY_GGUF_REPOSITORY` | GGUF custom-node source repository | pinned in `build.sh` |
 | `COMFY_GGUF_COMMIT` | GGUF custom-node source revision | pinned in `build.sh` |
 | `COMFY_NUNCHAKU_REPOSITORY` | Combined Nunchaku custom-node/runtime repository | pinned in `build.sh` |
@@ -53,9 +55,16 @@ The supported environment overrides are:
 | `COMFY_NUNCHAKU_VERSION` | Expected combined distribution version | pinned in `build.sh` |
 
 ComfyUI repository, commit, and version must be updated together. Kitchen and
-AIMDO official distribution versions and matching XPU provider source pins are
-independently checked against their package and provider manifests. GGUF
-repository and commit must be updated together.
+AIMDO official dependency versions are separate from the versions of their
+pinned provider source wheels. The provider manifests declare which official
+versions each source wheel accepts, and image validation checks both identities.
+For the ComfyUI 0.37.0 candidate, official Kitchen 0.2.35 uses the 0.2.33
+provider source at `shinosawabot/comfy-kitchen`
+(`e4e8ef8c241ebb8a41106355ce73eb05a2e1ddca`), while official AIMDO 0.5.5 uses
+the 0.5.3 provider source at `shinosawabot/comfy-aimdo`
+(`874b805f032a213284170b6f5a2f11f6373c135d`). Their manifests retain
+same-version compatibility for 0.2.33 and 0.5.3 installations respectively.
+GGUF repository and commit must be updated together.
 The same rule applies to the combined Nunchaku repository, commit, and
 distribution version. Sparse attention uses ComfyUI's built-in node and the
 Kitchen XPU provider; it has no separate custom-node source pin. The kernel
@@ -164,8 +173,8 @@ whether `omni/` had uncommitted changes. The final image also records:
 - selected XPU target;
 - ComfyUI version and commit;
 - ComfyUI frontend, workflow-template, and integrated Manager versions;
-- official Kitchen version and Kitchen XPU provider commit;
-- official AIMDO version and AIMDO XPU provider commit;
+- official Kitchen version, Kitchen provider source version, and provider commit;
+- official AIMDO version, AIMDO provider source version, and provider commit;
 - retained XPU provider wheel SHA256 values;
 - GGUF custom-node commit;
 - combined Nunchaku custom-node/runtime version and commit;
