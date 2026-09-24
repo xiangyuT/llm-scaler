@@ -1143,15 +1143,27 @@ def int8_linear(
                 weight_scale,
                 dtype_code,
             )
+        swiglu_fusion_input = x
+        swiglu_output_shape = None
+        if (
+            input_act == "swiglu"
+            and x.ndim == 3
+            and x.shape[-1] > 0
+            and x.is_contiguous()
+        ):
+            swiglu_fusion_input = x.view(-1, x.shape[-1])
+            swiglu_output_shape = (*x.shape[:-1], x.shape[-1] // 2)
         if _can_fuse_h3_swiglu(
-            x,
+            swiglu_fusion_input,
             native,
             weight,
             convrot,
             convrot_groupsize,
             input_act,
         ):
-            x = _apply_h3_swiglu_exact(x, native)
+            x = _apply_h3_swiglu_exact(swiglu_fusion_input, native)
+            if swiglu_output_shape is not None:
+                x = x.view(swiglu_output_shape)
         else:
             x = _apply_input_act(x, input_act)
         if _can_cache_krea2_int8_convrot(
