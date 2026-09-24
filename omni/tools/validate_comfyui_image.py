@@ -789,10 +789,13 @@ def main() -> None:
 
     comfyui_version = run_path("/llm/ComfyUI/comfyui_version.py")["__version__"]
     require_equal("ComfyUI version", comfyui_version, expected_comfyui)
+    # The vendored package has no parent pyproject.toml, so Kitchen resolves
+    # __version__ from the installed canonical distribution. Provider/source
+    # versions are checked independently against the provider manifest above.
     require_equal(
         "Kitchen module version",
         comfy_kitchen.__version__,
-        expected_kitchen_provider,
+        expected_kitchen,
     )
     kitchen_module_path = Path(comfy_kitchen.__file__).resolve()
     if not kitchen_module_path.is_relative_to(kitchen_provider.canonical_root):
