@@ -23,6 +23,8 @@ _attention_traced_contracts = set()
 _MINIMAX_H3_H56_CUTE_MIN_SEQUENCE = 31
 _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE = 6
 _CUTE_D128_MAX_DENSE_ELEMENTS = (1 << 31) - 1
+# Short rectangular queries can lose their CUTE advantage to tail work.
+_BMG_D128_PREFIX_MIN_QUERY = 2048
 _VALIDATE_OUTPUT_ENV = "OMNIXPU_VALIDATE_ATTENTION_OUTPUT"
 
 # ── Attention backend selection ──────────────────────────────────────────────
@@ -476,7 +478,7 @@ def _prepare_bmg_d128_bhld_cute(
     prefix_rectangular = (
         b == 1
         and heads == 32
-        and q_len >= 1024
+        and q_len >= _BMG_D128_PREFIX_MIN_QUERY
         and kv_len > q_len
         and mask is None
         and attn_precision is None

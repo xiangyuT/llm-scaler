@@ -766,13 +766,13 @@ def test_bmg_b1_self_keeps_legacy_cute_route(monkeypatch):
 @pytest.mark.parametrize(
     ("q_len", "kv_len", "pre_shaped"),
     [
-        (1024, 1025, False),
-        (1025, 2049, True),
+        (2048, 2049, False),
+        (2049, 4099, True),
         (4032, 4040, False),
         (4032, 8078, True),
         (4032, 12188, False),
         (4097, 8222, True),
-        (1024, (2 ** 31 - 1) // 4096, True),
+        (2048, (2 ** 31 - 1) // 4096, True),
     ],
 )
 def test_bmg_b1_dense_prefix_rectangular_uses_cute(
@@ -813,8 +813,8 @@ def test_bmg_b1_dense_prefix_rectangular_keeps_bhld_output_request(monkeypatch):
 def test_bmg_b1_prefix_segment_normalizes_unused_batch_stride(monkeypatch):
     patch, attention, calls = _load_patch(monkeypatch, target="bmg")
     q = _FakeTensor(
-        seq=1025, heads=32, pre_shaped=False,
-        stride=(2200 * 4096, 4096, 1), storage_offset=1175 * 4096,
+        seq=2049, heads=32, pre_shaped=False,
+        stride=(2200 * 4096, 4096, 1), storage_offset=151 * 4096,
     )
     kv = _FakeTensor(seq=2050, heads=32, pre_shaped=False)
     prepared = []
@@ -826,11 +826,11 @@ def test_bmg_b1_prefix_segment_normalizes_unused_batch_stride(monkeypatch):
     monkeypatch.setattr(patch._backend_sdp, "sdp_bhld_d128", observe)
     result = attention.optimized_attention(q, kv, kv, heads=32)
 
-    assert result.shape == (1, 1025, 4096)
+    assert result.shape == (1, 2049, 4096)
     assert calls == []
     assert len(prepared) == 1
     q_bhld, k_bhld, v_bhld = prepared[0]
-    assert q_bhld.stride() == (1025 * 4096, 128, 4096, 1)
+    assert q_bhld.stride() == (2049 * 4096, 128, 4096, 1)
     assert q_bhld.storage_offset() == q.storage_offset()
     assert k_bhld.stride() == v_bhld.stride() == (2050 * 4096, 128, 4096, 1)
     assert patch.get_stats()["routes"] == {
@@ -868,8 +868,8 @@ def test_bmg_b1_prefix_segment_cpu_tensor_view_has_no_copy(monkeypatch):
 def test_bmg_b1_prefix_segment_xpu_dispatch_preserves_source_storage(monkeypatch):
     patch, attention, calls = _load_patch(monkeypatch, target="bmg")
     width = 32 * 128
-    backing = torch.randn((1, 1031, width), device="xpu", dtype=torch.bfloat16)
-    q = backing[:, 6:1031]
+    backing = torch.randn((1, 2055, width), device="xpu", dtype=torch.bfloat16)
+    q = backing[:, 6:2055]
     k = torch.randn((1, 2057, width), device="xpu", dtype=torch.bfloat16)[:, 7:]
     v = torch.randn((1, 2059, width), device="xpu", dtype=torch.bfloat16)[:, 9:]
     prepared = []
@@ -887,8 +887,8 @@ def test_bmg_b1_prefix_segment_xpu_dispatch_preserves_source_storage(monkeypatch
         assert tensor.data_ptr() == source.data_ptr()
         assert tensor.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
         assert tensor.storage_offset() == source.storage_offset()
-    assert prepared[0][0].stride() == (1025 * width, 128, width, 1)
-    assert out.shape == (1, 1025, width)
+    assert prepared[0][0].stride() == (2049 * width, 128, width, 1)
+    assert out.shape == (1, 2049, width)
     assert out.data_ptr() == q.data_ptr()
     assert patch.get_stats()["routes"] == {
         "bmg_b1_bf16_d128_prefix_rectangular": 1
@@ -898,16 +898,18 @@ def test_bmg_b1_prefix_segment_xpu_dispatch_preserves_source_storage(monkeypatch
 @pytest.mark.parametrize(
     ("q_len", "kv_len", "batch", "kwargs"),
     [
-        (1023, 2048, 1, {}),
+        (1024, 2048, 1, {}),
+        (1025, 2050, 1, {}),
+        (2047, 4095, 1, {}),
         (1024, 1024, 1, {"mask": _FakeTensor(seq=1024, heads=32)}),
-        (1024, 2048, 1, {"mask": _FakeTensor(seq=1024, heads=32)}),
-        (1024, 2048, 1, {"attn_precision": "fp32"}),
-        (1024, 2048, 1, {"dropout_p": 0.1}),
-        (1024, 2048, 1, {"is_causal": True}),
-        (1024, 2048, 1, {"enable_gqa": True}),
-        (1024, 2048, 1, {"scale": 0.5}),
+        (2048, 4096, 1, {"mask": _FakeTensor(seq=2048, heads=32)}),
+        (2048, 4096, 1, {"attn_precision": "fp32"}),
+        (2048, 4096, 1, {"dropout_p": 0.1}),
+        (2048, 4096, 1, {"is_causal": True}),
+        (2048, 4096, 1, {"enable_gqa": True}),
+        (2048, 4096, 1, {"scale": 0.5}),
         (4032, 12188, 2, {}),
-        (1024, (2 ** 31 - 1) // 4096 + 1, 1, {}),
+        (2048, (2 ** 31 - 1) // 4096 + 1, 1, {}),
     ],
 )
 def test_bmg_b1_prefix_rectangular_unsupported_semantics_keep_fallback(
