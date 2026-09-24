@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import os
+import sys
 from pathlib import Path
 import types
 
@@ -22,14 +24,38 @@ def load_adapter():
     return module
 
 
-@pytest.fixture
-def runtime(monkeypatch):
-    qwen = pytest.importorskip("comfy.ldm.qwen_image21.model")
-    import comfy.model_management as mm
-    import comfy.model_patcher as mp
-
+@pytest.fixture(scope="module")
+def comfy_runtime():
     if not torch.xpu.is_available():
         pytest.skip("requires installed XPU Torch")
+    comfy_root = Path(os.environ.get("COMFYUI_ROOT", "/llm/ComfyUI"))
+    if not comfy_root.is_dir():
+        pytest.skip("requires installed ComfyUI")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.syspath_prepend(str(comfy_root))
+        patch.setenv("OMNIXPU_PROVIDER_BOOTSTRAP", "auto")
+        name = "_comfyui_omnixpu_runtime_bootstrap"
+        bootstrap = sys.modules.get(name)
+        if bootstrap is None:
+            spec = importlib.util.spec_from_file_location(
+                name, PLUGIN / "runtime_bootstrap.py"
+            )
+            bootstrap = importlib.util.module_from_spec(spec)
+            patch.setitem(sys.modules, name, bootstrap)
+            spec.loader.exec_module(bootstrap)
+        state = bootstrap.bootstrap(dynamic_vram_override=False)
+        assert state["providers"]["comfy_kitchen.xpu"]["status"] == "active", state
+        # With an installed runtime, missing or incompatible model imports fail
+        # collection of the fixture instead of silently skipping its checks.
+        qwen = importlib.import_module("comfy.ldm.qwen_image21.model")
+        mm = importlib.import_module("comfy.model_management")
+        mp = importlib.import_module("comfy.model_patcher")
+        yield qwen, mm, mp
+
+
+@pytest.fixture
+def runtime(monkeypatch, comfy_runtime):
+    qwen, mm, mp = comfy_runtime
     adapter = load_adapter()
     cache = qwen.PoseBranchCache
     # Permit use after the real plugin startup, while restoring that state
