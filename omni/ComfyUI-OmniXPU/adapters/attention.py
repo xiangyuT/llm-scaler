@@ -22,6 +22,7 @@ _attention_traced_contracts = set()
 
 _MINIMAX_H3_H56_CUTE_MIN_SEQUENCE = 31
 _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE = 6
+_CUTE_D128_MAX_DENSE_ELEMENTS = (1 << 31) - 1
 _VALIDATE_OUTPUT_ENV = "OMNIXPU_VALIDATE_ATTENTION_OUTPUT"
 
 # ── Attention backend selection ──────────────────────────────────────────────
@@ -358,6 +359,33 @@ def _is_dense_bld(tensor, batch, seq, width):
     )
 
 
+def _b1_dense_segment_bhld(tensor, seq, heads, dim_head, skip_reshape):
+    """Normalize only the unused B1 stride of a dense sequence slice."""
+    width = heads * dim_head
+    if skip_reshape:
+        shape = (1, heads, seq, dim_head)
+        if tuple(tensor.shape) != shape:
+            return None
+        stride = tuple(tensor.stride())
+        if len(stride) != 4 or stride[3] != 1:
+            return None
+        packed = stride[1:3] == (seq * dim_head, dim_head)
+        blhd_backed = stride[1:3] == (dim_head, width)
+        if not (packed or blhd_backed):
+            return None
+        return tensor.as_strided(
+            shape, (seq * width, stride[1], stride[2], 1),
+            tensor.storage_offset(),
+        )
+    shape = (1, seq, width)
+    if tuple(tensor.shape) != shape or tuple(tensor.stride())[1:] != (width, 1):
+        return None
+    normalized = tensor.as_strided(
+        shape, (seq * width, width, 1), tensor.storage_offset()
+    )
+    return normalized.view(1, seq, heads, dim_head).transpose(1, 2)
+
+
 _ANIMATE2_CROSS_ENV = "OMNIXPU_ANIMATE2_CROSS"
 _ANIMATE2_SHAPES_ENV = "OMNIXPU_ANIMATE2_SHAPES"
 _ANIMATE2_HEADS = 40
@@ -438,10 +466,26 @@ def _prepare_bmg_d128_bhld_cute(
     kv_len,
     skip_reshape,
     skip_output_reshape,
+    mask,
+    attn_precision,
+    kwargs,
 ):
     capability = getattr(_backend_sdp, "supports_d128_bhld", None)
     self_attention = q_len == kv_len and q_len >= 768
     cross_attention = kv_len == 1024 and q_len >= 1024
+    prefix_rectangular = (
+        b == 1
+        and heads == 32
+        and q_len >= 1024
+        and kv_len > q_len
+        and mask is None
+        and attn_precision is None
+        and not kwargs.get("is_causal", False)
+        and not kwargs.get("dropout_p", 0.0)
+        and not any(getattr(t, "requires_grad", False) for t in (q, k, v))
+        and q_len * heads * dim_head <= _CUTE_D128_MAX_DENSE_ELEMENTS
+        and kv_len * heads * dim_head <= _CUTE_D128_MAX_DENSE_ELEMENTS
+    )
     minimax_h3_attention = (
         b == 1
         and heads == 56
@@ -459,6 +503,7 @@ def _prepare_bmg_d128_bhld_cute(
         or (b == 1 and cross_attention)
         or minimax_h3_attention
         or animate2_attention
+        or prefix_rectangular
     )
     if not (
         _backend_name == "cute"
@@ -481,7 +526,13 @@ def _prepare_bmg_d128_bhld_cute(
     ):
         return None
 
-    if skip_reshape:
+    if prefix_rectangular:
+        q_bhld = _b1_dense_segment_bhld(q, q_len, heads, dim_head, skip_reshape)
+        k_bhld = _b1_dense_segment_bhld(k, kv_len, heads, dim_head, skip_reshape)
+        v_bhld = _b1_dense_segment_bhld(v, kv_len, heads, dim_head, skip_reshape)
+        if any(tensor is None for tensor in (q_bhld, k_bhld, v_bhld)):
+            return None
+    elif skip_reshape:
         q_bhld, k_bhld, v_bhld = q, k, v
     else:
         width = heads * dim_head
@@ -762,6 +813,9 @@ def apply():
                 kv_len,
                 skip_reshape,
                 skip_output_reshape,
+                mask,
+                attn_precision,
+                kwargs,
             )
             if target == "bmg"
             else None
@@ -935,6 +989,8 @@ def apply():
                 route = (
                     f"animate2_b{b}_{tag}_d128_q{q_len}_kv{kv_len}_cross"
                 )
+            elif b == 1 and q_len < kv_len:
+                route = "bmg_b1_bf16_d128_prefix_rectangular"
             else:
                 route = f"bmg_b{b}_bf16_d128_kv1024_cross"
             route_call_count = _record_attention_route(route)

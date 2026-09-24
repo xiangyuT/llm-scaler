@@ -37,6 +37,7 @@ class _FakeTensor:
         stride=None,
         batch=1,
         non_finite=False,
+        storage_offset=0,
     ):
         if pre_shaped:
             self.shape = (batch, heads, seq, dim_head)
@@ -52,6 +53,7 @@ class _FakeTensor:
         self.dtype = dtype
         self.device = types.SimpleNamespace(type="xpu")
         self.non_finite = non_finite
+        self._storage_offset = storage_offset
         self._non_finite_checks = []
 
     @classmethod
@@ -62,6 +64,7 @@ class _FakeTensor:
         tensor.dtype = source.dtype
         tensor.device = source.device
         tensor.non_finite = source.non_finite
+        tensor._storage_offset = source._storage_offset
         tensor._non_finite_checks = source._non_finite_checks
         return tensor
 
@@ -115,6 +118,15 @@ class _FakeTensor:
 
     def stride(self):
         return self._stride
+
+    def storage_offset(self):
+        return self._storage_offset
+
+    def as_strided(self, shape, stride, storage_offset=None):
+        tensor = self._with_metadata(self, shape, stride)
+        if storage_offset is not None:
+            tensor._storage_offset = storage_offset
+        return tensor
 
     def __ne__(self, other):
         self._non_finite_checks.append(True)
@@ -748,6 +760,189 @@ def test_bmg_b1_self_keeps_legacy_cute_route(monkeypatch):
     assert isinstance(result, _FakeTensor)
     assert calls == ["cute"]
     assert patch.get_stats()["cute"] == 1
+    assert patch.get_stats()["routes"] == {}
+
+
+@pytest.mark.parametrize(
+    ("q_len", "kv_len", "pre_shaped"),
+    [
+        (1024, 1025, False),
+        (1025, 2049, True),
+        (4032, 4040, False),
+        (4032, 8078, True),
+        (4032, 12188, False),
+        (4097, 8222, True),
+        (1024, (2 ** 31 - 1) // 4096, True),
+    ],
+)
+def test_bmg_b1_dense_prefix_rectangular_uses_cute(
+    monkeypatch, q_len, kv_len, pre_shaped
+):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=q_len, heads=32, pre_shaped=pre_shaped)
+    kv = _FakeTensor(seq=kv_len, heads=32, pre_shaped=pre_shaped)
+
+    result = attention.optimized_attention(
+        q, kv, kv, heads=32, skip_reshape=pre_shaped
+    )
+
+    assert isinstance(result, _FakeTensor)
+    assert result.shape == (1, q_len, 32 * 128)
+    assert calls == ["cute_d128_bhld"]
+    assert patch.get_stats()["routes"] == {
+        "bmg_b1_bf16_d128_prefix_rectangular": 1
+    }
+
+
+def test_bmg_b1_dense_prefix_rectangular_keeps_bhld_output_request(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=2049, heads=32)
+    kv = _FakeTensor(seq=6150, heads=32)
+
+    result = attention.optimized_attention(
+        q, kv, kv, heads=32, skip_reshape=True, skip_output_reshape=True
+    )
+
+    assert result.shape == (1, 32, 2049, 128)
+    assert calls == ["cute_d128_bhld"]
+    assert patch.get_stats()["routes"] == {
+        "bmg_b1_bf16_d128_prefix_rectangular": 1
+    }
+
+
+def test_bmg_b1_prefix_segment_normalizes_unused_batch_stride(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(
+        seq=1025, heads=32, pre_shaped=False,
+        stride=(2200 * 4096, 4096, 1), storage_offset=1175 * 4096,
+    )
+    kv = _FakeTensor(seq=2050, heads=32, pre_shaped=False)
+    prepared = []
+
+    def observe(q_bhld, k_bhld, v_bhld):
+        prepared.append((q_bhld, k_bhld, v_bhld))
+        return q_bhld
+
+    monkeypatch.setattr(patch._backend_sdp, "sdp_bhld_d128", observe)
+    result = attention.optimized_attention(q, kv, kv, heads=32)
+
+    assert result.shape == (1, 1025, 4096)
+    assert calls == []
+    assert len(prepared) == 1
+    q_bhld, k_bhld, v_bhld = prepared[0]
+    assert q_bhld.stride() == (1025 * 4096, 128, 4096, 1)
+    assert q_bhld.storage_offset() == q.storage_offset()
+    assert k_bhld.stride() == v_bhld.stride() == (2050 * 4096, 128, 4096, 1)
+    assert patch.get_stats()["routes"] == {
+        "bmg_b1_bf16_d128_prefix_rectangular": 1
+    }
+
+
+def test_bmg_b1_prefix_segment_cpu_tensor_view_has_no_copy(monkeypatch):
+    patch, _, _ = _load_patch(monkeypatch, target="bmg")
+    width = 32 * 128
+    backing = torch.arange(23 * width, dtype=torch.float32).view(1, 23, width)
+    segment = backing[:, 7:17]
+    assert segment.stride(0) == 23 * width
+    assert segment.storage_offset() == 7 * width
+
+    for source, pre_shaped in (
+        (segment, False),
+        (segment.view(1, 10, 32, 128).transpose(1, 2), True),
+    ):
+        view = patch._b1_dense_segment_bhld(source, 10, 32, 128, pre_shaped)
+        expected = segment.view(1, 10, 32, 128).transpose(1, 2)
+        assert view.shape == (1, 32, 10, 128)
+        assert view.stride() == (10 * width, 128, width, 1)
+        assert view.storage_offset() == source.storage_offset()
+        assert view.data_ptr() == source.data_ptr()
+        assert view.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+        assert torch.equal(view, expected)
+
+    assert patch._b1_dense_segment_bhld(segment[:, ::2], 5, 32, 128, False) is None
+    packed = torch.empty(1, 32, 23, 128)[:, :, 7:17]
+    assert patch._b1_dense_segment_bhld(packed, 10, 32, 128, True) is None
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU unavailable")
+def test_bmg_b1_prefix_segment_xpu_dispatch_preserves_source_storage(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    width = 32 * 128
+    backing = torch.randn((1, 1031, width), device="xpu", dtype=torch.bfloat16)
+    q = backing[:, 6:1031]
+    k = torch.randn((1, 2057, width), device="xpu", dtype=torch.bfloat16)[:, 7:]
+    v = torch.randn((1, 2059, width), device="xpu", dtype=torch.bfloat16)[:, 9:]
+    prepared = []
+
+    def observe(q_bhld, k_bhld, v_bhld):
+        prepared.append((q_bhld, k_bhld, v_bhld))
+        return q_bhld
+
+    monkeypatch.setattr(patch._backend_sdp, "sdp_bhld_d128", observe)
+    out = attention.optimized_attention(q, k, v, heads=32)
+
+    assert calls == []
+    assert len(prepared) == 1
+    for source, tensor in zip((q, k, v), prepared[0]):
+        assert tensor.data_ptr() == source.data_ptr()
+        assert tensor.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+        assert tensor.storage_offset() == source.storage_offset()
+    assert prepared[0][0].stride() == (1025 * width, 128, width, 1)
+    assert out.shape == (1, 1025, width)
+    assert out.data_ptr() == q.data_ptr()
+    assert patch.get_stats()["routes"] == {
+        "bmg_b1_bf16_d128_prefix_rectangular": 1
+    }
+
+
+@pytest.mark.parametrize(
+    ("q_len", "kv_len", "batch", "kwargs"),
+    [
+        (1023, 2048, 1, {}),
+        (1024, 1024, 1, {"mask": _FakeTensor(seq=1024, heads=32)}),
+        (1024, 2048, 1, {"mask": _FakeTensor(seq=1024, heads=32)}),
+        (1024, 2048, 1, {"attn_precision": "fp32"}),
+        (1024, 2048, 1, {"dropout_p": 0.1}),
+        (1024, 2048, 1, {"is_causal": True}),
+        (1024, 2048, 1, {"enable_gqa": True}),
+        (1024, 2048, 1, {"scale": 0.5}),
+        (4032, 12188, 2, {}),
+        (1024, (2 ** 31 - 1) // 4096 + 1, 1, {}),
+    ],
+)
+def test_bmg_b1_prefix_rectangular_unsupported_semantics_keep_fallback(
+    monkeypatch, q_len, kv_len, batch, kwargs
+):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=q_len, heads=32, batch=batch)
+    kv = _FakeTensor(seq=kv_len, heads=32, batch=batch)
+
+    result = attention.optimized_attention(
+        q, kv, kv, heads=32, skip_reshape=True, **kwargs
+    )
+
+    assert result == "torch-output"
+    assert calls == ["torch"]
+    assert patch.get_stats()["routes"] == {}
+
+
+def test_bmg_b1_prefix_rectangular_requires_dense_layout_and_no_grad(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=2049, heads=32)
+    kv = _FakeTensor(seq=8193, heads=32)
+    q.requires_grad = True
+
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, skip_reshape=True
+    ) == "torch-output"
+
+    q.requires_grad = False
+    q._stride = (2049 * 4096, 128, 8192, 1)
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, skip_reshape=True
+    ) == "torch-output"
+
+    assert calls == ["torch", "torch"]
     assert patch.get_stats()["routes"] == {}
 
 
