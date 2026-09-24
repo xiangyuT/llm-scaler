@@ -1150,6 +1150,9 @@ def int8_linear(
             and x.ndim == 3
             and x.shape[-1] > 0
             and x.is_contiguous()
+            # Native packed row offsets use int32 before splitting gate/up.
+            and x.numel() <= 2**31 - 1
+            and x.shape[-1] <= 2**31 - 1
         ):
             swiglu_fusion_input = x.view(-1, x.shape[-1])
             swiglu_output_shape = (*x.shape[:-1], x.shape[-1] // 2)
