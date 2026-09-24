@@ -19,6 +19,7 @@ No workflow or model-pipeline replacement is required.
 | Kitchen XPU backend | INT8/QTensor operations, FP8 QDQ and stochastic rounding, SVDQuant, AdaLN, four RoPE APIs, and ConvRot |
 | ComfyUI adapter | Attention routing, LayerNorm/RMSNorm class integration, the remaining FP8 model/factory bridge, and fused Lumina/Z-Image INT8 FFN wiring |
 | Memory adapter | Cached whole-LoRA model budgets plus optional DynamicVRAM per-layer XPU staging measurements |
+| Qwen Image 2.1 cache | XPU slot selection, patch-safe prefix reuse, and pinned host cache data |
 | SeedVR2 capacity | Guarded Ada broadcast plus byte-bounded RMSNorm, SwiGLU, and window-attention materialization |
 | SeedVR2 native adapters | Validated BMG FP16 GroupNorm and causal-prefix cat-pad routing |
 | Large-video preprocessing | Source-guarded, bounded CPU materialization for PIL Lanczos resize, SeedVR input padding, and XPU VAE input staging |
@@ -117,6 +118,7 @@ OMNIXPU_QUANTIZED_MATMUL=0  # Disable native INT8 model-format eligibility
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
 OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
+OMNIXPU_QWEN_IMAGE21_CACHE=0 # Disable Qwen Image 2.1 cache compatibility adapter
 OMNIXPU_SEEDVR_ADA_RESHAPE=0  # Disable the guarded SeedVR2 Ada reshape patch
 OMNIXPU_SEEDVR_CAPACITY=0     # Disable bounded SeedVR2 activation scheduling
 OMNIXPU_SEEDVR_CAT_PAD=0      # Disable validated BMG causal-prefix cat-pad routing
@@ -177,6 +179,23 @@ See [native sparse attention usage](../docs/SPARSE_ATTENTION.md) for model
 connections, trained SLA/VSA recipes, fallback diagnostics and migration from
 the deprecated **Patch Sol-Attn** custom node. The old experimental environment
 gate is not needed; `OMNIXPU_SPARSE_ATTENTION` controls this adapter.
+
+## Qwen Image 2.1 cache integration
+
+When a compatible ComfyUI includes Qwen Image 2.1, the XPU cache adapter fixes
+shared Wan cache slot selection and uses Torch-owned pinned CPU storage for
+cache data offloaded from XPU. `--disable-pinned-memory` retains pageable
+storage; `--async-offload 2` enables ComfyUI's existing prefetch streams.
+Select `cpu` in **Qwen Image 2.1 Cache**, or let `auto` choose host storage.
+Quantization scales keep their upstream storage behavior. A pinned allocation
+OOM falls back to pageable storage; other runtime errors remain visible.
+
+A ModelPatcher diffusion wrapper clears and bypasses prefix caching while
+`post_input`, `attn1_patch`, `single_block`, or block replacements are active.
+Normal caching resumes with empty slots after that path, including exceptions.
+Non-XPU calls retain upstream behavior. Missing or incompatible Qwen Image 2.1
+interfaces leave the adapter unapplied and are reported in OmniXPU Status.
+This adapter does not add the model, its weights, or a ComfyUI version upgrade.
 
 ## Native compiled inference
 
