@@ -87,8 +87,8 @@ def test_apply_is_idempotent(runtime):
     assert first == (runtime.cache.select, runtime.cache.put, runtime.mp.ModelPatcher.__init__)
 
 
-def test_cache_copy_opt_in_uses_real_prefix_wrapper_and_exact_join(runtime, monkeypatch):
-    monkeypatch.setenv(runtime.adapter._COPY_ENV, "1")
+def test_cache_copy_default_uses_real_prefix_wrapper_and_exact_join(runtime, monkeypatch):
+    monkeypatch.delenv(runtime.adapter._COPY_ENV, raising=False)
     original = runtime.qwen.prefix_cached_attention
     activate(runtime)
     factory = runtime.qwen.prefix_cached_attention
@@ -180,7 +180,7 @@ def test_cache_copy_source_contract_failure_is_atomic(runtime, monkeypatch):
                       runtime.mp.ModelPatcher.__init__, runtime.qwen.prefix_cached_attention)
 
 
-def test_cache_copy_defaults_off_and_rejects_invalid_opt_in_atomically(runtime, monkeypatch):
+def test_cache_copy_defaults_on_and_rejects_invalid_override_atomically(runtime, monkeypatch):
     original = runtime.qwen.prefix_cached_attention
     monkeypatch.setenv(runtime.adapter._COPY_ENV, "unexpected")
     before = runtime.cache.select, runtime.cache.put, runtime.mp.ModelPatcher.__init__
@@ -189,6 +189,13 @@ def test_cache_copy_defaults_off_and_rejects_invalid_opt_in_atomically(runtime, 
     assert before == (runtime.cache.select, runtime.cache.put, runtime.mp.ModelPatcher.__init__)
     assert runtime.qwen.prefix_cached_attention is original
     monkeypatch.delenv(runtime.adapter._COPY_ENV)
+    activate(runtime)
+    assert getattr(runtime.qwen.prefix_cached_attention, runtime.adapter._COPY_MARKER) is original
+
+
+def test_cache_copy_explicit_off_preserves_original_factory(runtime, monkeypatch):
+    original = runtime.qwen.prefix_cached_attention
+    monkeypatch.setenv(runtime.adapter._COPY_ENV, "0")
     activate(runtime)
     assert runtime.qwen.prefix_cached_attention is original
 

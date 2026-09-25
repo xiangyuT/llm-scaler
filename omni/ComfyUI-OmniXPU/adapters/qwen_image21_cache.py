@@ -15,6 +15,7 @@ log = logging.getLogger("ComfyUI-OmniXPU")
 _MARKER = "__omnixpu_qwen_image21_cache_original__"
 _WRAPPER_KEY = "omnixpu_qwen_image21_prefix_cache"
 _PREFIX_PATCHES = ("post_input", "attn1_patch", "single_block")
+# Preserve the legacy env name; unset or empty enables, and "0" disables.
 _COPY_ENV = "OMNIXPU_EXPERIMENTAL_QWEN21_CACHE_COPY"
 _COPY_MARKER = "__omnixpu_qwen21_cache_copy_original__"
 _COPY_MIN_QUERY = 2048  # The existing BMG D128 prefix CUTE admission floor.
@@ -24,7 +25,7 @@ _PREFIX_SOURCE_SHA256 = "7e98fa30a8530e50d4030a207cdb4c5cfb3f7b98674ff2728b8b697
 
 def _copy_prefix_inputs(q, k, v, prefix_k, prefix_v, heads, options):
     """Admit only source-bound B70 target cache hits; otherwise use original."""
-    if (os.environ.get(_COPY_ENV, "0") != "1" or not isinstance(options, dict)
+    if (os.environ.get(_COPY_ENV, "1") not in ("", "1") or not isinstance(options, dict)
             or os.environ.get("OMNI_ATTN_BACKEND", "auto").lower() not in ("auto", "cute")
             or options.get("optimized_attention_override")
             or torch.compiler.is_compiling() or heads != 32):
@@ -61,10 +62,10 @@ def _copy_prefix_inputs(q, k, v, prefix_k, prefix_v, heads, options):
 
 
 def _copy_prefix_factory(qwen):
-    mode = os.environ.get(_COPY_ENV, "0")
+    mode = os.environ.get(_COPY_ENV, "1")
     if mode not in ("", "0", "1"):
         return None, f"{_COPY_ENV} must be 0 or 1"
-    if mode != "1":
+    if mode == "0":
         return None, None
     original = qwen.prefix_cached_attention
     if hasattr(original, _COPY_MARKER):
