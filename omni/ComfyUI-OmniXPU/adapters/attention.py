@@ -418,7 +418,9 @@ def _prepare_experimental_masked_d128(
             and not kwargs.get("dropout_p", 0.0)
             and not kwargs.get("enable_gqa", False)
             and "scale" not in kwargs
-            and not (set(kwargs) - {"transformer_options", "is_causal", "dropout_p", "enable_gqa"})
+            and kwargs.get("_inside_attn_wrapper", True) is True
+            and not (set(kwargs) - {"transformer_options", "is_causal", "dropout_p",
+                                    "enable_gqa", "_inside_attn_wrapper"})
             and not any(getattr(t, "requires_grad", False) for t in (q, k, v))
             and q_len * 4096 <= _CUTE_D128_MAX_DENSE_ELEMENTS
             and kv_len * 4096 <= _CUTE_D128_MAX_DENSE_ELEMENTS

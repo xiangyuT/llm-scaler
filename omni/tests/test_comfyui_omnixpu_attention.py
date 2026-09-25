@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import ast
+import functools
 import importlib.util
+import hashlib
+import os
 import sys
 import types
 from pathlib import Path
@@ -14,6 +18,31 @@ import torch
 _PLUGIN = Path(__file__).parents[1] / "ComfyUI-OmniXPU"
 _PATCHES = _PLUGIN / "patches"
 _ADAPTERS = _PLUGIN / "adapters"
+
+
+def _pinned_comfy_wrap_attn():
+    key = "OMNIXPU_TEST_COMFY_ATTENTION_SOURCE"
+    if key not in os.environ:
+        pytest.skip(f"set {key} to the pinned Comfy attention.py for this integration check")
+    source = Path(os.environ[key])
+    if not source.is_file():
+        pytest.fail(f"explicit pinned Comfy source is missing: {source}")
+    contents = source.read_bytes()
+    if hashlib.sha256(contents).hexdigest() != "9cafaafaf93ff53e8cbefb5e4a204014019985df2da8c1996bf40f1235fc2960":
+        pytest.fail("explicit Comfy attention.py is not pinned 73c9 source")
+    module = ast.parse(contents.decode("utf-8"), filename=str(source))
+    functions = [node for node in module.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "wrap_attn"]
+    if len(functions) != 1:
+        pytest.fail("pinned Comfy source does not define exactly one wrap_attn")
+    namespace = {
+        "functools": functools,
+        # This focused fixture calls wrap_attn with plain fake tensors, so its
+        # container branch must remain false without importing Comfy runtime.
+        "AttentionTensorContainer": type("AttentionTensorContainer", (), {}),
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
+    return namespace["wrap_attn"]
 
 
 def _load_module(name: str, path: Path):
@@ -162,6 +191,7 @@ def _load_patch(
     d128_bhld_error=None,
     h3_vae_d64_capable=True,
     h3_vae_d64_error=None,
+    wrap_attn=None,
 ):
     if backend is None:
         monkeypatch.delenv("OMNI_ATTN_BACKEND", raising=False)
@@ -192,7 +222,7 @@ def _load_patch(
         return None
 
     attention = types.ModuleType("comfy.ldm.modules.attention")
-    attention.wrap_attn = lambda fn: fn
+    attention.wrap_attn = wrap_attn or (lambda fn: fn)
     attention.attention_basic = original_attention
     attention.attention_pytorch = torch_attention
     attention.optimized_attention = original_attention
@@ -990,6 +1020,39 @@ def test_bmg_masked_d128_opt_in_uses_actual_mask_route(
     assert patch.get_stats()["routes"] == {
         f"bmg_b1_bf16_d128_masked_split{variant}": 1
     }
+
+
+@pytest.mark.parametrize("variant", ["1", "4"])
+def test_bmg_masked_d128_accepts_pinned_comfy_wrap_marker_only(monkeypatch, variant):
+    wrap_attn = _pinned_comfy_wrap_attn()
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", variant)
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="bmg", wrap_attn=wrap_attn,
+    )
+    q = _FakeTensor(seq=335, heads=32, pre_shaped=False)
+    kv = _FakeTensor(seq=335, heads=32, pre_shaped=False)
+    mask = _FakeMask(335, 335)
+    selected = []
+    monkeypatch.setattr(patch, "_run_experimental_masked_d128",
+                        lambda prepared, actual_mask: selected.append(prepared) or prepared[1])
+    result = attention.optimized_attention(q, kv, kv, heads=32, mask=mask)
+    assert result.shape == (1, 335, 4096)
+    assert len(selected) == 1 and selected[0][0] == variant and calls == []
+    assert patch.get_stats()["routes"] == {
+        f"bmg_b1_bf16_d128_masked_split{variant}": 1
+    }
+
+    # A caller-supplied false marker is not a trusted wrapper marker; the
+    # actual Comfy wrapper only inserts True when the key is absent.
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=mask, _inside_attn_wrapper=False,
+    ) == "torch-output"
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=mask, unknown_semantics=True,
+    ) == "torch-output"
+    assert len(selected) == 1 and calls == ["torch", "torch"]
 
 
 def test_bmg_masked_d128_opt_in_preserves_segment_offset_and_bhld_output(monkeypatch):
