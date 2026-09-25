@@ -50,7 +50,8 @@ using namespace cute;
 template <class CollectiveMainloop, // Attention mainloop
           class TileShapeO_,        // Shape of output tile, may be larger than P*V GEMM
           class TensorO_,           // 2D slice of global output tensor
-          class TiledCopyO_ = void> // Optional TiledCopy for loading O
+          class TiledCopyO_ = void,  // Optional TiledCopy for loading O
+          bool DirectOutput = false>
 class FMHAFwdEpilogue {
 
 public:
@@ -154,19 +155,34 @@ public:
     /* Some subgroups may not have any work to do; if so, quit early. */
     if (!active) return;
 
-    // Keep the unnormalized FP32 accumulator and row state for the merge.
     // reduce<1> creates an identity row layout: lanes0..7 own rows0..7.
     static_assert(ReduceK{} == _1{} && get<0>(SGTileShapeA{}) == 8,
                   "independent Q8 subgroups required");
-    static_assert(FragARow{}.size() == 1 && is_same_v<ElementO, float>,
-                  "one packed FP32 row state and FP32 partial output required");
-    int lane = thr_id % intel::sg_size;
-    if (lane < 8) {
-      int row = get<0>(blk_qv) * get<0>(TileShapeO{}) + (thr_id / intel::sg_size) * 8 + lane;
-      if (row < size<0>(O)) {
-        // The wrapper allocates144 FP32 columns;128..129 hold max and sum.
-        O(row, 128) = tA_max(0);
-        O(row, 129) = tA_sum(0);
+    static_assert(FragARow{}.size() == 1, "one FP32 row state required");
+    if constexpr (DirectOutput) {
+      static_assert(!is_same_v<ElementO, float>, "direct output must be BF16");
+      // The online QK/softmax/PV accumulators remain FP32. Only an empty
+      // visible row has sum==0; preserve NaNs from nonempty rows.
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA_sum.size(); i++) {
+        ElementA sum = rA_sum(i);
+        rA_sum(i) = sum == ElementA(0) ? ElementA(0) : ElementA(1) / sum;
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < rA.size(); i++) {
+        ElementA inverse = broadcast<0>(rA_sum, rA, i);
+        rA(i) = inverse == ElementA(0) ? ElementA(0) : rA(i) * inverse;
+      }
+    } else {
+      static_assert(is_same_v<ElementO, float>, "FP32 partial output required");
+      int lane = thr_id % intel::sg_size;
+      if (lane < 8) {
+        int row = get<0>(blk_qv) * get<0>(TileShapeO{}) + (thr_id / intel::sg_size) * 8 + lane;
+        if (row < size<0>(O)) {
+          // The wrapper allocates 144 FP32 columns; 128..129 hold max and sum.
+          O(row, 128) = tA_max(0);
+          O(row, 129) = tA_sum(0);
+        }
       }
     }
 

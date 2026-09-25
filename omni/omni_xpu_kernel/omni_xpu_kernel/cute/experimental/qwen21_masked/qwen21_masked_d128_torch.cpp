@@ -1,8 +1,9 @@
 // Experimental B70 BF16 actual-bool-mask CUTE, derived from the public tuning
 // C36 suffix4 component. No fixed segment lengths or inferred causal mask.
-// The cutlass macro gives this changed mainloop/Arguments ABI a private C++
-// namespace; qwen21_masked_d128 separately owns Torch registration and kernels.
-#define cutlass cute_qwen21_masked_cutlass
+// This candidate adds one-partition direct BF16 output while retaining the
+// prior partial/merge paths. Its C++ and Torch namespaces differ from both
+// installed dense CUTE and the previously built masked sidecar.
+#define cutlass cute_qwen21_masked_direct_cutlass
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
 #include <c10/core/DeviceGuard.h>
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #include <cute/tensor.hpp>
 #include <sycl/sycl.hpp>
@@ -32,7 +34,7 @@
 
 using namespace cute;
 
-namespace qwen21_masked_d128 {
+namespace qwen21_masked_direct_d128 {
 
 // ---- launch glue: submit cutlass device kernel onto torch's XPU queue --------
 // (mirror of sgl-kernel-xpu src/sycl/comm/common.h::launch)
@@ -87,6 +89,7 @@ static int checked_int(int64_t value, const char* label) {
 // switches to a 64-wide KV tile (fewer K-loop iters at large seq — omni uses 64).
 template <
     typename Element,
+    bool DirectOutput = false,
     int PipelineStagesOverride = 0,
     int QTileOverride = 0,
     int SubgroupLayoutQOverride = 0,
@@ -138,7 +141,7 @@ struct D128TileKernel {
   using ElementQ = Element;
   using ElementK = Element;
   using ElementV = Element;
-  using ElementO = float;  // Unnormalized partial accumulator, before final dtype conversion.
+  using ElementO = std::conditional_t<DirectOutput, Element, float>;
 
   using StrideQ = Stride<int, _1, int, int>;
   using StrideK = Stride<int, _1, int, int>;
@@ -179,7 +182,7 @@ struct D128TileKernel {
       void, void, void, void, void>;
 
   using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogue<
-      CollectiveMainloop, ShapeOutput, TensorO, void>;
+      CollectiveMainloop, ShapeOutput, TensorO, void, DirectOutput>;
 
   using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<false>;
   using Kernel = cutlass::fmha::kernel::XeFMHAFwdKernel<
@@ -189,6 +192,7 @@ struct D128TileKernel {
 
 template <
     typename Element,
+    bool DirectOutput = false,
     int PipelineStagesOverride = 0,
     int QTileOverride = 0,
     int SubgroupLayoutQOverride = 0,
@@ -208,6 +212,7 @@ void run_d128_tile(
     int64_t o_stride_head = -1, int64_t o_stride_batch = -1) {
   using KT = D128TileKernel<
       Element,
+      DirectOutput,
       PipelineStagesOverride,
       QTileOverride,
       SubgroupLayoutQOverride,
@@ -362,12 +367,14 @@ static bool dense_bhld_or_blhd(const at::Tensor& t, int length) {
   return packed || blhd;
 }
 
-// Experimental complete API: both variants include FP32 partial allocation,
-// a CUTE mainloop and the same single-normalization stable merge.
+// Experimental complete API: direct normalizes FP32 state inside one kernel;
+// the prior one/four-partition variants retain FP32 partial and merge behavior.
 static at::Tensor sdp_impl(const at::Tensor& q, const at::Tensor& k,
                            const at::Tensor& v, const at::Tensor& mask,
-                           int partitions) {
+                           int partitions, bool direct_output) {
   TORCH_CHECK(partitions == 1 || partitions == 4, "masked D128 supports 1 or 4 KV partitions");
+  TORCH_CHECK(!direct_output || partitions == 1,
+              "direct masked D128 requires one KV partition");
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
               "masked D128 requires BHLD Q/K/V");
   TORCH_CHECK(q.device().is_xpu() && k.device() == q.device() &&
@@ -394,8 +401,9 @@ static at::Tensor sdp_impl(const at::Tensor& q, const at::Tensor& k,
   checked_int(static_cast<int64_t>(Lq) * Lkv, "mask element address span");
   checked_int(static_cast<int64_t>(Lq) * H * D, "Q/output element address span");
   checked_int(static_cast<int64_t>(Lkv) * H * D, "K/V element address span");
-  checked_int(static_cast<int64_t>(partitions) * H * Lq * 144,
-              "FP32 partial element address span");
+  if (!direct_output)
+    checked_int(static_cast<int64_t>(partitions) * H * Lq * 144,
+                "FP32 partial element address span");
   for (const auto& t : {q, k, v}) {
     const int length = checked_int(t.size(2), "active sequence length");
     TORCH_CHECK(dense_bhld_or_blhd(t, length),
@@ -409,42 +417,60 @@ static at::Tensor sdp_impl(const at::Tensor& q, const at::Tensor& k,
   at::Tensor output = q_packed
       ? at::empty(q.sizes(), q.options())
       : at::empty({B, Lq, H, D}, q.options()).permute({0, 2, 1, 3});
-  // Zero-fill also makes empty partitions deterministic if a compiler skips
-  // their partial epilogue. Its cost is inside the measured complete API.
-  at::Tensor partial = at::zeros({partitions, H, Lq, 144},
-                                  q.options().dtype(at::kFloat));
-  run_d128_tile<cutlass::bfloat16_t>(
-      q.data_ptr(), k.data_ptr(), v.data_ptr(), partial.data_ptr(),
-      partitions, H, Lq, Lkv, D, 1.0f / std::sqrt(128.0f),
-      mask.data_ptr<bool>(), Lkv, partitions, q.get_device(),
-      q.stride(2), q.stride(1), 0,
-      k.stride(2), k.stride(1), 0,
-      v.stride(2), v.stride(1), 0,
-      partial.stride(2), partial.stride(1), partial.stride(0));
-  merge_split_kv(partial.data_ptr<float>(),
-                 static_cast<cutlass::bfloat16_t*>(output.data_ptr()),
-                 checked_int(static_cast<int64_t>(H) * Lq, "merge row count"),
-                 Lq, checked_int(output.stride(1), "output head stride"),
-                 checked_int(output.stride(2), "output sequence stride"),
-                 partitions, q.get_device());
+  if (direct_output) {
+    // FP32 online QK/softmax/PV state is normalized in the epilogue. No FP32
+    // partial tensor, zero-fill or merge dispatch belongs to this API call.
+    run_d128_tile<cutlass::bfloat16_t, true>(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(),
+        1, H, Lq, Lkv, D, 1.0f / std::sqrt(128.0f),
+        mask.data_ptr<bool>(), Lkv, 1, q.get_device(),
+        q.stride(2), q.stride(1), 0,
+        k.stride(2), k.stride(1), 0,
+        v.stride(2), v.stride(1), 0,
+        output.stride(2), output.stride(1), 0);
+  } else {
+    // Keep the prior one/four-partition algorithm as a same-DSO control.
+    at::Tensor partial = at::zeros({partitions, H, Lq, 144},
+                                    q.options().dtype(at::kFloat));
+    run_d128_tile<cutlass::bfloat16_t, false>(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), partial.data_ptr(),
+        partitions, H, Lq, Lkv, D, 1.0f / std::sqrt(128.0f),
+        mask.data_ptr<bool>(), Lkv, partitions, q.get_device(),
+        q.stride(2), q.stride(1), 0,
+        k.stride(2), k.stride(1), 0,
+        v.stride(2), v.stride(1), 0,
+        partial.stride(2), partial.stride(1), partial.stride(0));
+    merge_split_kv(partial.data_ptr<float>(),
+                   static_cast<cutlass::bfloat16_t*>(output.data_ptr()),
+                   checked_int(static_cast<int64_t>(H) * Lq, "merge row count"),
+                   Lq, checked_int(output.stride(1), "output head stride"),
+                   checked_int(output.stride(2), "output sequence stride"),
+                   partitions, q.get_device());
+  }
   return output;
 }
 
 at::Tensor sdp(const at::Tensor& q, const at::Tensor& k,
                const at::Tensor& v, const at::Tensor& mask) {
-  return sdp_impl(q, k, v, mask, 1);
+  return sdp_impl(q, k, v, mask, 1, false);
 }
 at::Tensor sdp_split4(const at::Tensor& q, const at::Tensor& k,
                       const at::Tensor& v, const at::Tensor& mask) {
-  return sdp_impl(q, k, v, mask, 4);
+  return sdp_impl(q, k, v, mask, 4, false);
 }
-}  // namespace qwen21_masked_d128
+at::Tensor sdp_direct(const at::Tensor& q, const at::Tensor& k,
+                      const at::Tensor& v, const at::Tensor& mask) {
+  return sdp_impl(q, k, v, mask, 1, true);
+}
+}  // namespace qwen21_masked_direct_d128
 
-TORCH_LIBRARY(qwen21_masked_d128, m) {
+TORCH_LIBRARY(qwen21_masked_direct_d128, m) {
   m.def("sdp(Tensor q, Tensor k, Tensor v, Tensor mask) -> Tensor");
   m.def("sdp_split4(Tensor q, Tensor k, Tensor v, Tensor mask) -> Tensor");
+  m.def("sdp_direct(Tensor q, Tensor k, Tensor v, Tensor mask) -> Tensor");
 }
-TORCH_LIBRARY_IMPL(qwen21_masked_d128, XPU, m) {
-  m.impl("sdp", TORCH_FN(qwen21_masked_d128::sdp));
-  m.impl("sdp_split4", TORCH_FN(qwen21_masked_d128::sdp_split4));
+TORCH_LIBRARY_IMPL(qwen21_masked_direct_d128, XPU, m) {
+  m.impl("sdp", TORCH_FN(qwen21_masked_direct_d128::sdp));
+  m.impl("sdp_split4", TORCH_FN(qwen21_masked_direct_d128::sdp_split4));
+  m.impl("sdp_direct", TORCH_FN(qwen21_masked_direct_d128::sdp_direct));
 }

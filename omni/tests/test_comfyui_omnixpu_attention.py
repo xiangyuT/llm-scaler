@@ -1022,7 +1022,7 @@ def test_bmg_masked_d128_opt_in_uses_actual_mask_route(
     }
 
 
-@pytest.mark.parametrize("variant", ["1", "4"])
+@pytest.mark.parametrize("variant", ["1", "4", "direct"])
 def test_bmg_masked_d128_accepts_pinned_comfy_wrap_marker_only(monkeypatch, variant):
     wrap_attn = _pinned_comfy_wrap_attn()
     monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
@@ -1040,9 +1040,9 @@ def test_bmg_masked_d128_accepts_pinned_comfy_wrap_marker_only(monkeypatch, vari
     result = attention.optimized_attention(q, kv, kv, heads=32, mask=mask)
     assert result.shape == (1, 335, 4096)
     assert len(selected) == 1 and selected[0][0] == variant and calls == []
-    assert patch.get_stats()["routes"] == {
-        f"bmg_b1_bf16_d128_masked_split{variant}": 1
-    }
+    route = ("bmg_b1_bf16_d128_masked_direct" if variant == "direct"
+             else f"bmg_b1_bf16_d128_masked_split{variant}")
+    assert patch.get_stats()["routes"] == {route: 1}
 
     # A caller-supplied false marker is not a trusted wrapper marker; the
     # actual Comfy wrapper only inserts True when the key is absent.
@@ -1051,6 +1051,32 @@ def test_bmg_masked_d128_accepts_pinned_comfy_wrap_marker_only(monkeypatch, vari
     ) == "torch-output"
     assert attention.optimized_attention(
         q, kv, kv, heads=32, mask=mask, unknown_semantics=True,
+    ) == "torch-output"
+    assert len(selected) == 1 and calls == ["torch", "torch"]
+
+
+def test_bmg_masked_d128_direct_is_explicit_and_keeps_other_masks_on_torch(monkeypatch):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/direct-sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "b" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", "direct")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=335, heads=32, pre_shaped=False)
+    kv = _FakeTensor(seq=335, heads=32, pre_shaped=False)
+    mask = _FakeMask(335, 335)
+    selected = []
+    monkeypatch.setattr(patch, "_run_experimental_masked_d128",
+                        lambda prepared, actual_mask: selected.append(prepared) or prepared[1])
+    result = attention.optimized_attention(q, kv, kv, heads=32, mask=mask)
+    assert result.shape == (1, 335, 4096)
+    assert len(selected) == 1 and selected[0][0] == "direct"
+    assert patch.get_stats()["routes"] == {"bmg_b1_bf16_d128_masked_direct": 1}
+    assert calls == []
+
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=_FakeMask(335, 335, dtype=torch.float32),
+    ) == "torch-output"
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=mask, scale=0.1,
     ) == "torch-output"
     assert len(selected) == 1 and calls == ["torch", "torch"]
 

@@ -5,7 +5,7 @@
     "revision": "2fc09973bfdf15755090fcb0e3b6ad236408a992",
     "clean": true
   },
-  "wrapper_sha256": "58b9d597868375e3d50adf69c21fe3cd40e85464fe678f46b7762df4f87491c2",
+  "wrapper_sha256": "6d059993ec6c1e707b3d385712141cce9238c61e71808097dbc62038124f32ca",
   "config_sha256": "5fc03bee8e4081a50c3baf7105f91811824eca61a7565ed3ad59ec9ed90b0c4c",
   "headers": [
     {
@@ -52,7 +52,7 @@
       },
       {
         "path": "flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp",
-        "sha256": "3cdf09175df9790564e6ff02e33ff68a7e326bab838af864167eb750eb0e4b47"
+        "sha256": "8a698fe6e2660a1f48c9a23f81a5301d5ee1716d7716545ae95a6f7ce95dd401"
       },
       {
         "path": "flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp",

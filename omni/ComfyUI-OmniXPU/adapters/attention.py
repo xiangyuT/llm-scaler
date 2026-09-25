@@ -400,7 +400,7 @@ def _prepare_experimental_masked_d128(
 ):
     """Opt-in actual-bool-mask sidecar; default and unsupported calls are unchanged."""
     variant = os.environ.get(_MASKED_D128_PARTITIONS_ENV)
-    if not (variant in ("1", "4") and os.environ.get(_MASKED_D128_DSO_ENV)
+    if not (variant in ("1", "4", "direct") and os.environ.get(_MASKED_D128_DSO_ENV)
             and os.environ.get(_MASKED_D128_SHA_ENV)
             and _backend_name == "cute" and _omni_xpu_target() == "bmg"
             and _torch_supports_versioned_routes()
@@ -425,7 +425,8 @@ def _prepare_experimental_masked_d128(
             and q_len * 4096 <= _CUTE_D128_MAX_DENSE_ELEMENTS
             and kv_len * 4096 <= _CUTE_D128_MAX_DENSE_ELEMENTS
             and q_len * kv_len <= _CUTE_D128_MAX_DENSE_ELEMENTS
-            and int(variant) * 32 * q_len * 144 <= _CUTE_D128_MAX_DENSE_ELEMENTS):
+            and (variant == "direct" or
+                 int(variant) * 32 * q_len * 144 <= _CUTE_D128_MAX_DENSE_ELEMENTS)):
         return None
     tensors = tuple(
         _b1_dense_segment_bhld(t, length, heads, dim_head, skip_reshape)
@@ -452,8 +453,11 @@ def _run_experimental_masked_d128(prepared, mask):
             raise RuntimeError("masked D128 sidecar SHA mismatch")
         torch.ops.load_library(str(path))
         _masked_d128_loaded = identity
-    namespace = torch.ops.qwen21_masked_d128
-    op = namespace.sdp if prepared[0] == "1" else namespace.sdp_split4
+    if prepared[0] == "direct":
+        op = torch.ops.qwen21_masked_direct_d128.sdp_direct
+    else:
+        namespace = torch.ops.qwen21_masked_d128
+        op = namespace.sdp if prepared[0] == "1" else namespace.sdp_split4
     return op(*prepared[1:], mask)
 
 
@@ -963,7 +967,9 @@ def apply():
                 out = _run_experimental_masked_d128(masked_prepared, mask)
                 if not torch.compiler.is_compiling():
                     _cute_call_count += 1
-                route = "bmg_b1_bf16_d128_masked_split" + masked_prepared[0]
+                route = ("bmg_b1_bf16_d128_masked_direct"
+                         if masked_prepared[0] == "direct" else
+                         "bmg_b1_bf16_d128_masked_split" + masked_prepared[0])
                 _record_attention_route(route)
                 log_debug_event(
                     "kernel", "attention",
