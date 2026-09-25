@@ -137,6 +137,18 @@ class _FakeTensor:
         return len(self._non_finite_checks)
 
 
+class _FakeMask:
+    def __init__(self, q, kv, *, dtype=torch.bool, contiguous=True, rank=2):
+        self.shape = (q, kv) if rank == 2 else (1, 1, q, kv)
+        self.ndim = rank
+        self.dtype = dtype
+        self.device = types.SimpleNamespace(type="xpu")
+        self._contiguous = contiguous
+
+    def is_contiguous(self):
+        return self._contiguous
+
+
 def _load_patch(
     monkeypatch,
     *,
@@ -946,6 +958,119 @@ def test_bmg_b1_prefix_rectangular_requires_dense_layout_and_no_grad(monkeypatch
 
     assert calls == ["torch", "torch"]
     assert patch.get_stats()["routes"] == {}
+
+
+@pytest.mark.parametrize("variant", ["1", "4"])
+@pytest.mark.parametrize(
+    ("q_len", "kv_len"),
+    [(335, 335), (8, 8), (38, 4078), (6, 4046),
+     (78, 8156), (6, 8084), (75, 10659)],
+)
+def test_bmg_masked_d128_opt_in_uses_actual_mask_route(
+    monkeypatch, variant, q_len, kv_len,
+):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", variant)
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=q_len, heads=32, pre_shaped=False)
+    kv = _FakeTensor(seq=kv_len, heads=32, pre_shaped=False)
+    mask = _FakeMask(q_len, kv_len)
+    prepared = []
+
+    def sidecar(values, actual_mask):
+        prepared.append((values, actual_mask))
+        return values[1]
+
+    monkeypatch.setattr(patch, "_run_experimental_masked_d128", sidecar)
+    result = attention.optimized_attention(q, kv, kv, heads=32, mask=mask)
+    assert result.shape == (1, q_len, 4096)
+    assert calls == [] and len(prepared) == 1
+    assert prepared[0][0][0] == variant and prepared[0][1] is mask
+    assert patch.get_stats()["routes"] == {
+        f"bmg_b1_bf16_d128_masked_split{variant}": 1
+    }
+
+
+def test_bmg_masked_d128_opt_in_preserves_segment_offset_and_bhld_output(monkeypatch):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", "4")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=75, heads=32, pre_shaped=False,
+                    stride=(11000 * 4096, 4096, 1), storage_offset=10584 * 4096)
+    kv = _FakeTensor(seq=10659, heads=32, pre_shaped=False)
+    seen = []
+    monkeypatch.setattr(patch, "_run_experimental_masked_d128",
+                        lambda values, mask: seen.append(values) or values[1])
+    result = attention.optimized_attention(
+        q, kv, kv, heads=32, mask=_FakeMask(75, 10659),
+        skip_output_reshape=True,
+    )
+    assert result.shape == (1, 32, 75, 128) and calls == []
+    assert seen[0][1].storage_offset() == q.storage_offset()
+    assert seen[0][1].stride() == (75 * 4096, 128, 4096, 1)
+
+
+@pytest.mark.parametrize("bad_mask", [
+    {"dtype": torch.float32}, {"contiguous": False}, {"rank": 4},
+    {"q": 74}, {"kv": 10658},
+])
+def test_bmg_masked_d128_nonbool_or_broadcast_mask_keeps_torch(
+    monkeypatch, bad_mask,
+):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", "4")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=75, heads=32)
+    kv = _FakeTensor(seq=10659, heads=32)
+    mask = _FakeMask(bad_mask.get("q", 75), bad_mask.get("kv", 10659),
+                     **{k: v for k, v in bad_mask.items() if k not in ("q", "kv")})
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=mask, skip_reshape=True,
+    ) == "torch-output"
+    assert calls == ["torch"] and patch.get_stats()["routes"] == {}
+
+
+def test_bmg_masked_d128_missing_opt_in_and_other_semantics_keep_torch(monkeypatch):
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=75, heads=32)
+    kv = _FakeTensor(seq=10659, heads=32)
+    mask = _FakeMask(75, 10659)
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=mask, skip_reshape=True,
+    ) == "torch-output"
+    for key, value in (("scale", 0.5), ("dropout_p", 0.1),
+                       ("is_causal", True), ("enable_gqa", True)):
+        monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+        monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+        monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", "1")
+        assert attention.optimized_attention(
+            q, kv, kv, heads=32, mask=mask, skip_reshape=True, **{key: value},
+        ) == "torch-output"
+    assert calls == ["torch"] * 5 and patch.get_stats()["routes"] == {}
+
+
+def test_bmg_masked_d128_grad_and_mask_address_limit_fall_back(monkeypatch):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO", "/new/sidecar.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256", "a" * 64)
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS", "1")
+    patch, attention, calls = _load_patch(monkeypatch, target="bmg")
+    q = _FakeTensor(seq=75, heads=32)
+    kv = _FakeTensor(seq=10659, heads=32)
+    q.requires_grad = True
+    assert attention.optimized_attention(
+        q, kv, kv, heads=32, mask=_FakeMask(75, 10659), skip_reshape=True,
+    ) == "torch-output"
+    q.requires_grad = False
+    large_q = _FakeTensor(seq=40000, heads=32)
+    large_kv = _FakeTensor(seq=60000, heads=32)
+    assert attention.optimized_attention(
+        large_q, large_kv, large_kv, heads=32,
+        mask=_FakeMask(40000, 60000), skip_reshape=True,
+    ) == "torch-output"
+    assert calls == ["torch", "torch"] and patch.get_stats()["routes"] == {}
 
 
 @pytest.mark.parametrize(

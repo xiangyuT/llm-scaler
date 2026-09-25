@@ -1,8 +1,10 @@
 import glob
+import hashlib
 import logging
 import os
 import sys
 from importlib.machinery import EXTENSION_SUFFIXES
+from pathlib import Path
 
 import torch
 
@@ -26,6 +28,10 @@ _CUTE_D128_MAX_DENSE_ELEMENTS = (1 << 31) - 1
 # Short rectangular queries can lose their CUTE advantage to tail work.
 _BMG_D128_PREFIX_MIN_QUERY = 2048
 _VALIDATE_OUTPUT_ENV = "OMNIXPU_VALIDATE_ATTENTION_OUTPUT"
+_MASKED_D128_DSO_ENV = "OMNIXPU_EXPERIMENTAL_MASKED_D128_DSO"
+_MASKED_D128_SHA_ENV = "OMNIXPU_EXPERIMENTAL_MASKED_D128_SHA256"
+_MASKED_D128_PARTITIONS_ENV = "OMNIXPU_EXPERIMENTAL_MASKED_D128_PARTITIONS"
+_masked_d128_loaded = None
 
 # ── Attention backend selection ──────────────────────────────────────────────
 # OMNI_ATTN_BACKEND selects which attention routing policy the patched ComfyUI
@@ -386,6 +392,67 @@ def _b1_dense_segment_bhld(tensor, seq, heads, dim_head, skip_reshape):
         shape, (seq * width, width, 1), tensor.storage_offset()
     )
     return normalized.view(1, seq, heads, dim_head).transpose(1, 2)
+
+
+def _prepare_experimental_masked_d128(
+    q, k, v, mask, b, heads, dim_head, q_len, kv_len,
+    skip_reshape, attn_precision, kwargs,
+):
+    """Opt-in actual-bool-mask sidecar; default and unsupported calls are unchanged."""
+    variant = os.environ.get(_MASKED_D128_PARTITIONS_ENV)
+    if not (variant in ("1", "4") and os.environ.get(_MASKED_D128_DSO_ENV)
+            and os.environ.get(_MASKED_D128_SHA_ENV)
+            and _backend_name == "cute" and _omni_xpu_target() == "bmg"
+            and _torch_supports_versioned_routes()
+            and not torch.compiler.is_compiling()
+            and b == 1 and heads == 32 and dim_head == 128
+            and q_len > 0 and kv_len > 0
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.device.type == "xpu" and k.device == q.device == v.device
+            and mask is not None and mask.device == q.device
+            and mask.dtype == torch.bool and mask.ndim == 2
+            and tuple(mask.shape) == (q_len, kv_len)
+            and mask.is_contiguous()
+            and attn_precision is None
+            and not kwargs.get("is_causal", False)
+            and not kwargs.get("dropout_p", 0.0)
+            and not kwargs.get("enable_gqa", False)
+            and "scale" not in kwargs
+            and not (set(kwargs) - {"transformer_options", "is_causal", "dropout_p", "enable_gqa"})
+            and not any(getattr(t, "requires_grad", False) for t in (q, k, v))
+            and q_len * 4096 <= _CUTE_D128_MAX_DENSE_ELEMENTS
+            and kv_len * 4096 <= _CUTE_D128_MAX_DENSE_ELEMENTS
+            and q_len * kv_len <= _CUTE_D128_MAX_DENSE_ELEMENTS
+            and int(variant) * 32 * q_len * 144 <= _CUTE_D128_MAX_DENSE_ELEMENTS):
+        return None
+    tensors = tuple(
+        _b1_dense_segment_bhld(t, length, heads, dim_head, skip_reshape)
+        for t, length in ((q, q_len), (k, kv_len), (v, kv_len))
+    )
+    if any(t is None for t in tensors):
+        return None
+    return (variant, *tensors)
+
+
+def _run_experimental_masked_d128(prepared, mask):
+    global _masked_d128_loaded
+    configured_path = os.environ[_MASKED_D128_DSO_ENV]
+    expected = os.environ[_MASKED_D128_SHA_ENV]
+    identity = (configured_path, expected)
+    if _masked_d128_loaded != identity:
+        if _masked_d128_loaded is not None:
+            raise RuntimeError("masked D128 sidecar identity cannot change in process")
+        path = Path(configured_path).resolve()
+        if len(expected) != 64 or not path.is_file():
+            raise RuntimeError("masked D128 sidecar path/SHA is incomplete")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected:
+            raise RuntimeError("masked D128 sidecar SHA mismatch")
+        torch.ops.load_library(str(path))
+        _masked_d128_loaded = identity
+    namespace = torch.ops.qwen21_masked_d128
+    op = namespace.sdp if prepared[0] == "1" else namespace.sdp_split4
+    return op(*prepared[1:], mask)
 
 
 _ANIMATE2_CROSS_ENV = "OMNIXPU_ANIMATE2_CROSS"
@@ -880,6 +947,37 @@ def apply():
             use_bmg_minimax_h3_vae_d64
             and bmg_minimax_h3_vae_d64_contract not in _attention_failed_contracts
         )
+
+        masked_prepared = _prepare_experimental_masked_d128(
+            q, k, v, mask, b, heads, dim_head, q_len, kv_len,
+            skip_reshape, attn_precision, kwargs,
+        ) if target == "bmg" else None
+        masked_contract = (
+            "masked_d128", masked_prepared[0], q_len, kv_len,
+            tuple(q.stride()), tuple(k.stride()), tuple(v.stride()),
+        ) if masked_prepared is not None else None
+        if masked_contract is not None and masked_contract not in _attention_failed_contracts:
+            try:
+                out = _run_experimental_masked_d128(masked_prepared, mask)
+                if not torch.compiler.is_compiling():
+                    _cute_call_count += 1
+                route = "bmg_b1_bf16_d128_masked_split" + masked_prepared[0]
+                _record_attention_route(route)
+                log_debug_event(
+                    "kernel", "attention",
+                    {"q": masked_prepared[1], "k": masked_prepared[2],
+                     "v": masked_prepared[3], "mask": mask},
+                    details={"backend": "cute", "route": route},
+                )
+                if skip_output_reshape:
+                    return out
+                return out.transpose(1, 2).reshape(b, q_len, heads * dim_head)
+            except Exception as error:
+                if is_fatal_accelerator_error(error):
+                    raise
+                _attention_failed_contracts.add(masked_contract)
+                log.warning("[OmniXPU] experimental masked D128 route failed "
+                            "for Q=%d KV=%d; using Torch: %s", q_len, kv_len, error)
 
         # Constraint check
         reasons = []
