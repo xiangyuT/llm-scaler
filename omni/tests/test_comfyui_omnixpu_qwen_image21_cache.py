@@ -66,6 +66,9 @@ def runtime(monkeypatch, comfy_runtime):
         original = getattr(method, adapter._MARKER, method)
         monkeypatch.setattr(owner, name, original)
         originals.append(original)
+    prefix = qwen.prefix_cached_attention
+    monkeypatch.setattr(qwen, "prefix_cached_attention",
+                        getattr(prefix, adapter._SEGMENTED_MARKER, prefix))
     monkeypatch.setattr(mm.args, "disable_pinned_memory", False)
     monkeypatch.setattr(mm, "NUM_STREAMS", 2)
     return types.SimpleNamespace(adapter=adapter, cache=cache, qwen=qwen, mm=mm,
@@ -82,6 +85,58 @@ def test_apply_is_idempotent(runtime):
     first = runtime.cache.select, runtime.cache.put, runtime.mp.ModelPatcher.__init__
     activate(runtime)
     assert first == (runtime.cache.select, runtime.cache.put, runtime.mp.ModelPatcher.__init__)
+
+
+def test_segmented_prefix_opt_in_preserves_fallback_and_views(runtime, monkeypatch):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_QWEN21_SEGMENTED_DSO", "/new/segmented.so")
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_QWEN21_SEGMENTED_SHA256", "a" * 64)
+    activate(runtime)
+    factory = runtime.qwen.prefix_cached_attention
+    assert hasattr(factory, runtime.adapter._SEGMENTED_MARKER)
+    activate(runtime)
+    assert runtime.qwen.prefix_cached_attention is factory
+
+    def value(length):
+        return torch.randn((1, length, 32, 128), device=runtime.device,
+                           dtype=torch.bfloat16)
+    q, k, v = value(17), value(17), value(17)
+    prefix_k, prefix_v = value(31), value(31)
+    selected = []
+    fallback = []
+    monkeypatch.setattr(runtime.adapter, "_run_segmented_prefix",
+                        lambda prepared: selected.append(prepared) or
+                        torch.zeros((1, 17, 4096), device=runtime.device,
+                                    dtype=torch.bfloat16))
+    monkeypatch.setattr(runtime.qwen, "optimized_attention",
+                        lambda fq, fk, fv, heads, **kwargs:
+                        fallback.append((fk.shape, fv.shape, heads)) or "torch-fallback")
+    attention = factory(prefix_k, prefix_v, {})
+    assert attention(q, k, v, 32).shape == (1, 17, 4096)
+    assert len(selected) == 1 and fallback == []
+    assert [tuple(t.shape) for t in selected[0]] == [
+        (1, 32, 17, 128), (1, 32, 17, 128), (1, 32, 17, 128),
+        (1, 32, 31, 128), (1, 32, 31, 128),
+    ]
+    assert all(t.data_ptr() == source.data_ptr() for t, source in
+               zip(selected[0], (q, k, v, prefix_k, prefix_v)))
+
+    assert attention(q.detach().requires_grad_(True), k, v, 32) == "torch-fallback"
+    storage = torch.empty(8 + q.numel(), device=runtime.device, dtype=q.dtype)
+    offset_q = storage.as_strided(q.shape, (q.numel(), 4096, 128, 1), 8)
+    assert offset_q.data_ptr() % 64 == 16
+    assert attention(offset_q, k, v, 32) == "torch-fallback"
+    assert fallback == [((1, 48, 4096), (1, 48, 4096), 32)] * 2
+    assert len(selected) == 1
+
+
+def test_segmented_prefix_incomplete_opt_in_is_atomic(runtime, monkeypatch):
+    monkeypatch.setenv("OMNIXPU_EXPERIMENTAL_QWEN21_SEGMENTED_DSO", "/new/segmented.so")
+    before = (runtime.cache.select, runtime.cache.put,
+              runtime.mp.ModelPatcher.__init__, runtime.qwen.prefix_cached_attention)
+    ok, reason = runtime.adapter.apply()
+    assert not ok and "requires both" in reason
+    assert before == (runtime.cache.select, runtime.cache.put,
+                      runtime.mp.ModelPatcher.__init__, runtime.qwen.prefix_cached_attention)
 
 
 def test_unsupported_contract_is_atomic(runtime, monkeypatch):
