@@ -387,18 +387,26 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
       for (int VV = 0; VV < VTiles; VV++) {
         prefetch(prefetch_v_cur, pVgV_cur(_,_,_,VV,k_idx));
       }
-      // Both segment tails are independently guarded. A non-tile-aligned
-      // prefix never leaks its padding into the current segment or softmax.
-      Tensor cLocal = make_identity_tensor(take<0,2>(TileShapeQK{}));
-      auto cS_thread = thr_mma_qk.partition_C(cLocal);
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < tSrS.size(); ++i) {
-        const int row = get<0>(blk_qv) * get<0>(TileShapeQK{}) + get<0>(cS_thread(i));
-        const int col = (is_cache ? K : K - kblocks_cache) * get<1>(TileShapeQK{})
-                      + get<1>(cS_thread(i));
-        const bool visible = row < params.query_length &&
-                             col < (is_cache ? seq_len_kv_cache : current_len);
-        if (!visible) tSrS(i) = ElementS(-INFINITY);
+      // Full Q/K tiles need no per-element score mask. This condition is
+      // workgroup-uniform; prefix and current retain independent tail bounds.
+      const int local_k_tile = is_cache ? K : K - kblocks_cache;
+      const int segment_len = is_cache ? seq_len_kv_cache : current_len;
+      const bool q_tail = (get<0>(blk_qv) + 1) * get<0>(TileShapeQK{})
+                          > params.query_length;
+      const bool k_tail = (local_k_tile + 1) * get<1>(TileShapeQK{})
+                          > segment_len;
+      if (q_tail || k_tail) {
+        Tensor cLocal = make_identity_tensor(take<0,2>(TileShapeQK{}));
+        auto cS_thread = thr_mma_qk.partition_C(cLocal);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < tSrS.size(); ++i) {
+          const int row = get<0>(blk_qv) * get<0>(TileShapeQK{})
+                          + get<0>(cS_thread(i));
+          const int col = local_k_tile * get<1>(TileShapeQK{})
+                          + get<1>(cS_thread(i));
+          if (row >= params.query_length || col >= segment_len)
+            tSrS(i) = ElementS(-INFINITY);
+        }
       }
 
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */

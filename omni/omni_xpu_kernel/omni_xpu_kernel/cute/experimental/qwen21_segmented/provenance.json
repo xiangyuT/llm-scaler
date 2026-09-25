@@ -48,7 +48,7 @@
     "files": [
       {
       "path": "flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp",
-      "sha256": "3bc31ded8b7b7ae2e1deb31d77d5dab490a36fb732a04e0d1c5c7c9bdefce3b6"
+      "sha256": "f178ab129e6f37b255cc2750a4a0379ac4ee2baff245904220bc80f44d9abbe1"
       },
       {
         "path": "flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp",
