@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import inspect
 import logging
+import os
 import textwrap
 
 import torch
@@ -13,6 +15,93 @@ log = logging.getLogger("ComfyUI-OmniXPU")
 _MARKER = "__omnixpu_qwen_image21_cache_original__"
 _WRAPPER_KEY = "omnixpu_qwen_image21_prefix_cache"
 _PREFIX_PATCHES = ("post_input", "attn1_patch", "single_block")
+_COPY_ENV = "OMNIXPU_EXPERIMENTAL_QWEN21_CACHE_COPY"
+_COPY_MARKER = "__omnixpu_qwen21_cache_copy_original__"
+_COPY_MIN_QUERY = 2048  # The existing BMG D128 prefix CUTE admission floor.
+_MAX_ELEMENTS = (1 << 31) - 1
+_PREFIX_SOURCE_SHA256 = "7e98fa30a8530e50d4030a207cdb4c5cfb3f7b98674ff2728b8b697d324234a5"
+
+
+def _copy_prefix_inputs(q, k, v, prefix_k, prefix_v, heads, options):
+    """Admit only source-bound B70 target cache hits; otherwise use original."""
+    if (os.environ.get(_COPY_ENV, "0") != "1" or not isinstance(options, dict)
+            or os.environ.get("OMNI_ATTN_BACKEND", "auto").lower() not in ("auto", "cute")
+            or options.get("optimized_attention_override")
+            or torch.compiler.is_compiling() or heads != 32):
+        return False
+    try:
+        patches = options.get("patches", {})
+        replacements = options.get("patches_replace", {})
+        if (not isinstance(patches, dict) or not isinstance(replacements, dict)
+                or any(patches.get(name) for name in _PREFIX_PATCHES)
+                or replacements.get("dit", {})):
+            return False
+        import omni_xpu_kernel
+        if omni_xpu_kernel.__xpu_target__ != "bmg":
+            return False
+        tensors = (q, k, v, prefix_k, prefix_v)
+        if (any(not isinstance(t, torch.Tensor) for t in tensors)
+                or q.device.type != "xpu" or q.dtype != torch.bfloat16
+                or any(t.device != q.device or t.dtype != q.dtype or t.requires_grad
+                       or t.ndim != 4 or t.shape[0] != 1
+                       or t.shape[2:] != (32, 128)
+                       or t.stride()[1:] != (4096, 128, 1)
+                       or t.data_ptr() % 64 for t in tensors)):
+            return False
+        current_len, prefix_len = k.shape[1], prefix_k.shape[1]
+        if (current_len < _COPY_MIN_QUERY or prefix_len <= 0
+                or q.shape[1] != current_len
+                or v.shape != k.shape or prefix_v.shape != prefix_k.shape
+                or (prefix_len + current_len) * 4096 > _MAX_ELEMENTS):
+            return False
+        index = q.device.index if q.device.index is not None else torch.xpu.current_device()
+        return getattr(torch.xpu.get_device_properties(index), "device_id", None) == 0xE223
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return False
+
+
+def _copy_prefix_factory(qwen):
+    mode = os.environ.get(_COPY_ENV, "0")
+    if mode not in ("", "0", "1"):
+        return None, f"{_COPY_ENV} must be 0 or 1"
+    if mode != "1":
+        return None, None
+    original = qwen.prefix_cached_attention
+    if hasattr(original, _COPY_MARKER):
+        return original, None
+    if tuple(inspect.signature(original).parameters) != (
+            "prefix_k", "prefix_v", "transformer_options"):
+        return None, "unsupported prefix_cached_attention signature"
+    source = inspect.getsource(original)
+    if (hashlib.sha256(source.encode("utf-8")).hexdigest() != _PREFIX_SOURCE_SHA256
+            or source.count("torch.cat([prefix_k, k], dim=1).flatten(2)") != 1
+            or source.count("torch.cat([prefix_v, v], dim=1).flatten(2)") != 1):
+        return None, "unsupported prefix_cached_attention source contract"
+
+    @functools.wraps(original)
+    def factory(prefix_k, prefix_v, transformer_options={}):
+        fallback = original(prefix_k, prefix_v, transformer_options)
+
+        def attention(q, k, v, heads):
+            if not _copy_prefix_inputs(q, k, v, prefix_k, prefix_v,
+                                       heads, transformer_options):
+                return fallback(q, k, v, heads)
+            length = prefix_k.shape[1]
+            shape = (1, length + k.shape[1], 32, 128)
+            joined_k = torch.empty(shape, dtype=k.dtype, device=k.device)
+            joined_v = torch.empty(shape, dtype=v.dtype, device=v.device)
+            joined_k[:, :length].copy_(prefix_k)
+            joined_k[:, length:].copy_(k)
+            joined_v[:, :length].copy_(prefix_v)
+            joined_v[:, length:].copy_(v)
+            return qwen.optimized_attention(
+                q.flatten(2), joined_k.flatten(2), joined_v.flatten(2), heads,
+                transformer_options=transformer_options)
+
+        return attention
+
+    setattr(factory, _COPY_MARKER, original)
+    return factory, None
 
 
 def _rewrite(function, replacements, helpers=None):
@@ -86,6 +175,14 @@ def apply():
     except AttributeError as exc:
         return False, f"Qwen Image 2.1 cache API is unavailable: {exc}"
     if all(hasattr(method, _MARKER) for method in originals):
+        try:
+            copy_factory, copy_error = _copy_prefix_factory(qwen)
+        except (AttributeError, OSError, TypeError, ValueError) as exc:
+            return False, str(exc)
+        if copy_error is not None:
+            return False, copy_error
+        if copy_factory is not None:
+            qwen.prefix_cached_attention = copy_factory
         return True, "already patched"
     if any(hasattr(method, _MARKER) for method in originals):
         return False, "Qwen Image 2.1 cache adapter is partially applied"
@@ -127,6 +224,9 @@ def apply():
             ("if comfy.model_management.pin_memory(t):",
              "if not t.is_pinned() and comfy.model_management.pin_memory(t):"),
         ), {"_omnixpu_copy_pinned_cpu": _copy_pinned_cpu})
+        copy_factory, copy_error = _copy_prefix_factory(qwen)
+        if copy_error is not None:
+            raise ValueError(copy_error)
     except (AttributeError, OSError, TypeError, ValueError, SyntaxError) as exc:
         return False, str(exc)
 
@@ -153,4 +253,6 @@ def apply():
     for replacement, original in zip((select, put, init), originals):
         setattr(replacement, _MARKER, original)
     cache.select, cache.put, patcher.__init__ = select, put, init
+    if copy_factory is not None:
+        qwen.prefix_cached_attention = copy_factory
     return True, None

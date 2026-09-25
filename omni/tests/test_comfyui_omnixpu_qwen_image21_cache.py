@@ -66,6 +66,9 @@ def runtime(monkeypatch, comfy_runtime):
         original = getattr(method, adapter._MARKER, method)
         monkeypatch.setattr(owner, name, original)
         originals.append(original)
+    prefix = qwen.prefix_cached_attention
+    monkeypatch.setattr(qwen, "prefix_cached_attention",
+                        getattr(prefix, adapter._COPY_MARKER, prefix))
     monkeypatch.setattr(mm.args, "disable_pinned_memory", False)
     monkeypatch.setattr(mm, "NUM_STREAMS", 2)
     return types.SimpleNamespace(adapter=adapter, cache=cache, qwen=qwen, mm=mm,
@@ -82,6 +85,112 @@ def test_apply_is_idempotent(runtime):
     first = runtime.cache.select, runtime.cache.put, runtime.mp.ModelPatcher.__init__
     activate(runtime)
     assert first == (runtime.cache.select, runtime.cache.put, runtime.mp.ModelPatcher.__init__)
+
+
+def test_cache_copy_opt_in_uses_real_prefix_wrapper_and_exact_join(runtime, monkeypatch):
+    monkeypatch.setenv(runtime.adapter._COPY_ENV, "1")
+    original = runtime.qwen.prefix_cached_attention
+    activate(runtime)
+    factory = runtime.qwen.prefix_cached_attention
+    assert getattr(factory, runtime.adapter._COPY_MARKER) is original
+    activate(runtime)
+    assert runtime.qwen.prefix_cached_attention is factory
+
+    def value(length):
+        return torch.randn((1, length, 32, 128), device=runtime.device,
+                           dtype=torch.bfloat16)
+    q, k, v, pk, pv = value(2048), value(2048), value(2048), value(31), value(31)
+    options = {"patches": {"post_input": [], "single_block": [], "attn1_patch": []},
+               "patches_replace": {"dit": {}, "other": {"noop": object()}},
+               "block_index": 15}
+    with torch.inference_mode():
+        expected = original(pk, pv, options)(q, k, v, 32)
+        actual = factory(pk, pv, options)(q, k, v, 32)
+        assert actual.shape == expected.shape == (1, 2048, 4096)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        joined_k = torch.cat((pk, k), dim=1).flatten(2)
+        joined_v = torch.cat((pv, v), dim=1).flatten(2)
+        observed = []
+        def optimized(fq, fk, fv, heads, **kwargs):
+            observed.append((fk, fv, heads, kwargs))
+            return fq
+        monkeypatch.setattr(runtime.qwen, "optimized_attention", optimized)
+        def forbidden_cat(*args, **kwargs):
+            raise AssertionError("copy route unexpectedly called torch.cat")
+        monkeypatch.setattr(torch, "cat", forbidden_cat)
+        assert factory(pk, pv, options)(q, k, v, 32).shape == (1, 2048, 4096)
+        assert len(observed) == 1 and observed[0][2:] == (32, {"transformer_options": options})
+        assert torch.equal(observed[0][0], joined_k)
+        assert torch.equal(observed[0][1], joined_v)
+        assert observed[0][0].stride()[1:] == joined_k.stride()[1:]
+        assert observed[0][1].stride()[1:] == joined_v.stride()[1:]
+
+
+def test_cache_copy_unsupported_inputs_use_exact_original_closure(runtime, monkeypatch):
+    monkeypatch.setenv(runtime.adapter._COPY_ENV, "1")
+    activate(runtime)
+    factory = runtime.qwen.prefix_cached_attention
+    def value(length):
+        return torch.randn((1, length, 32, 128), device=runtime.device,
+                           dtype=torch.bfloat16)
+    q, k, v, pk, pv = value(2048), value(2048), value(2048), value(31), value(31)
+    calls = []
+    def optimized(fq, fk, fv, heads, **kwargs):
+        calls.append((fk.shape, fv.shape, heads, kwargs))
+        return "original"
+    monkeypatch.setattr(runtime.qwen, "optimized_attention", optimized)
+    backing = torch.empty(8 + q.numel(), device=runtime.device, dtype=q.dtype)
+    misaligned = backing.as_strided(q.shape, q.stride(), 8)
+    assert misaligned.data_ptr() % 64 == 16
+    cases = (
+        (q[:, :17], k[:, :17], v[:, :17], pk, pv, {}),
+        (q.to(torch.float16), k, v, pk, pv, {}),
+        (q.detach().requires_grad_(True), k, v, pk, pv, {}),
+        (misaligned, k, v, pk, pv, {}),
+        (q, k, v, pk[:, ::2], pv[:, ::2], {}),
+        (q, k, v, pk, pv, {"patches": {"attn1_patch": [object()]}}),
+        (q, k, v, pk, pv, {"patches_replace": {"dit": {"single_block": object()}}}),
+        (q, k, v, pk, pv, {"optimized_attention_override": object()}),
+        (q.expand(2, -1, -1, -1), k.expand(2, -1, -1, -1),
+         v.expand(2, -1, -1, -1), pk.expand(2, -1, -1, -1),
+         pv.expand(2, -1, -1, -1), {}),
+    )
+    for cq, ck, cv, cpk, cpv, options in cases:
+        assert factory(cpk, cpv, options)(cq, ck, cv, 32) == "original"
+    monkeypatch.setenv("OMNI_ATTN_BACKEND", "torch")
+    assert factory(pk, pv, {})(q, k, v, 32) == "original"
+    monkeypatch.setenv("OMNI_ATTN_BACKEND", "auto")
+    monkeypatch.setenv(runtime.adapter._COPY_ENV, "0")
+    assert factory(pk, pv, {})(q, k, v, 32) == "original"
+    assert len(calls) == len(cases) + 2
+    assert all(row[2] == 32 and row[0] == row[1] for row in calls)
+
+
+def test_cache_copy_source_contract_failure_is_atomic(runtime, monkeypatch):
+    monkeypatch.setenv(runtime.adapter._COPY_ENV, "1")
+    def changed(prefix_k, prefix_v, transformer_options={}):
+        return lambda q, k, v, heads: None
+    monkeypatch.setattr(runtime.qwen, "prefix_cached_attention", changed)
+    before = (runtime.cache.select, runtime.cache.put,
+              runtime.mp.ModelPatcher.__init__, runtime.qwen.prefix_cached_attention)
+    ok, reason = runtime.adapter.apply()
+    assert not ok and "source contract" in reason
+    assert before == (runtime.cache.select, runtime.cache.put,
+                      runtime.mp.ModelPatcher.__init__, runtime.qwen.prefix_cached_attention)
+
+
+def test_cache_copy_defaults_off_and_rejects_invalid_opt_in_atomically(runtime, monkeypatch):
+    original = runtime.qwen.prefix_cached_attention
+    monkeypatch.setenv(runtime.adapter._COPY_ENV, "unexpected")
+    before = runtime.cache.select, runtime.cache.put, runtime.mp.ModelPatcher.__init__
+    ok, reason = runtime.adapter.apply()
+    assert not ok and "must be 0 or 1" in reason
+    assert before == (runtime.cache.select, runtime.cache.put, runtime.mp.ModelPatcher.__init__)
+    assert runtime.qwen.prefix_cached_attention is original
+    monkeypatch.delenv(runtime.adapter._COPY_ENV)
+    activate(runtime)
+    assert runtime.qwen.prefix_cached_attention is original
 
 
 def test_unsupported_contract_is_atomic(runtime, monkeypatch):
