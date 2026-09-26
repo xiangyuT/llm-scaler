@@ -18,6 +18,37 @@
 #include "utils.h"
 
 namespace omni_xpu {
+namespace kitchen {
+    torch::Tensor deltanet_conv_step(
+        torch::Tensor proj, torch::Tensor conv_state, torch::Tensor conv_w,
+        std::optional<torch::Tensor> conv_b,
+        std::optional<torch::Tensor> snapshots);
+    torch::Tensor gated_delta_decode_fused(
+        torch::Tensor mixed_qkv, torch::Tensor x, torch::Tensor w_a,
+        torch::Tensor w_b, torch::Tensor dt_bias, torch::Tensor g_decay,
+        torch::Tensor state, int64_t key_dim, int64_t key_heads, double scale,
+        torch::Tensor z, torch::Tensor norm_weight, double eps,
+        std::optional<torch::Tensor> snapshots);
+    torch::Tensor group_norm_silu_pad3d(
+        torch::Tensor input, std::optional<torch::Tensor> weight,
+        std::optional<torch::Tensor> bias, int64_t groups, double eps,
+        std::vector<int64_t> pad, bool silu);
+    torch::Tensor fp16_linear(
+        torch::Tensor input, torch::Tensor weight,
+        std::optional<torch::Tensor> bias,
+        std::optional<torch::Tensor> residual,
+        std::optional<torch::Tensor> residual_scale);
+    torch::Tensor fp16_conv3d(
+        torch::Tensor input, torch::Tensor weight,
+        std::optional<torch::Tensor> bias,
+        std::optional<torch::Tensor> residual,
+        std::vector<int64_t> stride);
+    torch::Tensor rms_norm_for_int8(
+        torch::Tensor input, torch::Tensor weight, double eps);
+    torch::Tensor scaled_residual(
+        torch::Tensor input, torch::Tensor residual,
+        torch::Tensor residual_scale);
+}
 namespace layout {
 #if defined(OMNI_XPU_ARCH_BMG)
     torch::Tensor cat_pad_bmg(
@@ -859,4 +890,54 @@ PYBIND11_MODULE(_C, m) {
         "Clear INT8 oneDNN primitive cache");
     int8.def("int8_cache_stats", &omni_xpu::int8_ops::int8_cache_stats,
         "Return INT8 cache stats as (hits, misses, size)");
+
+    auto kitchen = m.def_submodule(
+        "kitchen", "Native Comfy Kitchen XPU operators");
+    kitchen.def(
+        "deltanet_conv_step",
+        &omni_xpu::kitchen::deltanet_conv_step,
+        "Depthwise causal decode convolution with in-place state and optional snapshots",
+        py::arg("proj"), py::arg("conv_state"), py::arg("conv_w"),
+        py::arg("conv_b") = py::none(),
+        py::arg("snapshots") = py::none());
+    kitchen.def(
+        "gated_delta_decode_fused",
+        &omni_xpu::kitchen::gated_delta_decode_fused,
+        "Up to eight Gated Delta decode steps with in-place FP32 state",
+        py::arg("mixed_qkv"), py::arg("x"), py::arg("w_a"),
+        py::arg("w_b"), py::arg("dt_bias"), py::arg("g_decay"),
+        py::arg("state"), py::arg("key_dim"), py::arg("key_heads"),
+        py::arg("scale"), py::arg("z"), py::arg("norm_weight"),
+        py::arg("eps"), py::arg("snapshots") = py::none());
+    kitchen.def(
+        "group_norm_silu_pad3d",
+        &omni_xpu::kitchen::group_norm_silu_pad3d,
+        "Per-frame GroupNorm, SiLU and reflect/causal padding on XPU",
+        py::arg("input"), py::arg("weight") = py::none(),
+        py::arg("bias") = py::none(), py::arg("groups") = 32,
+        py::arg("eps") = 1e-6,
+        py::arg("pad") = std::vector<int64_t>{0, 0, 0, 0, 0},
+        py::arg("silu") = true);
+    kitchen.def(
+        "fp16_linear", &omni_xpu::kitchen::fp16_linear,
+        "FP16 XPU linear with native bias and scaled-residual epilogue",
+        py::arg("input"), py::arg("weight"),
+        py::arg("bias") = py::none(),
+        py::arg("residual") = py::none(),
+        py::arg("residual_scale") = py::none());
+    kitchen.def(
+        "fp16_conv3d", &omni_xpu::kitchen::fp16_conv3d,
+        "FP16 XPU Conv3D with native bias and residual epilogue",
+        py::arg("input"), py::arg("weight"),
+        py::arg("bias") = py::none(),
+        py::arg("residual") = py::none(),
+        py::arg("stride") = std::vector<int64_t>{1, 1, 1});
+    kitchen.def(
+        "rms_norm_for_int8", &omni_xpu::kitchen::rms_norm_for_int8,
+        "XPU RMSNorm materialization for Kitchen INT8 projection",
+        py::arg("input"), py::arg("weight"), py::arg("eps") = 1e-6);
+    kitchen.def(
+        "scaled_residual", &omni_xpu::kitchen::scaled_residual,
+        "XPU residual + scale * projection epilogue",
+        py::arg("input"), py::arg("residual"), py::arg("residual_scale"));
 }
