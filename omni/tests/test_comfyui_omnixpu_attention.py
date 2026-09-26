@@ -1460,27 +1460,28 @@ def test_bmg_minimax_h3_video_vae_d64_uses_structural_cute(
     }
 
 
-def test_bmg_minimax_h3_video_vae_d64_batch4_packed_qkv(monkeypatch):
+@pytest.mark.parametrize("batch", [2, 3, 4])
+def test_bmg_minimax_h3_video_vae_d64_batched_packed_qkv(monkeypatch, batch):
     patch, attention, calls = _load_patch(
         monkeypatch, target="bmg", torch_version="2.13.0+xpu",
     )
     seq = 1797
     packed_stride = (seq * 6144, 192, 6144, 1)
     q = _FakeTensor(
-        batch=4, seq=seq, heads=32, dim_head=64,
+        batch=batch, seq=seq, heads=32, dim_head=64,
         dtype=torch.float16, stride=packed_stride,
     )
     k = _FakeTensor(
-        batch=4, seq=seq, heads=32, dim_head=64,
+        batch=batch, seq=seq, heads=32, dim_head=64,
         dtype=torch.float16, stride=packed_stride,
     )
     v = _FakeTensor(
-        batch=4, seq=seq, heads=32, dim_head=64,
+        batch=batch, seq=seq, heads=32, dim_head=64,
         dtype=torch.float16, stride=packed_stride,
     )
 
     def cat_batches(values, dim=0):
-        assert dim == 0 and len(values) == 4
+        assert dim == 0 and len(values) == batch
         shape = (sum(value.shape[0] for value in values), *values[0].shape[1:])
         return _FakeTensor._with_metadata(
             values[0], shape, _FakeTensor._contiguous_stride(shape),
@@ -1488,8 +1489,8 @@ def test_bmg_minimax_h3_video_vae_d64_batch4_packed_qkv(monkeypatch):
 
     monkeypatch.setattr(torch, "cat", cat_batches)
     result = attention.optimized_attention(q, k, v, heads=32, skip_reshape=True)
-    assert result.shape == (4, seq, 2048)
-    assert calls == ["cute_h3_vae_d64"] * 4
+    assert result.shape == (batch, seq, 2048)
+    assert calls == ["cute_h3_vae_d64"] * batch
     assert patch.get_stats()["fallback"] == 0
     assert patch.get_stats()["routes"] == {
         "minimax_h3_video_vae_fp16_d64": 1,

@@ -329,7 +329,7 @@ def _use_bmg_minimax_h3_vae_d64(
         and q.device.type == "xpu"
         and k.device == q.device
         and v.device == q.device
-        and b in (1, 4)
+        and 1 <= b <= 4
         and heads == 32
         and dim_head == 64
         and q_len == kv_len

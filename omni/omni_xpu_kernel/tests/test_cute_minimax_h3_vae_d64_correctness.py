@@ -94,10 +94,11 @@ def test_minimax_h3_video_vae_d64_rejects_wrong_layout_and_dtype():
 @pytest.mark.skipif(
     not has_bmg_h3_vae_d64(), reason="MiniMax H3 VideoVAE D64 unavailable"
 )
-def test_minimax_h3_video_vae_d64_batch4_packed_qkv_matches_sdpa():
+@pytest.mark.parametrize("batch", [2, 3, 4])
+def test_minimax_h3_video_vae_d64_batched_packed_qkv_matches_sdpa(batch):
     from omni_xpu_kernel import cute
 
-    batch, sequence, heads, width = 4, 1797, 32, 64
+    sequence, heads, width = 1797, 32, 64
     torch.xpu.manual_seed_all(20260926)
     qkv = torch.randn(
         (batch, sequence, heads, 3 * width),
