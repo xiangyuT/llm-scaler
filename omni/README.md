@@ -140,16 +140,16 @@ see [ComfyUI usage](docs/COMFYUI.md).
 
 ## Image contents
 
-The focused image contains:
+The focused source build selects:
 
-- upstream [ComfyUI v0.35.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.35.0),
-  pinned to `40c4fcdf513a4523e39d54a9d391908af8df8171`;
+- upstream [ComfyUI v0.37.0](https://github.com/Comfy-Org/ComfyUI/tree/v0.37.0),
+  pinned to `73c9bad4d21e7addbe1d13bc92eee0f1431b017d`;
 - `omni_xpu_kernel`, built for the selected Torch minor and XPU target;
-- official `comfy-kitchen==0.2.33` plus the co-installable XPU runtime provider
-  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/9a46ea72e3e9a639ec9cfc0af8d763614eb00b4d),
+- official `comfy-kitchen==0.2.35` plus the matching co-installable XPU runtime provider
+  from [`comfy-kitchen-xpu` revision](https://github.com/xiangyuT/comfy-kitchen-xpu/commit/e5fd85b54aeb4949cfa60c78128b2d867a7adfb5),
   including the managed GGUF and Nunchaku W4A16 routes;
-- official `comfy-aimdo==0.5.3` plus the co-installable XPU runtime provider
-  from [`comfy-aimdo-xpu` revision](https://github.com/xiangyuT/comfy-aimdo-xpu/commit/a79b5668d0a79a957796bd9c539577a70d384aa1),
+- official `comfy-aimdo==0.5.5` plus the co-installable XPU runtime provider
+  from [`shinosawabot/comfy-aimdo` revision](https://github.com/shinosawabot/comfy-aimdo/commit/874b805f032a213284170b6f5a2f11f6373c135d),
   built with its Level Zero backend and native allocator hook;
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
@@ -160,7 +160,7 @@ The focused image contains:
   Kitchen and the packaged `omni_xpu_kernel` XPU operators; see
   [usage and legacy-node migration](docs/SPARSE_ATTENTION.md);
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md);
-- ComfyUI v0.35.0 integrated Node Manager plus pinned VideoHelperSuite,
+- ComfyUI v0.37.0 integrated Node Manager plus pinned VideoHelperSuite,
   Easy-Use, KJNodes, CacheDiT, and ControlNet auxiliary nodes;
 - an exact installed Python dependency snapshot at
   `/llm/manifests/comfyui-python-freeze.txt`.

@@ -58,12 +58,12 @@ ComfyUI repository, commit, and version must be updated together. Kitchen and
 AIMDO official dependency versions are separate from the versions of their
 pinned provider source wheels. The provider manifests declare which official
 versions each source wheel accepts, and image validation checks both identities.
-For the ComfyUI 0.37.0 candidate, official Kitchen 0.2.35 uses the 0.2.33
-provider source at `shinosawabot/comfy-kitchen`
-(`e4e8ef8c241ebb8a41106355ce73eb05a2e1ddca`), while official AIMDO 0.5.5 uses
-the 0.5.3 provider source at `shinosawabot/comfy-aimdo`
-(`874b805f032a213284170b6f5a2f11f6373c135d`). Their manifests retain
-same-version compatibility for 0.2.33 and 0.5.3 installations respectively.
+For the ComfyUI 0.37.0 candidate, official Kitchen 0.2.35 uses the matching
+0.2.35 provider source at `xiangyuT/comfy-kitchen-xpu`
+(`e5fd85b54aeb4949cfa60c78128b2d867a7adfb5`). Official AIMDO 0.5.5 still
+uses the 0.5.3 provider source at `shinosawabot/comfy-aimdo`
+(`874b805f032a213284170b6f5a2f11f6373c135d`). The Kitchen provider manifest
+accepts official 0.2.35; AIMDO's manifest retains 0.5.3/0.5.5 compatibility.
 GGUF repository and commit must be updated together.
 The same rule applies to the combined Nunchaku repository, commit, and
 distribution version. Sparse attention uses ComfyUI's built-in node and the
