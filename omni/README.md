@@ -154,7 +154,7 @@ The focused source build selects:
 - [`ComfyUI-GGUF-XPU`](https://github.com/analytics-zoo/ComfyUI-GGUF-XPU/commit/39671fe73117ba97de7011e7e06e32599dcda06d),
   with GGUF, SentencePiece, and Protobuf dependencies installed from the same
   pinned checkout's requirements;
-- [`ComfyUI-nunchaku-XPU==1.2.1+xpu.3`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/cc0f6236b6c329178ad4ef58452a874e774c7b8e),
+- [`ComfyUI-nunchaku-XPU==1.2.1+xpu.3`](https://github.com/xiangyuT/ComfyUI-nunchaku-XPU/commit/61f388bf536942501acc163b52803d18232ccf70),
   with its `nunchaku_torch` runtime bundled in the same pinned checkout;
 - ComfyUI native **Model Sparse Attention** (SOL, SLA and VSA), backed by
   Kitchen and the packaged `omni_xpu_kernel` XPU operators; see
