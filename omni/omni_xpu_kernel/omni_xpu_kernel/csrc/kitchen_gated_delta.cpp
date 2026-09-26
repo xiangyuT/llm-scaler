@@ -14,10 +14,7 @@ template <typename T>
 class DeltaConvStepKernel;
 
 template <typename T>
-class GatedDeltaStateKernel;
-
-template <typename T>
-class GatedDeltaOutputKernel;
+class GatedDeltaDecodeKernel;
 
 template <typename T>
 torch::Tensor launch_delta_conv_step(
@@ -105,8 +102,7 @@ torch::Tensor launch_gated_delta_decode(
     const int64_t value_dim = state.size(3);
     const int64_t channels = mixed_qkv.size(1);
     const int64_t head_repeat = heads / key_heads;
-    auto raw = torch::empty({batch, steps, heads, value_dim}, x.options());
-    auto output = torch::empty_like(raw);
+    auto output = torch::empty({batch, steps, heads, value_dim}, x.options());
 
     const T* qkv_ptr = static_cast<const T*>(mixed_qkv.data_ptr());
     const T* x_ptr = static_cast<const T*>(x.data_ptr());
@@ -117,130 +113,137 @@ torch::Tensor launch_gated_delta_decode(
     float* state_ptr = state.data_ptr<float>();
     float* snapshot_ptr = snapshots.has_value()
         ? snapshots->data_ptr<float>() : nullptr;
-    T* raw_ptr = static_cast<T*>(raw.data_ptr());
     const T* z_ptr = static_cast<const T*>(z.data_ptr());
     const T* norm_ptr = static_cast<const T*>(norm_weight.data_ptr());
     T* output_ptr = static_cast<T*>(output.data_ptr());
     const float score_scale = static_cast<float>(scale);
     const float norm_eps = static_cast<float>(eps);
 
-    auto state_cgf = [&](sycl::handler& handler) {
-        handler.parallel_for<GatedDeltaStateKernel<T>>(
-            sycl::range<1>(static_cast<size_t>(batch * heads * value_dim)),
-            [=](sycl::id<1> item) {
-                const int64_t index = static_cast<int64_t>(item[0]);
-                const int64_t dv = index % value_dim;
-                const int64_t head = (index / value_dim) % heads;
-                const int64_t batch_index = index / (heads * value_dim);
+    // Each workgroup owns one (batch, head) state slice. Reduce the rounded
+    // per-value outputs locally so RMSNorm and gate need no global scratch or
+    // second launch; every lane reaches the barriers for every decode step.
+    size_t lanes = 1;
+    while (lanes < static_cast<size_t>(value_dim)) lanes <<= 1;
+    auto cgf = [&](sycl::handler& handler) {
+        sycl::local_accessor<float, 1> squares(sycl::range<1>(lanes), handler);
+        handler.parallel_for<GatedDeltaDecodeKernel<T>>(
+            sycl::nd_range<1>(
+                sycl::range<1>(static_cast<size_t>(batch * heads) * lanes),
+                sycl::range<1>(lanes)),
+            [=](sycl::nd_item<1> item) {
+                const int64_t dv = static_cast<int64_t>(item.get_local_id(0));
+                const int64_t group = static_cast<int64_t>(item.get_group(0));
+                const int64_t head = group % heads;
+                const int64_t batch_index = group / heads;
                 const int64_t key_head = head / head_repeat;
                 for (int64_t step = 0; step < steps; ++step) {
-                    const T* input_row =
-                        x_ptr + (batch_index * steps + step) * hidden;
-                    float a_sum = 0.0f;
-                    float b_sum = 0.0f;
-                    for (int64_t feature = 0; feature < hidden; ++feature) {
-                        const float value = static_cast<float>(input_row[feature]);
-                        a_sum += value *
-                            static_cast<float>(a_ptr[head * hidden + feature]);
-                        b_sum += value *
-                            static_cast<float>(b_ptr[head * hidden + feature]);
-                    }
-                    const float a_rounded = static_cast<float>(static_cast<T>(a_sum));
-                    const float b_rounded = static_cast<float>(static_cast<T>(b_sum));
-                    const float beta = static_cast<float>(static_cast<T>(
-                        1.0f / (1.0f + sycl::exp(-b_rounded))));
-                    const float pre_decay = a_rounded + dt_ptr[head];
-                    const float softplus = pre_decay > 20.0f
-                        ? pre_decay : sycl::log(1.0f + sycl::exp(pre_decay));
-                    const float decay = sycl::exp(decay_ptr[head] * softplus);
-
-                    float q_norm_square = 0.0f;
-                    float k_norm_square = 0.0f;
-                    for (int64_t d = 0; d < head_dim; ++d) {
-                        const int64_t q_channel = key_head * head_dim + d;
-                        const int64_t k_channel = key_dim + q_channel;
-                        const float q_value = static_cast<float>(
-                            qkv_ptr[(batch_index * channels + q_channel) * steps + step]);
-                        const float k_value = static_cast<float>(
-                            qkv_ptr[(batch_index * channels + k_channel) * steps + step]);
-                        q_norm_square += q_value * q_value;
-                        k_norm_square += k_value * k_value;
-                    }
-                    const float q_inverse = 1.0f /
-                        sycl::sqrt(sycl::fmax(q_norm_square, 1e-24f));
-                    const float k_inverse = 1.0f /
-                        sycl::sqrt(sycl::fmax(k_norm_square, 1e-24f));
-
-                    float memory = 0.0f;
-                    for (int64_t d = 0; d < head_dim; ++d) {
-                        const int64_t state_offset =
-                            ((batch_index * heads + head) * head_dim + d) *
-                            value_dim + dv;
-                        const float updated = state_ptr[state_offset] * decay;
-                        state_ptr[state_offset] = updated;
-                        const int64_t k_channel = key_dim + key_head * head_dim + d;
-                        const float k_value = static_cast<float>(
-                            qkv_ptr[(batch_index * channels + k_channel) * steps + step]) *
-                            k_inverse;
-                        memory += k_value * updated;
-                    }
-                    const int64_t v_channel = 2 * key_dim + head * value_dim + dv;
-                    const float value = static_cast<float>(
-                        qkv_ptr[(batch_index * channels + v_channel) * steps + step]);
-                    const float delta = (value - memory) * beta;
                     float raw_value = 0.0f;
-                    for (int64_t d = 0; d < head_dim; ++d) {
-                        const int64_t state_offset =
-                            ((batch_index * heads + head) * head_dim + d) *
-                            value_dim + dv;
-                        const int64_t base_channel = key_head * head_dim + d;
-                        const float k_value = static_cast<float>(
-                            qkv_ptr[(batch_index * channels + key_dim + base_channel) *
-                                    steps + step]) * k_inverse;
-                        const float updated = state_ptr[state_offset] + k_value * delta;
-                        state_ptr[state_offset] = updated;
-                        const float q_value = static_cast<float>(
-                            qkv_ptr[(batch_index * channels + base_channel) * steps + step]) *
-                            q_inverse * score_scale;
-                        raw_value += q_value * updated;
-                        if (snapshot_ptr && step + 1 < steps) {
-                            const int64_t snapshot_offset =
-                                (((step * batch + batch_index) * heads + head) *
-                                 head_dim + d) * value_dim + dv;
-                            snapshot_ptr[snapshot_offset] = updated;
+                    if (dv < value_dim) {
+                        const T* input_row =
+                            x_ptr + (batch_index * steps + step) * hidden;
+                        float a_sum = 0.0f;
+                        float b_sum = 0.0f;
+                        for (int64_t feature = 0; feature < hidden; ++feature) {
+                            const float value = static_cast<float>(input_row[feature]);
+                            a_sum += value *
+                                static_cast<float>(a_ptr[head * hidden + feature]);
+                            b_sum += value *
+                                static_cast<float>(b_ptr[head * hidden + feature]);
+                        }
+                        const float a_rounded = static_cast<float>(static_cast<T>(a_sum));
+                        const float b_rounded = static_cast<float>(static_cast<T>(b_sum));
+                        const float beta = static_cast<float>(static_cast<T>(
+                            1.0f / (1.0f + sycl::exp(-b_rounded))));
+                        const float pre_decay = a_rounded + dt_ptr[head];
+                        const float softplus = pre_decay > 20.0f
+                            ? pre_decay : sycl::log(1.0f + sycl::exp(pre_decay));
+                        const float decay = sycl::exp(decay_ptr[head] * softplus);
+
+                        float q_norm_square = 0.0f;
+                        float k_norm_square = 0.0f;
+                        for (int64_t d = 0; d < head_dim; ++d) {
+                            const int64_t q_channel = key_head * head_dim + d;
+                            const int64_t k_channel = key_dim + q_channel;
+                            const float q_value = static_cast<float>(
+                                qkv_ptr[(batch_index * channels + q_channel) * steps + step]);
+                            const float k_value = static_cast<float>(
+                                qkv_ptr[(batch_index * channels + k_channel) * steps + step]);
+                            q_norm_square += q_value * q_value;
+                            k_norm_square += k_value * k_value;
+                        }
+                        const float q_inverse = 1.0f /
+                            sycl::sqrt(sycl::fmax(q_norm_square, 1e-24f));
+                        const float k_inverse = 1.0f /
+                            sycl::sqrt(sycl::fmax(k_norm_square, 1e-24f));
+
+                        float memory = 0.0f;
+                        for (int64_t d = 0; d < head_dim; ++d) {
+                            const int64_t state_offset =
+                                ((batch_index * heads + head) * head_dim + d) *
+                                value_dim + dv;
+                            const float updated = state_ptr[state_offset] * decay;
+                            state_ptr[state_offset] = updated;
+                            const int64_t k_channel = key_dim + key_head * head_dim + d;
+                            const float k_value = static_cast<float>(
+                                qkv_ptr[(batch_index * channels + k_channel) * steps + step]) *
+                                k_inverse;
+                            memory += k_value * updated;
+                        }
+                        const int64_t v_channel = 2 * key_dim + head * value_dim + dv;
+                        const float value = static_cast<float>(
+                            qkv_ptr[(batch_index * channels + v_channel) * steps + step]);
+                        const float delta = (value - memory) * beta;
+                        for (int64_t d = 0; d < head_dim; ++d) {
+                            const int64_t state_offset =
+                                ((batch_index * heads + head) * head_dim + d) *
+                                value_dim + dv;
+                            const int64_t base_channel = key_head * head_dim + d;
+                            const float k_value = static_cast<float>(
+                                qkv_ptr[(batch_index * channels + key_dim + base_channel) *
+                                        steps + step]) * k_inverse;
+                            const float updated = state_ptr[state_offset] + k_value * delta;
+                            state_ptr[state_offset] = updated;
+                            const float q_value = static_cast<float>(
+                                qkv_ptr[(batch_index * channels + base_channel) * steps + step]) *
+                                q_inverse * score_scale;
+                            raw_value += q_value * updated;
+                            if (snapshot_ptr && step + 1 < steps) {
+                                const int64_t snapshot_offset =
+                                    (((step * batch + batch_index) * heads + head) *
+                                     head_dim + d) * value_dim + dv;
+                                snapshot_ptr[snapshot_offset] = updated;
+                            }
                         }
                     }
-                    raw_ptr[((batch_index * steps + step) * heads + head) *
-                            value_dim + dv] = static_cast<T>(raw_value);
+                    const float rounded = dv < value_dim
+                        ? static_cast<float>(static_cast<T>(raw_value)) : 0.0f;
+                    squares[dv] = rounded * rounded;
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for (size_t stride = lanes / 2; stride > 0; stride >>= 1) {
+                        if (static_cast<size_t>(dv) < stride) {
+                            squares[dv] += squares[dv + stride];
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                    if (dv < value_dim) {
+                        const int64_t index =
+                            ((batch_index * steps + step) * heads + head) *
+                            value_dim + dv;
+                        const float inverse = 1.0f / sycl::sqrt(
+                            squares[0] / static_cast<float>(value_dim) + norm_eps);
+                        const float normalized = static_cast<float>(
+                            static_cast<T>(rounded * inverse *
+                                           static_cast<float>(norm_ptr[dv])));
+                        const float gate = static_cast<float>(z_ptr[index]);
+                        const float activated = static_cast<float>(
+                            static_cast<T>(gate / (1.0f + sycl::exp(-gate))));
+                        output_ptr[index] = static_cast<T>(normalized * activated);
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
                 }
             });
     };
-    utils::submit_kernel(state_cgf, x.device(), "kitchen_gated_delta_state");
-
-    auto output_cgf = [&](sycl::handler& handler) {
-        handler.parallel_for<GatedDeltaOutputKernel<T>>(
-            sycl::range<1>(static_cast<size_t>(batch * steps * heads * value_dim)),
-            [=](sycl::id<1> item) {
-                const int64_t index = static_cast<int64_t>(item[0]);
-                const int64_t dv = index % value_dim;
-                const int64_t row = index / value_dim;
-                float square_sum = 0.0f;
-                for (int64_t d = 0; d < value_dim; ++d) {
-                    const float value = static_cast<float>(raw_ptr[row * value_dim + d]);
-                    square_sum += value * value;
-                }
-                const float inverse = 1.0f / sycl::sqrt(
-                    square_sum / static_cast<float>(value_dim) + norm_eps);
-                const float normalized = static_cast<float>(
-                    static_cast<T>(static_cast<float>(raw_ptr[index]) * inverse *
-                                   static_cast<float>(norm_ptr[dv])));
-                const float gate = static_cast<float>(z_ptr[index]);
-                const float activated = static_cast<float>(
-                    static_cast<T>(gate / (1.0f + sycl::exp(-gate))));
-                output_ptr[index] = static_cast<T>(normalized * activated);
-            });
-    };
-    utils::submit_kernel(output_cgf, x.device(), "kitchen_gated_delta_output");
+    utils::submit_kernel(cgf, x.device(), "kitchen_gated_delta_decode_fused");
     return output;
 }
 

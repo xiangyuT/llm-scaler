@@ -57,8 +57,9 @@ def test_deltanet_conv_step_rejects_more_than_eight_steps():
 
 @pytest.mark.parametrize("steps", [1, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_gated_delta_decode_matches_cuda_ut_contract(steps, dtype):
-    batch, heads, key_heads, key_head_dim, value_dim, hidden = 2, 4, 2, 128, 128, 256
+@pytest.mark.parametrize("value_dim", [32, 96, 128, 256, 512])
+def test_gated_delta_decode_matches_cuda_ut_contract(steps, dtype, value_dim):
+    batch, heads, key_heads, key_head_dim, hidden = 2, 4, 2, 128, 256
     key_dim = key_heads * key_head_dim
     channels = 2 * key_dim + heads * value_dim
     scale, eps = key_head_dim ** -0.5, 1e-6
