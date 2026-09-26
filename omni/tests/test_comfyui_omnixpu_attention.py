@@ -145,6 +145,18 @@ class _FakeTensor:
         dims[dim0], dims[dim1] = dims[dim1], dims[dim0]
         return self.permute(*dims)
 
+    def __getitem__(self, key):
+        if not isinstance(key, slice):
+            raise TypeError("the attention fixture supports batch slices only")
+        start, stop, step = key.indices(self.shape[0])
+        if step != 1:
+            raise ValueError("the attention fixture requires unit batch steps")
+        result = self._with_metadata(
+            self, (stop - start, *self.shape[1:]), self._stride,
+        )
+        result._storage_offset += start * self._stride[0]
+        return result
+
     def stride(self):
         return self._stride
 
@@ -1446,6 +1458,56 @@ def test_bmg_minimax_h3_video_vae_d64_uses_structural_cute(
     assert patch.get_stats()["routes"] == {
         "minimax_h3_video_vae_fp16_d64": 1
     }
+
+
+def test_bmg_minimax_h3_video_vae_d64_batch4_packed_qkv(monkeypatch):
+    patch, attention, calls = _load_patch(
+        monkeypatch, target="bmg", torch_version="2.13.0+xpu",
+    )
+    seq = 1797
+    packed_stride = (seq * 6144, 192, 6144, 1)
+    q = _FakeTensor(
+        batch=4, seq=seq, heads=32, dim_head=64,
+        dtype=torch.float16, stride=packed_stride,
+    )
+    k = _FakeTensor(
+        batch=4, seq=seq, heads=32, dim_head=64,
+        dtype=torch.float16, stride=packed_stride,
+    )
+    v = _FakeTensor(
+        batch=4, seq=seq, heads=32, dim_head=64,
+        dtype=torch.float16, stride=packed_stride,
+    )
+
+    def cat_batches(values, dim=0):
+        assert dim == 0 and len(values) == 4
+        shape = (sum(value.shape[0] for value in values), *values[0].shape[1:])
+        return _FakeTensor._with_metadata(
+            values[0], shape, _FakeTensor._contiguous_stride(shape),
+        )
+
+    monkeypatch.setattr(torch, "cat", cat_batches)
+    result = attention.optimized_attention(q, k, v, heads=32, skip_reshape=True)
+    assert result.shape == (4, seq, 2048)
+    assert calls == ["cute_h3_vae_d64"] * 4
+    assert patch.get_stats()["fallback"] == 0
+    assert patch.get_stats()["routes"] == {
+        "minimax_h3_video_vae_fp16_d64": 1,
+    }
+
+
+def test_bmg_minimax_h3_video_vae_d64_packed_qk_materialization(monkeypatch):
+    patch, _, _ = _load_patch(monkeypatch, target="bmg")
+    seq = 261
+    qkv = torch.randn(4, seq, 32, 192)
+    q, k, v = (part.transpose(1, 2) for part in qkv.chunk(3, dim=-1))
+    assert patch._is_minimax_h3_vae_d64_bhld(q, seq, 4, value=False)
+    assert patch._is_minimax_h3_vae_d64_bhld(k, seq, 4, value=False)
+    assert patch._is_minimax_h3_vae_d64_bhld(v, seq, 4, value=True)
+    prepared = patch._minimax_h3_vae_d64_qk_for_native(q[:1])
+    assert prepared.stride() == (seq * 2048, 64, 2048, 1)
+    assert torch.equal(prepared, q[:1])
+    assert not torch._C._is_alias_of(prepared, q)
 
 
 def test_bmg_minimax_h3_video_vae_d64_rejects_wrong_v_stride(monkeypatch):

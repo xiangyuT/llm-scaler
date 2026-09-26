@@ -262,19 +262,44 @@ def _is_minimax_h3_h56_bhld(tensor, seq):
     )
 
 
-def _is_minimax_h3_vae_d64_bhld(tensor, seq, *, value):
+def _is_minimax_h3_vae_d64_bhld(tensor, seq, batch, *, value):
     try:
         shape = tuple(tensor.shape)
         strides = tuple(tensor.stride())
     except (AttributeError, TypeError):
         return False
-    sequence_stride = 32 * (3 * 64 if value else 64)
-    head_stride = 3 * 64 if value else 64
-    return (
-        shape == (1, 32, seq, 64)
-        and strides
-        == (seq * sequence_stride, head_stride, sequence_stride, 1)
-    )
+    if shape != (batch, 32, seq, 64):
+        return False
+    packed = (seq * 32 * 3 * 64, 3 * 64, 32 * 3 * 64, 1)
+    separate = (seq * 32 * 64, 64, 32 * 64, 1)
+    return strides == packed if value else strides in (separate, packed)
+
+
+def _minimax_h3_vae_d64_qk_for_native(tensor):
+    if tensor.stride()[1] == 64:
+        return tensor
+    # ComfyUI 0.37 keeps Q/K as slices of packed [Q,K,V] after in-place
+    # RMS/RoPE. The native B1 kernel needs dense BLHD-backed Q/K; V keeps its
+    # validated interleaved view. Materialize only the two required carriers.
+    return tensor.transpose(1, 2).contiguous().transpose(1, 2)
+
+
+def _run_minimax_h3_vae_d64(q, k, v, batch, seq, heads, width):
+    if batch == 1:
+        out = _backend_sdp.sdp_minimax_h3_vae_d64(
+            _minimax_h3_vae_d64_qk_for_native(q),
+            _minimax_h3_vae_d64_qk_for_native(k), v,
+        )
+        return out.transpose(1, 2).reshape(batch, seq, heads * width)
+    pieces = []
+    for index in range(batch):
+        q_part = _minimax_h3_vae_d64_qk_for_native(q[index:index + 1])
+        k_part = _minimax_h3_vae_d64_qk_for_native(k[index:index + 1])
+        out = _backend_sdp.sdp_minimax_h3_vae_d64(
+            q_part, k_part, v[index:index + 1],
+        )
+        pieces.append(out.transpose(1, 2).reshape(1, seq, heads * width))
+    return torch.cat(pieces, dim=0)
 
 
 def _use_bmg_minimax_h3_vae_d64(
@@ -304,16 +329,16 @@ def _use_bmg_minimax_h3_vae_d64(
         and q.device.type == "xpu"
         and k.device == q.device
         and v.device == q.device
-        and b == 1
+        and b in (1, 4)
         and heads == 32
         and dim_head == 64
         and q_len == kv_len
         and q_len >= _MINIMAX_H3_VAE_D64_CUTE_MIN_SEQUENCE
         and skip_reshape
         and not skip_output_reshape
-        and _is_minimax_h3_vae_d64_bhld(q, q_len, value=False)
-        and _is_minimax_h3_vae_d64_bhld(k, q_len, value=False)
-        and _is_minimax_h3_vae_d64_bhld(v, q_len, value=True)
+        and _is_minimax_h3_vae_d64_bhld(q, q_len, b, value=False)
+        and _is_minimax_h3_vae_d64_bhld(k, q_len, b, value=False)
+        and _is_minimax_h3_vae_d64_bhld(v, q_len, b, value=True)
     )
 
 
@@ -989,7 +1014,7 @@ def apply():
 
         # Constraint check
         reasons = []
-        if b != 1 and bmg_d128_prepared is None:
+        if b != 1 and bmg_d128_prepared is None and not use_bmg_minimax_h3_vae_d64:
             reasons.append(f"batch={b}")
         if (
             bmg_d128_contract is not None
@@ -1256,9 +1281,8 @@ def apply():
                 details={"backend": "cute", "route": route},
             )
             try:
-                out = _backend_sdp.sdp_minimax_h3_vae_d64(q, k, v)
-                return out.transpose(1, 2).reshape(
-                    b, q_len, heads * dim_head
+                return _run_minimax_h3_vae_d64(
+                    q, k, v, b, q_len, heads, dim_head,
                 )
             except Exception as error:
                 if is_fatal_accelerator_error(error):
