@@ -27,6 +27,7 @@
 #include "oneapi/dnnl/dnnl_sycl.hpp"
 #include <torch/extension.h>
 #include <ATen/xpu/XPUGeneratorImpl.h>
+#include <sycl/sycl.hpp>
 
 #include "utils.h"
 
@@ -51,6 +52,79 @@ torch::Tensor fused_scaleback(torch::Tensor gemm_result, torch::Tensor x_scale,
 namespace {
 
 using DT = dnnl::memory::data_type;
+
+#if defined(OMNI_XPU_ARCH_BMG)
+template <typename OutputT>
+class KitchenInt8TwoRowKernel;
+
+template <typename OutputT>
+void launch_int8_two_row(
+    const torch::Tensor& x_int8,
+    const torch::Tensor& x_scale,
+    const torch::Tensor& weight,
+    const torch::Tensor& weight_scale,
+    const torch::Tensor& bias_f32,
+    torch::Tensor& output) {
+    constexpr size_t subgroup = 16;
+    constexpr size_t subgroups_per_workgroup = 8;
+    constexpr size_t workgroup = subgroup * subgroups_per_workgroup;
+    const int64_t k = x_int8.size(1);
+    const int64_t n = weight.size(0);
+    const bool scalar_weight_scale = weight_scale.numel() == 1;
+    const bool has_bias = bias_f32.defined();
+    const auto* x_ptr = x_int8.data_ptr<int8_t>();
+    const auto* x_scale_ptr = x_scale.data_ptr<float>();
+    const auto* weight_ptr = weight.data_ptr<int8_t>();
+    const auto* weight_scale_ptr = weight_scale.data_ptr<float>();
+    const auto* bias_ptr = has_bias ? bias_f32.data_ptr<float>() : nullptr;
+    auto* output_ptr = static_cast<OutputT*>(output.data_ptr());
+
+    auto cgf = [&](sycl::handler& handler) {
+        handler.parallel_for<KitchenInt8TwoRowKernel<OutputT>>(
+            sycl::nd_range<1>(
+                sycl::range<1>(
+                    static_cast<size_t>((n + subgroups_per_workgroup - 1) /
+                                        subgroups_per_workgroup) * workgroup),
+                sycl::range<1>(workgroup)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int64_t column =
+                    static_cast<int64_t>(item.get_group(0)) *
+                        subgroups_per_workgroup +
+                    static_cast<int64_t>(item.get_local_id(0) / subgroup);
+                if (column >= n) return;
+                const int64_t lane = item.get_local_id(0) % subgroup;
+                const int8_t* weight_row = weight_ptr + column * k;
+                int32_t sum0 = 0;
+                int32_t sum1 = 0;
+                for (int64_t block = lane; block < k / 16; block += subgroup) {
+                    const int64_t offset = block * 16;
+#pragma unroll
+                    for (int index = 0; index < 16; ++index) {
+                        const int32_t w = weight_row[offset + index];
+                        sum0 += static_cast<int32_t>(x_ptr[offset + index]) * w;
+                        sum1 += static_cast<int32_t>(x_ptr[k + offset + index]) * w;
+                    }
+                }
+                const auto sg = item.get_sub_group();
+                sum0 = sycl::reduce_over_group(sg, sum0, sycl::plus<int32_t>());
+                sum1 = sycl::reduce_over_group(sg, sum1, sycl::plus<int32_t>());
+                if (lane == 0) {
+                    const float weight_factor = weight_scale_ptr[
+                        scalar_weight_scale ? 0 : column];
+                    const float bias = has_bias ? bias_ptr[column] : 0.0f;
+                    output_ptr[column] = static_cast<OutputT>(
+                        static_cast<float>(sum0) * x_scale_ptr[0] *
+                        weight_factor + bias);
+                    output_ptr[n + column] = static_cast<OutputT>(
+                        static_cast<float>(sum1) * x_scale_ptr[1] *
+                        weight_factor + bias);
+                }
+            });
+    };
+    omni_xpu::utils::submit_kernel(
+        cgf, x_int8.device(), "kitchen_int8_two_row_gemv");
+}
+#endif
 
 // ============================================================================
 // Primitive Cache
@@ -597,6 +671,33 @@ torch::Tensor int8_linear_prequantized_impl(
             "), got numel=", bias->numel());
         bias_f32 = bias->to(x_int8.device()).to(torch::kFloat32).reshape({1, n}).contiguous();
     }
+
+#if defined(OMNI_XPU_ARCH_BMG)
+    // AR/CFG has two activation rows. A subgroup shares each weight row while
+    // accumulating both outputs, then applies scales and bias in this launch.
+    if (m == 2 && k % 16 == 0 && k <= 65536) {
+        if (!output_opt.has_value()) {
+            output = torch::empty(
+                {m, n},
+                torch::TensorOptions().dtype(out_dtype).device(x_int8.device()));
+        }
+        switch (out_dtype_code) {
+            case 0:
+                launch_int8_two_row<float>(
+                    x_int8, x_scale, weight, weight_scale, bias_f32, output);
+                break;
+            case 1:
+                launch_int8_two_row<sycl::half>(
+                    x_int8, x_scale, weight, weight_scale, bias_f32, output);
+                break;
+            case 2:
+                launch_int8_two_row<sycl::ext::oneapi::bfloat16>(
+                    x_int8, x_scale, weight, weight_scale, bias_f32, output);
+                break;
+        }
+        return output.reshape(out_sizes);
+    }
+#endif
 
     sycl::queue& queue = omni_xpu::utils::get_queue(x_int8.device());
     auto state = get_or_create_int8_scaled_primitive(
