@@ -60,7 +60,7 @@ pinned provider source wheels. The provider manifests declare which official
 versions each source wheel accepts, and image validation checks both identities.
 For the ComfyUI 0.37.0 candidate, official Kitchen 0.2.35 uses the matching
 0.2.35 provider source at `xiangyuT/comfy-kitchen-xpu`
-(`66ada080afbfcae49db9565f484ca5c9cb7e4300`). Official AIMDO 0.5.5 still
+(`ad51a0784442e678a068541115669e0d45007c33`). Official AIMDO 0.5.5 still
 uses the 0.5.3 provider source at `shinosawabot/comfy-aimdo`
 (`874b805f032a213284170b6f5a2f11f6373c135d`). The Kitchen provider manifest
 accepts official 0.2.35; AIMDO's manifest retains 0.5.3/0.5.5 compatibility.
