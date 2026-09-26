@@ -95,7 +95,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_KITCHEN_COMMIT": (
         "KITCHEN_COMMIT",
-        "e5fd85b54aeb4949cfa60c78128b2d867a7adfb5",
+        "66ada080afbfcae49db9565f484ca5c9cb7e4300",
     ),
     "COMFY_KITCHEN_VERSION": ("KITCHEN_VERSION", "0.2.35"),
     "COMFY_KITCHEN_PROVIDER_VERSION": (
