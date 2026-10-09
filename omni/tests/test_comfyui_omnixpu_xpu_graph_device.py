@@ -209,3 +209,54 @@ def test_existing_zimage_bf16_forward_replay_numerics(live):
                 Path(output).write_text(json.dumps({'records': records, 'counts': dict(state.stats)}, indent=2) + '\n')
             model.cleanup()
             comfy.model_management.unload_all_models()
+
+
+def test_real_xpu_signature_switch_eviction_and_retained_outputs(live):
+    runtime, _, _ = live
+    device = torch.device('xpu', 0)
+    function = lambda x: x.sin() + x * 2
+    with torch.inference_mode():
+        engine = runtime.GraphRuntime(torch, runtime.XPUBackend(torch, device))
+        snapshots = []
+        try:
+            for size in (8, 16, 24, 8):
+                for index in range(4):
+                    x = torch.randn((size, 64), device=device) * 0.1
+                    result = engine(function, (x,), {})
+                    torch.testing.assert_close(result, function(x), rtol=1e-4, atol=1e-4)
+                    snapshots.append((result, result.cpu().clone()))
+                    assert len(engine.signatures) <= 2
+            assert engine.stats['captures'] == 4 and engine.stats['replays'] == 4
+            assert engine.stats['evictions'] == 2
+            for result, copy in snapshots:
+                torch.testing.assert_close(result.cpu(), copy, rtol=0, atol=0)
+        finally:
+            engine.close()
+        assert not engine.entries and not engine.constants and not engine.signatures
+
+
+def test_real_xpu_sampler_cancellation_then_fresh_graph(live):
+    runtime, adapter, _ = live
+    import comfy.model_management
+    device = torch.device('xpu', 0)
+    state = adapter.ModelGraphState()
+    engines = []
+    def sampler(cancel):
+        engine = runtime.GraphRuntime(torch, runtime.XPUBackend(torch, device))
+        engines.append(engine)
+        state.local.runtime = engine
+        function = lambda x: x.sin() * 2
+        for _ in range(5):
+            x = torch.randn((8, 64), device=device)
+            actual = engine(function, (x,), {})
+            torch.testing.assert_close(actual, function(x), rtol=1e-4, atol=1e-4)
+        if cancel:
+            raise comfy.model_management.InterruptProcessingException()
+    with torch.inference_mode():
+        with pytest.raises(comfy.model_management.InterruptProcessingException):
+            state.sampler_wrapper(sampler, True)
+        state.sampler_wrapper(sampler, False)
+        assert engines[0] is not engines[1]
+        assert all(engine.closed and not engine.entries for engine in engines)
+        assert state.stats['captures'] == 2 and state.stats['graph_teardowns'] == 2
+        assert not state.poisoned and state.local.runtime is None

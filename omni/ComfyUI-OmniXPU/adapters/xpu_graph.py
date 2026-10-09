@@ -46,10 +46,13 @@ class ModelGraphState:
         self.stats = Counter()
         self.reasons = Counter()
         self.poisoned = False
-        _STATES.add(self)
+        with _STATS_LOCK:
+            _STATES.add(self)
 
     def on_model_patcher_clone(self):
-        return ModelGraphState(enabled=self.enabled, runtime_factory=self.runtime_factory)
+        clone = ModelGraphState(enabled=self.enabled, runtime_factory=self.runtime_factory)
+        clone.poisoned = self.poisoned
+        return clone
 
     def sampler_wrapper(self, executor, *args, **kwargs):
         if self.poisoned:
@@ -58,26 +61,34 @@ class ModelGraphState:
             return executor(*args, **kwargs)
         self.local.active = True
         self.local.runtime = None
-        before_stats, before_reasons = self.stats.copy(), self.reasons.copy()
-        self.stats["samples"] += 1
+        counts, reasons = Counter(samples=1), Counter()
+        self.local.counts, self.local.reasons = counts, reasons
         try:
             return executor(*args, **kwargs)
         finally:
             runtime = self.local.runtime
             try:
-                if runtime is not None:
+                if runtime is not None and not runtime.poisoned:
                     runtime.close()
-                    self.stats["graph_teardowns"] += 1
+                    counts["graph_teardowns"] += 1
             finally:
                 if runtime is not None:
-                    self.poisoned = self.poisoned or runtime.poisoned
-                    self.stats.update(runtime.stats)
-                    self.reasons.update(runtime.reasons)
+                    if runtime.poisoned:
+                        patcher = self.patcher() if self.patcher else None
+                        module = getattr(getattr(patcher, "model", None), "diffusion_model", None)
+                        if module is not None:
+                            runtime.failed_weights = tuple(p.detach() for p in module.parameters())
+                    counts.update(runtime.stats)
+                    reasons.update(runtime.reasons)
                 self.local.runtime = None
                 self.local.active = False
+                self.local.counts = self.local.reasons = None
                 with _STATS_LOCK:
-                    _TOTAL_COUNTS.update(self.stats - before_stats)
-                    _TOTAL_REASONS.update(self.reasons - before_reasons)
+                    self.poisoned = self.poisoned or (runtime is not None and runtime.poisoned)
+                    self.stats.update(counts)
+                    self.reasons.update(reasons)
+                    _TOTAL_COUNTS.update(counts)
+                    _TOTAL_REASONS.update(reasons)
 
     def eligibility(self, executor, options):
         patcher = self.patcher() if self.patcher else None
@@ -94,6 +105,12 @@ class ModelGraphState:
             return "inference-only graph path"
         if (type(module).__module__, type(module).__name__) not in _MODEL_TYPES:
             return "model forward has not been qualified"
+        if any(child.training or child._forward_pre_hooks or child._forward_hooks
+               for child in module.modules()):
+            return "training children or module forward hooks are not qualified"
+        hooks = torch.nn.modules.module
+        if hooks._global_forward_pre_hooks or hooks._global_forward_hooks:
+            return "global module forward hooks are not qualified"
         if len(executor.wrappers) != 1:
             return "additional diffusion wrappers"
         if patcher.model_options.get("torch_compile_kwargs"):
@@ -110,9 +127,11 @@ class ModelGraphState:
         if type(module).__name__ == "NextDiT":
             if not isinstance(module.rope_embedder, ResidentEmbedND):
                 return "native position constant adapter required"
-            if any(type(value) not in (int, float) for value in options.get("rope_options", {}).values()):
+            position_options = options.get("rope_options")
+            if position_options is not None and (not isinstance(position_options, dict)
+                    or any(type(value) not in (int, float) for value in position_options.values())):
                 return "dynamic position options are not qualified"
-        if os.environ.get("OMNI_ATTN_BACKEND", "auto") == "esimd":
+        if os.environ.get("OMNI_ATTN_BACKEND", "auto").lower() == "esimd":
             return "stateful ESIMD attention is not qualified"
         if os.environ.get("AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC", "0") != "0":
             return "allocation compiler combination is not qualified"
@@ -136,8 +155,15 @@ class ModelGraphState:
         options = bound.arguments.get("transformer_options", {})
         reason = self.eligibility(executor, options)
         if reason:
-            self.reasons[reason] += 1
-            self.stats["skipped"] += 1
+            if getattr(self.local, "active", False):
+                self.local.reasons[reason] += 1
+                self.local.counts["skipped"] += 1
+            else:
+                with _STATS_LOCK:
+                    self.reasons[reason] += 1
+                    self.stats["skipped"] += 1
+                    _TOTAL_REASONS[reason] += 1
+                    _TOTAL_COUNTS["skipped"] += 1
             return executor(*args, **kwargs)
         module = executor.class_obj
         parameters = list(module.parameters())
@@ -158,7 +184,8 @@ class ModelGraphState:
         options.pop("wrappers", None)
         options.pop("callbacks", None)
         bound.arguments["transformer_options"] = options
-        return self.local.runtime(executor, bound.args, bound.kwargs, identity=identity)
+        return self.local.runtime(executor, bound.args, bound.kwargs, identity=identity,
+                                  callable_identity=executor.original)
 
 
 def _on_clone(parent, clone):
@@ -182,8 +209,11 @@ def bind(model, state):
 def get_stats():
     with _STATS_LOCK:
         stats, reasons = _TOTAL_COUNTS.copy(), _TOTAL_REASONS.copy()
-    for state in list(_STATES):
+        states = list(_STATES)
+    for state in states:
         runtime = getattr(state.local, "runtime", None)
+        stats.update(getattr(state.local, "counts", None) or {})
+        reasons.update(getattr(state.local, "reasons", None) or {})
         if runtime is not None:
             stats.update(runtime.stats)
             reasons.update(runtime.reasons)

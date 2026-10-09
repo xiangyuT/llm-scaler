@@ -373,7 +373,6 @@ def test_eviction_cleanup_failure_prevents_another_capture(modules):
     engine, backend, core = runtime(modules, warmup_calls=1, max_entries=1)
     for _ in range(2):
         engine(core, (torch.ones(4),), {})
-    engine(core, (torch.ones(5),), {})
     graph = next(iter(engine.entries.values()))[0]
     def failed_reset():
         raise RuntimeError("graph reset failed")
@@ -383,3 +382,198 @@ def test_eviction_cleanup_failure_prevents_another_capture(modules):
     assert engine.poisoned and engine.closed
     with pytest.raises(RuntimeError, match="closed"):
         engine(core, (torch.ones(5),), {})
+
+
+def test_warm_position_caches_share_the_signature_budget(modules):
+    constants_module = importlib.import_module("omnixpu_graph_test.graph_constants")
+    class Embed(torch.nn.Module):
+        dim, theta, axes_dim = 2, 10000, [2]
+        def forward(self, ids):
+            return ids.cos()
+    wrapper = constants_module.ResidentEmbedND(Embed())
+    engine, _, core = runtime(modules, max_entries=2)
+    def function(x):
+        wrapper(torch.arange(x.numel(), dtype=x.dtype).reshape(1, -1, 1))
+        return core(x)
+    for size in range(4, 14):
+        engine(function, (torch.ones(size),), {})
+        assert len(engine.constants) <= 2 and len(engine.warmed) <= 2
+        assert len(engine.entries) <= 2 and len(engine.signatures) <= 2
+    assert engine.stats["signature_evictions"] == 8
+    engine.close()
+    assert not engine.signatures and not engine.constants
+
+
+def test_rejected_signatures_are_bounded_too(modules):
+    backend = FakeBackend(capture_error=RuntimeError("unsupported"))
+    engine = modules[0].GraphRuntime(torch, backend, warmup_calls=1, max_entries=2)
+    core = Core(backend)
+    for size in range(4, 10):
+        for _ in range(2):
+            engine(core, (torch.ones(size),), {})
+        assert len(engine.rejected) <= 2
+    assert engine.stats["capture_failures"] == 6
+    engine.close()
+
+
+def test_failed_cleanup_is_not_a_successful_teardown_and_survives_clone(modules):
+    import weakref
+    backend = FakeBackend(capture_error=RuntimeError("unsupported"), cleanup_error=RuntimeError("recording"))
+    state = modules[1].ModelGraphState()
+    engine = modules[0].GraphRuntime(torch, backend, warmup_calls=1)
+    core = Core(backend)
+    def sampler():
+        state.local.runtime = engine
+        engine(core, (torch.ones(4),), {})
+        engine(core, (torch.ones(4),), {})
+    with pytest.raises(RuntimeError, match="restart"):
+        state.sampler_wrapper(sampler)
+    assert state.stats["graph_teardowns"] == 0 and state.poisoned
+    assert state.on_model_patcher_clone().poisoned
+    assert engine in modules[0]._FAILED_RUNTIMES
+    held_graph = weakref.ref(engine.failed_resources[0])
+    assert held_graph() is not None
+    with pytest.raises(RuntimeError, match="restart"):
+        state.sampler_wrapper(lambda: pytest.fail("poisoned sampler executed"))
+
+
+def test_cancelled_sampler_can_restart_with_a_new_runtime(modules):
+    state = modules[1].ModelGraphState()
+    engines = []
+    def sampler(cancel):
+        engine, _, core = runtime(modules, warmup_calls=1)
+        engines.append(engine)
+        state.local.runtime = engine
+        for _ in range(2):
+            engine(core, (torch.ones(4),), {})
+        if cancel:
+            raise RuntimeError("cancelled")
+    with pytest.raises(RuntimeError, match="cancelled"):
+        state.sampler_wrapper(sampler, True)
+    state.sampler_wrapper(sampler, False)
+    assert all(engine.closed and not engine.entries for engine in engines)
+    assert engines[0] is not engines[1]
+    assert state.stats["captures"] == 2 and state.stats["graph_teardowns"] == 2
+
+
+def test_overlapping_sampler_counters_are_added_once(modules):
+    import concurrent.futures
+    import threading
+    state = modules[1].ModelGraphState()
+    barrier = threading.Barrier(2)
+    def sampler():
+        engine, _, core = runtime(modules, warmup_calls=1)
+        state.local.runtime = engine
+        for _ in range(2):
+            engine(core, (torch.ones(4),), {})
+        barrier.wait(timeout=5)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as workers:
+        jobs = [workers.submit(state.sampler_wrapper, sampler) for _ in range(2)]
+        for job in jobs:
+            job.result(timeout=10)
+    counts = modules[1].get_stats()["counts"]
+    assert counts["samples"] == counts["captures"] == counts["graph_teardowns"] == 2
+
+
+@pytest.mark.parametrize("option", [None, {}, {"scale_x": 1.0}])
+def test_native_null_or_scalar_position_options_do_not_fail(modules, monkeypatch, option):
+    constants_module = importlib.import_module("omnixpu_graph_test.graph_constants")
+    Native = type("NextDiT", (torch.nn.Module,), {"__module__": "comfy.ldm.lumina.model"})
+    module = Native().eval()
+    module.rope_embedder = constants_module.ResidentEmbedND(torch.nn.Identity())
+    class Patcher:
+        model = types.SimpleNamespace(model_lowvram=False)
+        model_options, object_patches, hook_patches, weight_wrapper_patches = {}, {}, {}, {}
+        def is_dynamic(self):
+            return False
+    patcher = Patcher()
+    state = modules[1].ModelGraphState(patcher)
+    state.local.active = True
+    control = types.SimpleNamespace(get_xpu_allocator_mode=lambda: None)
+    monkeypatch.setitem(sys.modules, "comfy_aimdo", types.SimpleNamespace(control=control))
+    executor = types.SimpleNamespace(class_obj=module, wrappers=[state.diffusion_wrapper])
+    with torch.inference_mode():
+        assert state.eligibility(executor, {"rope_options": option}) == "XPU-resident parameters required"
+
+
+@pytest.mark.parametrize("hook", ["pre", "post", "training_child"])
+def test_hidden_module_hooks_or_training_children_keep_eager(modules, hook):
+    Native = type("UNetModel", (torch.nn.Module,),
+                  {"__module__": "comfy.ldm.modules.diffusionmodules.openaimodel"})
+    module = Native()
+    module.child = torch.nn.Dropout()
+    module.eval()
+    if hook == "training_child":
+        module.child.train()
+    elif hook == "pre":
+        module.child.register_forward_pre_hook(lambda *args: None)
+    else:
+        module.register_forward_hook(lambda *args: None)
+    class Patcher:
+        model = types.SimpleNamespace(model_lowvram=False)
+        def is_dynamic(self):
+            return False
+    patcher = Patcher()
+    state = modules[1].ModelGraphState(patcher)
+    state.local.active = True
+    executor = types.SimpleNamespace(class_obj=module, wrappers=[state.diffusion_wrapper])
+    with torch.inference_mode():
+        assert state.eligibility(executor, {}) == "training children or module forward hooks are not qualified"
+
+
+def test_cpu_metadata_is_rejected_before_xpu_stream_work(modules):
+    backend = object.__new__(modules[0].XPUBackend)
+    backend.device, backend.torch = torch.device("xpu", 0), torch
+    with pytest.raises(modules[0].UnsupportedGraphInput, match="model XPU"):
+        backend.validate_inputs((torch.ones(4),))
+
+
+def test_new_callable_with_identical_inputs_cannot_reuse_old_graph(modules):
+    engine, backend, _ = runtime(modules, warmup_calls=1)
+    def make(scale):
+        def function(x):
+            output = x * scale
+            if backend.graph:
+                backend.graph.operation = lambda: output.copy_(x * scale)
+            return output
+        return function
+    for scale in (2, 3):
+        function = make(scale)
+        for _ in range(2):
+            assert torch.equal(engine(function, (torch.ones(4),), {}), torch.ones(4) * scale)
+    assert engine.stats["captures"] == 2
+    engine.close()
+
+
+def qualification_state(modules):
+    Native = type("UNetModel", (torch.nn.Module,),
+                  {"__module__": "comfy.ldm.modules.diffusionmodules.openaimodel"})
+    module = Native().eval()
+    class Patcher:
+        model = types.SimpleNamespace(model_lowvram=False)
+        model_options, object_patches, hook_patches, weight_wrapper_patches = {}, {}, {}, {}
+        def is_dynamic(self):
+            return False
+    patcher = Patcher()
+    state = modules[1].ModelGraphState(patcher)
+    state.local.active = True
+    executor = types.SimpleNamespace(class_obj=module, wrappers=[state.diffusion_wrapper])
+    return patcher, state, executor
+
+
+@pytest.mark.parametrize("backend", ["ESIMD", "EsImD"])
+def test_esimd_opt_out_matches_attention_case_normalization(modules, monkeypatch, backend):
+    patcher, state, executor = qualification_state(modules)
+    monkeypatch.setenv("OMNI_ATTN_BACKEND", backend)
+    with torch.inference_mode():
+        assert state.eligibility(executor, {}) == "stateful ESIMD attention is not qualified"
+
+
+def test_global_module_hooks_are_not_silently_frozen(modules):
+    patcher, state, executor = qualification_state(modules)
+    handle = torch.nn.modules.module.register_module_forward_hook(lambda *args: None)
+    try:
+        with torch.inference_mode():
+            assert state.eligibility(executor, {}) == "global module forward hooks are not qualified"
+    finally:
+        handle.remove()

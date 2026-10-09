@@ -14,6 +14,7 @@ from .adapters.errors import is_fatal_accelerator_error
 
 _CAPTURE_LOCK = threading.Lock()
 _POISONED_DEVICES = set()
+_FAILED_RUNTIMES = []  # Keep unsafe graph/storage owners alive until restart.
 _CONSTANT_CALL = threading.local()
 
 
@@ -103,6 +104,13 @@ class XPUBackend:
     def poison(self):
         _POISONED_DEVICES.add(str(self.device))
 
+    def validate_inputs(self, inputs):
+        def validate(tensor):
+            if tensor.device != self.device or tensor.layout != self.torch.strided:
+                raise UnsupportedGraphInput("graph inputs must be strided tensors on the model XPU")
+            return tensor
+        tree_map(inputs, validate, self.torch)
+
     @contextmanager
     def execution(self, inputs):
         self.check_health()
@@ -152,6 +160,7 @@ class GraphRuntime:
         self.torch, self.backend = torch, backend
         self.warmup_calls, self.max_entries = warmup_calls, max_entries
         self.entries = OrderedDict()
+        self.signatures = OrderedDict()
         self.warmed = Counter()
         self.constants = {}
         self.rejected = {}
@@ -160,20 +169,58 @@ class GraphRuntime:
         self.closed = False
         self.poisoned = False
 
+    def _poison(self, resources=None):
+        self.closed = self.poisoned = True
+        self.failed_resources = resources
+        _FAILED_RUNTIMES.append(self)
+        if hasattr(self.backend, "poison"):
+            self.backend.poison()
+
+    def _admit_signature(self, key, owner):
+        if key in self.signatures:
+            self.signatures.move_to_end(key)
+            return
+        if len(self.signatures) >= self.max_entries:
+            old_key = next(iter(self.signatures))
+            old = self.entries.get(old_key)
+            try:
+                self.backend.quiesce()
+                if old is not None:
+                    old[0].reset()
+            except BaseException as error:
+                self._poison()
+                raise RuntimeError("XPU graph eviction cleanup failed; restart the process") from error
+            if old is not None:
+                del self.entries[old_key]
+                self.stats["evictions"] += 1
+            self.signatures.pop(old_key)
+            self.constants.pop(old_key, None)
+            self.warmed.pop(old_key, None)
+            self.rejected.pop(old_key, None)
+            self.stats["signature_evictions"] += 1
+        self.signatures[key] = owner
+
     def _eager(self, function, args, kwargs, reason=None):
         self.stats["eager"] += 1
         if reason:
             self.reasons[reason] += 1
         return function(*args, **kwargs)
 
-    def __call__(self, function, args, kwargs, *, identity=()):
+    def __call__(self, function, args, kwargs, *, identity=(), callable_identity=None):
         if self.closed:
             raise RuntimeError("execution graph runtime is closed")
         inputs = (args, kwargs)
         try:
-            key = (identity, input_signature(inputs, self.torch))
+            if hasattr(self.backend, "validate_inputs"):
+                self.backend.validate_inputs(inputs)
+            owner = function if callable_identity is None else callable_identity
+            function_key = (id(getattr(owner, "__func__", owner)), id(getattr(owner, "__self__", None)))
+            key = (identity, function_key, input_signature(inputs, self.torch))
         except UnsupportedGraphInput as error:
             return self._eager(function, args, kwargs, str(error))
+        # Retain the callable as well as its identity, preventing Python ID
+        # reuse from selecting another function's captured graph.
+        self._admit_signature(key, owner)
         if key in self.rejected:
             return self._eager(function, args, kwargs, self.rejected[key])
         if key not in self.entries and self.warmed[key] < self.warmup_calls:
@@ -183,21 +230,9 @@ class GraphRuntime:
             return self.backend.retain_outputs(result)
 
         entry = self.entries.get(key)
-        if entry is None and len(self.entries) >= self.max_entries:
-            try:
-                self.backend.quiesce()
-                old_key, old = next(iter(self.entries.items()))
-                old[0].reset()
-            except BaseException as error:
-                self.closed = self.poisoned = True
-                if hasattr(self.backend, "poison"):
-                    self.backend.poison()
-                raise RuntimeError("XPU graph eviction cleanup failed; restart the process") from error
-            del self.entries[old_key]
-            self.constants.pop(old_key, None)
-            self.warmed.pop(old_key, None)
-            self.stats["evictions"] += 1
         graph = None
+        static = None
+        output = None
         capturing = entry is None
         capture_complete = not capturing
         try:
@@ -230,19 +265,17 @@ class GraphRuntime:
         except BaseException as error:
             if graph is None and isinstance(error, UnsupportedGraphInput):
                 self.rejected[key] = str(error)
+                self.constants.pop(key, None)
                 return self._eager(function, args, kwargs, str(error))
             if entry is not None:
-                self.entries.pop(key, None)
                 graph = entry[0]
             if graph is not None:
                 try:
                     self.backend.recover(graph)
                 except BaseException as cleanup_error:
-                    self.closed = True
-                    self.poisoned = True
-                    if hasattr(self.backend, "poison"):
-                        self.backend.poison()
+                    self._poison((graph, static, output))
                     raise RuntimeError("XPU graph cleanup failed; restart the process") from cleanup_error
+            self.entries.pop(key, None)
             if capture_complete or is_fatal_accelerator_error(error) or not isinstance(error, RuntimeError):
                 raise
             reason = f"capture unsupported: {error}"
@@ -264,11 +297,10 @@ class GraphRuntime:
             for graph, _, _ in self.entries.values():
                 graph.reset()
         except BaseException:
-            self.poisoned = True
-            if hasattr(self.backend, "poison"):
-                self.backend.poison()
+            self._poison()
             raise
         self.entries.clear()
+        self.signatures.clear()
         self.warmed.clear()
         self.constants.clear()
         self.rejected.clear()

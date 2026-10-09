@@ -266,9 +266,11 @@ Public diffusion-model and sampler wrappers manage execution. Real sampler
 forwards provide warmup on the capture stream. Graphs live for one sampler
 call and close before model cleanup, including cancellation and exceptions.
 Outputs are independent snapshots. Dynamic prefetch, quantized parameters,
-extra forward patches/wrappers, compile combinations, explicit ESIMD and the
-private allocation compiler combination use eager and report a reason. The
+extra forward patches/wrappers or module hooks, training children, compile
+combinations, explicit ESIMD and the private allocation compiler combination
+use eager and report a reason. The
 allocator must use native Torch caching or AIMDO native_hook.
+The two-signature budget includes warmup constants and rejected signatures.
 Set OMNIXPU_XPU_GRAPH=0 to disable the feature.
 
 Native NextDiT position encoding uses CPU FP64 on devices without FP64.
