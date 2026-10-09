@@ -12,9 +12,9 @@ class OmniXPUStatus:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}}
+        return {"required": {}, "optional": {"image": ("IMAGE",)}}
 
-    def get_status(self):
+    def get_status(self, image=None):
         lines = ["=== ComfyUI-OmniXPU Status ==="]
 
         # GPU info
@@ -104,6 +104,15 @@ class OmniXPUStatus:
                     line += f" ({reason})"
                 lines.append(line)
 
+        graphs = sys.modules.get(f"{_PKG}.adapters.xpu_graph")
+        if graphs and hasattr(graphs, "get_stats"):
+            graph_stats = graphs.get_stats()
+            if graph_stats["counts"] or graph_stats["reasons"]:
+                lines.append("")
+                lines.append(f"  XPU execution graphs: {graph_stats['counts']}")
+                for reason, count in sorted(graph_stats["reasons"].items()):
+                    lines.append(f"    {reason}: {count}")
+
         # Attention stats
         attn = sys.modules.get(f"{_PKG}.adapters.attention")
         if attn and hasattr(attn, "get_stats"):
@@ -146,4 +155,5 @@ class OmniXPUStatus:
             except Exception:
                 pass
 
-        return ("\n".join(lines),)
+        status = "\n".join(lines)
+        return {"ui": {"text": [status]}, "result": (status,)}

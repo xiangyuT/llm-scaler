@@ -137,6 +137,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
 def test_disabled_components_are_reported_without_importing_modules(monkeypatch):
     patches = _load_registry(monkeypatch)
     cfg = types.SimpleNamespace(
+        xpu_graph=False,
         aimdo_memory_compiler=False,
         attention=False,
         sparse_attention=False,

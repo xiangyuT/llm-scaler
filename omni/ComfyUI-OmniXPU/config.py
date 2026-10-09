@@ -10,6 +10,7 @@ class Config:
 
     def __init__(self):
         master = os.environ.get("OMNIXPU_ENABLE", "1") != "0"
+        self.xpu_graph = master and os.environ.get("OMNIXPU_XPU_GRAPH", "1") != "0"
         self.aimdo_memory_compiler = (
             master and os.environ.get("AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC", "0") == "1"
         )

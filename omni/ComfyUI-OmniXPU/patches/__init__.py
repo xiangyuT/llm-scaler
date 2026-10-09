@@ -23,6 +23,13 @@ class Component:
 # registration, capability checks, dispatch, and eager fallback.
 COMPONENTS = (
     Component(
+        "xpu_execution_graph_adapter",
+        "xpu_graph",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/xpu_graph.py",
+    ),
+    Component(
         "aimdo_memory_compiler_adapter",
         "aimdo_memory_compiler",
         "adapter",

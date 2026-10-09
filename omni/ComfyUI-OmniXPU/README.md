@@ -252,6 +252,40 @@ Non-XPU calls retain upstream behavior. Missing or incompatible Qwen Image 2.1
 interfaces leave the adapter unapplied and are reported in OmniXPU Status.
 This adapter does not add the model, its weights, or a ComfyUI version upgrade.
 
+## Resident XPU execution graphs (experimental)
+
+Insert **OmniXPU Graph (experimental)** between the model loader/model patches
+and the sampler to opt in. The first path targets native UNet and NextDiT
+FP16/BF16/FP32 models with fixed inputs and completely resident weights.
+Both enabled and disabled node modes create a non-dynamic model clone;
+service-wide text/VAE DynamicVRAM stays selected independently. Disabled mode
+provides a matched resident eager reference. Existing workflows without this
+node retain their current behavior.
+
+Public diffusion-model and sampler wrappers manage execution. Real sampler
+forwards provide warmup on the capture stream. Graphs live for one sampler
+call and close before model cleanup, including cancellation and exceptions.
+Outputs are independent snapshots. Dynamic prefetch, quantized parameters,
+extra forward patches/wrappers, compile combinations, explicit ESIMD and the
+private allocation compiler combination use eager and report a reason. The
+allocator must use native Torch caching or AIMDO native_hook.
+Set OMNIXPU_XPU_GRAPH=0 to disable the feature.
+
+Native NextDiT position encoding uses CPU FP64 on devices without FP64.
+The node uses a public model object patch to retain those position constants
+from real warmup forwards, keeping the original math outside capture. This
+does not cache text features or change RoPE precision. Constants belong to
+the sampler runtime; changing shapes, scalar position options or embedding
+configuration creates a new graph key. Tensor-valued position options use
+eager. Static input layouts must survive cloning unchanged.
+Set OMNIXPU_XPU_GRAPH_DEBUG=1 to log capture failure locations.
+
+Connect the optional image input on OmniXPU Status to the decoded output to
+report execution-graph counts after sampling. Replay counters are separate
+from eager operator routing counts. Interface availability does not establish
+model/device support or performance benefit; clean-image and performance
+qualification remain separate.
+
 ## Native compiled inference
 
 Upstream `TorchCompileModel` clones the diffusion model with

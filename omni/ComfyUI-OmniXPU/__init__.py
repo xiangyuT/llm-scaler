@@ -52,6 +52,9 @@ try:
         diag = _load("nodes/diagnostics.py", f"{_PKG}.nodes.diagnostics")
         NODE_CLASS_MAPPINGS["OmniXPUStatus"] = diag.OmniXPUStatus
         NODE_DISPLAY_NAME_MAPPINGS["OmniXPUStatus"] = "OmniXPU Status"
+        graph_node = _load("nodes/xpu_graph.py", f"{_PKG}.nodes.xpu_graph")
+        NODE_CLASS_MAPPINGS["OmniXPUGraph"] = graph_node.OmniXPUGraph
+        NODE_DISPLAY_NAME_MAPPINGS["OmniXPUGraph"] = "OmniXPU Graph (experimental)"
 
 except Exception as e:
     import traceback
