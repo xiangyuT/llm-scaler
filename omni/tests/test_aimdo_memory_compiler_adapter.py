@@ -174,6 +174,7 @@ def runtime(monkeypatch):
     control = ModuleType("comfy_aimdo.control")
     control.get_memory_compiler_capability = lambda: {"native_owner_diagnostic": {
         "active": True, "consumer_contract": "explicit_record_stream"}}
+    control.get_memory_compiler_runtime_status = control.get_memory_compiler_capability
     aimdo = ModuleType("comfy_aimdo")
     aimdo.control = control
     monkeypatch.setitem(sys.modules, "comfy_aimdo", aimdo)
@@ -181,6 +182,34 @@ def runtime(monkeypatch):
     r = adapter.Runtime(mm, mp, owner, NS(Tensor=Tensor), ck, int8, worker, Queue)
     r.events, r.device, r.stream, r.Tensor, r.QuantizedTensor = events, device, stream, Tensor, QuantizedTensor
     return r
+
+
+def test_enabled_reads_live_status_without_full_source_diagnostics(runtime, monkeypatch):
+    control = sys.modules["comfy_aimdo.control"]
+    state = {"active": True, "consumer_contract": "explicit_record_stream"}
+    monkeypatch.setattr(control, "get_memory_compiler_runtime_status",
+                        lambda: {"native_owner_diagnostic": dict(state)})
+    monkeypatch.setattr(control, "get_memory_compiler_capability",
+                        lambda: pytest.fail("enabled must not hash the provider DSO"))
+    assert runtime.enabled(lambda device: False, runtime.device)
+    state["active"] = False
+    assert not runtime.enabled(lambda device: False, runtime.device)
+    state.update(active=True, consumer_contract=None)
+    assert not runtime.enabled(lambda device: False, runtime.device)
+
+
+def test_enabled_keeps_the_older_provider_query_and_original_device_routes(runtime, monkeypatch):
+    control = sys.modules["comfy_aimdo.control"]
+    monkeypatch.delattr(control, "get_memory_compiler_runtime_status")
+    assert runtime.enabled(lambda device: False, runtime.device)
+    monkeypatch.setattr(control, "get_memory_compiler_capability",
+                        lambda: pytest.fail("disabled and non-XPU checks need no capability query"))
+    assert runtime.enabled(lambda device: True, NS(type="cuda"))
+    runtime.mp.args.disable_comfy_compiler = True
+    assert not runtime.enabled(lambda device: True, runtime.device)
+    runtime.mp.args.disable_comfy_compiler = False
+    runtime.mp.comfy.memory_management.aimdo_enabled = False
+    assert not runtime.enabled(lambda device: True, runtime.device)
 
 
 def test_begin_end_replay_keeps_scope_order(runtime):

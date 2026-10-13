@@ -120,7 +120,10 @@ class Runtime:
         if self.mp.args.disable_comfy_compiler or not self.mp.comfy.memory_management.aimdo_enabled:
             return False
         from comfy_aimdo import control
-        capability = control.get_memory_compiler_capability()["native_owner_diagnostic"]
+        query = getattr(control, "get_memory_compiler_runtime_status", None)
+        if query is None:
+            query = control.get_memory_compiler_capability
+        capability = query()["native_owner_diagnostic"]
         return capability["active"] and capability["consumer_contract"] == "explicit_record_stream"
 
     def begin(self, device):

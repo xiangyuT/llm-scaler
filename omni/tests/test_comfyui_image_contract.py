@@ -108,7 +108,7 @@ COMPONENT_PINS = {
     ),
     "COMFY_AIMDO_COMMIT": (
         "AIMDO_COMMIT",
-        "80ef0f9abdb384a47d81058b4bec87a201ff63e4",
+        "ada02f3cb29e836c27fa19d7c430ada382e76867",
     ),
     "COMFY_AIMDO_VERSION": ("AIMDO_VERSION", "0.5.5"),
     "COMFY_AIMDO_PROVIDER_VERSION": (

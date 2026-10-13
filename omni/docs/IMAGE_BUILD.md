@@ -64,7 +64,7 @@ For the ComfyUI 0.39.0 candidate, official Kitchen 0.2.37 uses the matching
 (`c2b77e7229bcb1917a5bf3145dc45cbe8fc389a9`, merged by
 [PR #12](https://github.com/xiangyuT/comfy-kitchen-xpu/pull/12)). Official AIMDO 0.5.5 uses
 the matching 0.5.5 provider source at `xiangyuT/comfy-aimdo-xpu`
-(`80ef0f9abdb384a47d81058b4bec87a201ff63e4`). Both provider manifests
+(`ada02f3cb29e836c27fa19d7c430ada382e76867`). Both provider manifests
 accept their matching official 0.2.37 and 0.5.5 versions. The ComfyUI release
 requirements also pin embedded docs to 0.5.13; frontend and workflow templates
 are selected as 1.53.10 and 0.11.76 by the build inputs.
@@ -85,6 +85,13 @@ ComfyUI allocation boundaries and kernel cache APIs are checked before native
 takeover. Incompatible caller changes disable this diagnostic while retaining
 the independently selected base allocator route. The adapter remains private;
 public AIMDO XPU memory-compiler availability is unchanged.
+The pinned AIMDO development source includes native-owner lifecycle fixes and
+lightweight `get_memory_compiler_runtime_status()` queries. The caller uses
+that query for repeated eligibility checks, with the full capability query as
+a compatibility fallback for older providers. Source/ABI/file diagnostics stay
+available through the full query. Public XPU graph recording and default
+native-owner enablement remain unchanged; this source pin is not an image or
+performance acceptance result.
 The same rule applies to the combined Nunchaku repository, commit, and
 distribution version; the current source revision is
 `9f5604445f56154dd44e8b4acfed1aef868003c5`. Sparse attention uses
