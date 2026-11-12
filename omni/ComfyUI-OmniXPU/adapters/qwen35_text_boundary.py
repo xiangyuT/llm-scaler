@@ -1,6 +1,7 @@
 """Keep a quoted closing tag in Qwen3.5 reasoning out of the visible answer."""
 
 from functools import wraps
+import sys
 
 
 _MARKER = "_omnixpu_qwen35_token_boundary"
@@ -39,10 +40,18 @@ class _Clip:
 def apply():
     try:
         from comfy.text_encoders.qwen35 import Qwen35ImageTokenizer
-        from comfy_extras import nodes_textgen
     except ImportError:
         return False, "Qwen3.5 text generation is unavailable"
-    cls = nodes_textgen.TextGenerateV2
+    # Builtins are loaded under ComfyUI's file-based module name. Importing
+    # comfy_extras.nodes_textgen creates a second class that the executor never
+    # calls. Match the registered object, as the other node adapters do.
+    nodes = sys.modules.get("nodes")
+    cls = getattr(nodes, "NODE_CLASS_MAPPINGS", {}).get("TextGenerateV2")
+    if cls is None:
+        return False, "TextGenerateV2 is not registered"
+    module = sys.modules.get(cls.__module__)
+    if module is None or not hasattr(module, "io"):
+        return False, "Registered TextGenerateV2 has no node output interface"
     method = cls.__dict__.get("execute")
     if not isinstance(method, classmethod):
         return False, "TextGenerateV2 no longer exposes classmethod execute"
@@ -63,7 +72,7 @@ def apply():
         if not isinstance(proxy.ids, list) or any(type(i) is not int for i in proxy.ids):
             raise RuntimeError("Qwen3.5 generation no longer returns a token ID list")
         split = _split_at_token(clip, tokenizer, proxy.ids)
-        return result if split is None else nodes_textgen.io.NodeOutput(*split)
+        return result if split is None else module.io.NodeOutput(*split)
 
     setattr(execute, _MARKER, True)
     cls.execute = classmethod(execute)

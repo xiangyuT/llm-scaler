@@ -184,6 +184,8 @@ when reasoning has also spelled the same tag using ordinary tokens. This keeps
 quoted tags in reasoning from exposing draft JSON to downstream text extraction.
 The original node owns tokenization, generation and sampling; its usual outputs
 are retained when the first string match already selects the actual token.
+The adapter follows ComfyUI's registered node object, including the class clones
+used by its executor.
 
 On Windows XPU, the boundary trim turns an unmet DynamicVRAM minimum-memory
 budget into an explicit partial VBAR reclaim before model loading. It preserves
