@@ -159,6 +159,7 @@ OMNIXPU_ENABLE=0            # Disable every custom-node component
 OMNIXPU_ATTENTION=0         # Disable the attention adapter
 OMNIXPU_SPARSE_ATTENTION=0  # Disable XPU eligibility for Model Sparse Attention
 OMNIXPU_NORM=0              # Disable the norm adapter
+OMNIXPU_TEXT_GENERATION=0   # Disable the Qwen3.5 thinking-token boundary fix
 OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_QUANTIZED_MATMUL=0  # Disable native INT8 model-format eligibility
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
@@ -177,6 +178,12 @@ retaining the upstream chunk algorithm, epsilon and final output dtype.
 It applies to the shared text-encoder call site independently of Mono Decode;
 `OMNIXPU_NORM=0` disables this precision adapter as well. Global functional
 normalization and non-XPU calls keep their existing behavior.
+
+For Qwen3.5, Generate Text uses the tokenizer's actual closing thinking token
+when reasoning has also spelled the same tag using ordinary tokens. This keeps
+quoted tags in reasoning from exposing draft JSON to downstream text extraction.
+The original node owns tokenization, generation and sampling; its usual outputs
+are retained when the first string match already selects the actual token.
 
 On Windows XPU, the boundary trim turns an unmet DynamicVRAM minimum-memory
 budget into an explicit partial VBAR reclaim before model loading. It preserves

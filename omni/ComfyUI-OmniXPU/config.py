@@ -17,6 +17,7 @@ class Config:
         self.sparse_attention = master and os.environ.get("OMNIXPU_SPARSE_ATTENTION", "1") != "0"
         self.rotary = master and os.environ.get("OMNIXPU_ROTARY", "1") != "0"
         self.norm = master and os.environ.get("OMNIXPU_NORM", "1") != "0"
+        self.text_generation = master and os.environ.get("OMNIXPU_TEXT_GENERATION", "1") != "0"
         self.h3_rms_modulation = (
             master
             and os.environ.get("OMNIXPU_H3_RMS_MODULATION", "1") != "0"

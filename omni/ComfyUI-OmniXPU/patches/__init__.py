@@ -72,6 +72,13 @@ COMPONENTS = (
         "adapters/qwen35_gdn.py",
     ),
     Component(
+        "qwen35_text_boundary",
+        "text_generation",
+        "compatibility_patch",
+        "upstream_pending",
+        "adapters/qwen35_text_boundary.py",
+    ),
+    Component(
         "h3_rms_modulation_adapter",
         "h3_rms_modulation",
         "adapter",

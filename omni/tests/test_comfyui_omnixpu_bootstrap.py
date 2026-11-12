@@ -110,6 +110,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
         "OMNIXPU_SEEDVR_ADA_RESHAPE",
         "OMNIXPU_SEEDVR_CAPACITY",
         "OMNIXPU_LARGE_VIDEO_PREPROCESS",
+        "OMNIXPU_TEXT_GENERATION",
         "OMNIXPU_INTERPOLATE_FIX",
         "OMNIXPU_MEDIAN_FIX",
     ):
@@ -119,6 +120,7 @@ def test_legacy_global_fixes_default_to_disabled(monkeypatch):
     assert config.attention
     assert config.rotary
     assert config.norm
+    assert config.text_generation
     assert config.h3_rms_modulation
     assert config.fp8_gemm
     assert config.int8_ffn
@@ -147,6 +149,7 @@ def test_disabled_components_are_reported_without_importing_modules(monkeypatch)
         sparse_attention=False,
         rotary=False,
         norm=False,
+        text_generation=False,
         h3_rms_modulation=False,
         fp8_gemm=False,
         int8_ffn=False,
